@@ -1,0 +1,1 @@
+trurl.exe --url https://example.com/a/b?x=1 --get {scheme},{host},{path},{query}
