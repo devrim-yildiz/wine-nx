@@ -1,13 +1,14 @@
 # 3D-accel (GPU compositor) milestone -- scoping
 
 Status: the Mesa/NVK dependency question is **resolved** (see below), and
-step 1 of the concrete next steps -- an isolated deko3d bring-up smoke test
--- is now **built and hardware-confirmed working**: device, queue, and
-swapchain creation against `nwindowGetDefault()` all function on real
-Switch hardware, presenting a scissor+clear-color test pattern every frame
-(`wine-nx-probe/source/deko3d_smoke.c`, target `wine-nx-deko3d-smoke`). See
-"What's actually built" at the bottom for the full picture, including what
-still isn't built (texture upload, the actual compositor).
+the deko3d bring-up smoke test (`wine-nx-probe/source/deko3d_smoke.c`,
+target `wine-nx-deko3d-smoke`) now covers device/queue/swapchain creation,
+a CPU-to-GPU texture upload, and a real shader-driven rotating cube --
+**all three hardware-confirmed together**, holding steady 60-62fps for a
+5-10 second test run with no measurable fps cost from the shader/geometry
+work over the earlier clear-only baseline. See "What's actually built" at
+the bottom for the full picture, including what still isn't built (the
+actual compositor swap into `wine_nx_fb_lock/unlock/present`).
 
 ## Resolved: does a usable Mesa/NVK (Vulkan) port exist for this project?
 
@@ -147,21 +148,24 @@ presentation-compositor milestone specifically.
 
 1. ~~Resolve the Mesa/NVK availability question~~ **Done** -- see above.
 2. ~~Prototype deko3d in isolation first, not against the real
-   compositor~~ **Done, partially.** `wine-nx-probe/source/deko3d_smoke.c`
-   (target `wine-nx-deko3d-smoke`) proves device/queue/swapchain creation
-   and present against `nwindowGetDefault()`, **hardware-confirmed**: dark
-   background with a cyan test-pattern box rendering correctly. Scoped
-   deliberately smaller than originally planned here -- scissor+clear only,
-   no shaders, no texture, no romfs -- so this first hardware round-trip
-   only had to prove the bare pipeline, not shader compilation too. The
-   texture-upload/quad step this doc originally described as part of step 2
-   is still open; `deko_examples/Example04_TexturedCube.cpp` in the
-   toolchain image remains the directly usable template for it (minus the
-   cube -- a static quad is simpler).
-3. **Next**: extend `deko3d_smoke.c` (or a new sample) to upload one static
-   texture and draw one textured quad, hardware-confirm that too -- this is
-   the actual shape of the compositor's real workload (a Wine DIB becomes
-   the uploaded texture), unlike the shader-free clear-only step just done.
+   compositor~~ **Done.** `wine-nx-probe/source/deko3d_smoke.c` (target
+   `wine-nx-deko3d-smoke`), built in three hardware-confirmed stages:
+   device/queue/swapchain/present (scissor+clear only, no shaders); a
+   CPU-generated texture uploaded via `dkCmdBufCopyBufferToImage()`
+   straight onto a framebuffer sub-rect (still no shaders -- proves the
+   upload path, not sampling); and a real shader-driven rotating cube
+   (uam-compiled shaders, depth buffer, per-frame uniform updates via a
+   fence-protected dynamic command ring). All three run together, holding
+   60-62fps on real hardware for a 5-10 second test -- no measurable fps
+   cost from real shader/geometry work over the clear-only baseline.
+3. **Still open**: an actual *sampled* textured quad (shader + sampler +
+   descriptor set reading the uploaded texture, the one combination not
+   yet built -- stage 2's upload and stage 3's shaders are proven
+   separately, not together). `deko_examples/Example04_TexturedCube.cpp`
+   remains the template for this (minus the cube -- a flat quad is
+   simpler). Only actually needed if the real compositor swap turns out to
+   require GPU-side sampling rather than a second direct
+   `CopyBufferToImage`-style upload; not yet clear which one it needs.
 4. **Only then** replace `wine_nx_fb_lock/unlock/present`'s libnx-framebuffer
    implementation in `wine-nx-probe/source/runtime.c` with the validated
    deko3d logic, gated behind the existing `__SWITCH__` build, kept
@@ -173,13 +177,18 @@ presentation-compositor milestone specifically.
 - **Built and hardware-verified**: the `wine_nx_fb_lock/unlock/present`
   interface boundary is proven stable across two independent presentation
   backends (libnx framebuffer on real hardware, SDL2 in the host-sim).
-  `wine-nx-deko3d-smoke` additionally proves deko3d device/queue/swapchain
-  creation and present against the same `nwindowGetDefault()` handle work
-  on real hardware, standalone (not yet wired into that interface). The
+  `wine-nx-deko3d-smoke` separately proves, all hardware-confirmed and all
+  running together at 60-62fps: deko3d device/queue/swapchain
+  creation/present against the same `nwindowGetDefault()` handle, a CPU
+  texture upload onto a live framebuffer, and real shader-compiled,
+  depth-tested, per-frame-animated 3D geometry. None of this is wired into
+  `wine_nx_fb_lock/unlock/present` yet -- it's a standalone smoke test. The
   Mesa/NVK dependency question is resolved with direct evidence, not
   assumption (see above).
-- **Not built**: GPU texture upload, a textured quad, or any actual
-  compositor logic -- `deko3d_smoke.c` only proves the pipeline itself
-  (clear-color present), not the DIB-upload workload the real milestone
-  needs, and nothing is wired into `wine_nx_fb_lock/unlock/present` yet.
-  Texture upload and the real compositor swap remain open, in that order.
+- **Not built**: sampling an uploaded texture from a shader (upload and
+  shaders are each proven, not combined), and the actual compositor swap
+  into `wine_nx_fb_lock/unlock/present`. Two crash bugs surfaced building
+  the cube stage, both root-caused from hardware crash logs rather than
+  guessed at (missing `romfsInit()`; un-rounded `DkMemBlockCreate()`
+  sizes) -- worth knowing about before writing more deko3d code in this
+  project, see the top of `deko3d_smoke.c` for details.

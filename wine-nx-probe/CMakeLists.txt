@@ -571,7 +571,7 @@ target_compile_options(wine-nx-deko3d-smoke PRIVATE
 
 target_link_options(wine-nx-deko3d-smoke PRIVATE -Wl,--gc-sections)
 
-target_link_libraries(wine-nx-deko3d-smoke PRIVATE deko3d nx)
+target_link_libraries(wine-nx-deko3d-smoke PRIVATE deko3d nx m)
 
 add_executable(wine-nx-runtime
     source/runtime.c
@@ -629,6 +629,36 @@ target_link_libraries(wine-nx-runtime PRIVATE
 
 find_program(NACPTOOL nacptool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(ELF2NRO elf2nro HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
+find_program(UAM uam HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
+
+# deko3d smoke test's stage-3 cube needs two compiled shaders in a romfs
+# image (dksh files loaded at runtime via fopen("romfs:/shaders/...")).
+# uam invocation (-s vert/frag -o out.dksh in.glsl) matches the pattern
+# devkitPro's own example Makefiles use (see deko_basic/Makefile).
+if(UAM)
+    set(DEKO3D_SMOKE_ROMFS_DIR "${CMAKE_CURRENT_BINARY_DIR}/deko3d-smoke-romfs")
+    set(DEKO3D_SMOKE_SHADERS_DIR "${DEKO3D_SMOKE_ROMFS_DIR}/shaders")
+    set(DEKO3D_VSH_DKSH "${DEKO3D_SMOKE_SHADERS_DIR}/transform_vsh.dksh")
+    set(DEKO3D_FSH_DKSH "${DEKO3D_SMOKE_SHADERS_DIR}/color_fsh.dksh")
+
+    add_custom_command(
+        OUTPUT "${DEKO3D_VSH_DKSH}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DEKO3D_SMOKE_SHADERS_DIR}"
+        COMMAND "${UAM}" -s vert -o "${DEKO3D_VSH_DKSH}" "${CMAKE_CURRENT_SOURCE_DIR}/source/shaders/transform_vsh.glsl"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/shaders/transform_vsh.glsl"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${DEKO3D_FSH_DKSH}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DEKO3D_SMOKE_SHADERS_DIR}"
+        COMMAND "${UAM}" -s frag -o "${DEKO3D_FSH_DKSH}" "${CMAKE_CURRENT_SOURCE_DIR}/source/shaders/color_fsh.glsl"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/shaders/color_fsh.glsl"
+        VERBATIM
+    )
+
+    add_custom_target(wine-nx-deko3d-smoke-shaders DEPENDS "${DEKO3D_VSH_DKSH}" "${DEKO3D_FSH_DKSH}")
+endif()
 
 if(NACPTOOL AND ELF2NRO)
     set(NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-probe.nacp")
@@ -761,10 +791,17 @@ if(NACPTOOL AND ELF2NRO)
         VERBATIM
     )
 
+    set(DEKO3D_SMOKE_ROMFS_ARG "")
+    set(DEKO3D_SMOKE_ROMFS_DEPS "")
+    if(UAM)
+        set(DEKO3D_SMOKE_ROMFS_ARG "--romfsdir=${DEKO3D_SMOKE_ROMFS_DIR}")
+        set(DEKO3D_SMOKE_ROMFS_DEPS wine-nx-deko3d-smoke-shaders)
+    endif()
+
     add_custom_command(
         OUTPUT "${DEKO3D_SMOKE_NRO_FILE}"
-        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-deko3d-smoke>" "${DEKO3D_SMOKE_NRO_FILE}" "--nacp=${DEKO3D_SMOKE_NACP_FILE}"
-        DEPENDS wine-nx-deko3d-smoke "${DEKO3D_SMOKE_NACP_FILE}"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-deko3d-smoke>" "${DEKO3D_SMOKE_NRO_FILE}" "--nacp=${DEKO3D_SMOKE_NACP_FILE}" ${DEKO3D_SMOKE_ROMFS_ARG}
+        DEPENDS wine-nx-deko3d-smoke "${DEKO3D_SMOKE_NACP_FILE}" ${DEKO3D_SMOKE_ROMFS_DEPS}
         VERBATIM
     )
 
