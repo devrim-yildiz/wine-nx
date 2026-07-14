@@ -213,14 +213,20 @@ per loop iteration. The full-buffer block-linear conversion may still matter
 once that real bottleneck is found and fixed, but **it is not where the next
 investigation should start.**
 
-The real performance step is still a GPU presentation path. The preferred
-direction is a Vulkan/NVK compositor: upload Wine DIB/window surfaces into GPU
-textures, composite them, and present once per frame -- but there is currently
-**no** Mesa/NVK Vulkan port anywhere in this tree (a prior version of this
-README claimed otherwise; that wasn't accurate). See
-`wine-nx-probe/3d-accel-scoping.md` for scoping notes on this milestone,
-including the deko3d-vs-NVK tradeoff and why finding/building that port is the
-actual first blocker, ahead of writing any compositor code.
+The real performance step is still a GPU presentation path: upload Wine
+DIB/window surfaces into GPU textures, composite them, and present once per
+frame. **The Vulkan/NVK question is now resolved, not just corrected:**
+checked directly against the devkitpro/devkita64 toolchain image (the same
+one `build-switch.sh` builds with) -- there is no Vulkan, NVK, or any
+Vulkan-capable driver anywhere in it, and there structurally can't be one
+under Horizon OS, since NVK is built on Linux's `nouveau` DRM kernel driver
+and Horizon isn't Linux. Real Mesa **OpenGL ES** is available instead (a
+Switch-native `libdrm_nouveau` shim under the same old, pre-NVK Mesa), and
+**deko3d** (Switch homebrew's own low-level GPU API) is available too --
+both already installed in the toolchain, both bind to the same
+`nwindowGetDefault()` handle `wine_nx_fb_init()` already uses. See
+`wine-nx-probe/3d-accel-scoping.md` for the full evidence and the updated
+recommendation (deko3d over OpenGL ES, both over the now-dead NVK option).
 
 ### UI Completeness Is Still Early
 
@@ -453,18 +459,26 @@ wine-nx-probe/samples/curl-arm64
 
 1. Presentation performance
 
-Replace or bypass the expensive linear framebuffer path. Preferred direction:
+Replace or bypass the expensive linear framebuffer path. **Resolved:** NVK
+(Mesa's Vulkan driver) is confirmed not available for Switch homebrew --
+verified directly against the devkitpro/devkita64 toolchain image, not
+assumed. See `wine-nx-probe/3d-accel-scoping.md` for the evidence and the
+updated recommendation (deko3d, not Vulkan/NVK):
 
-- Vulkan/NVK compositor for Wine software window surfaces;
+- deko3d compositor for Wine software window surfaces;
 - DIB/window surface upload into GPU textures;
 - popup/window composition on GPU;
-- one present per frame;
-- DXVK/vkd3d later, after Wine's Vulkan path is clean enough for real
-  D3D-to-Vulkan acceleration.
+- one present per frame.
 
-Fallback or lower-level options:
+Real Mesa **OpenGL ES** (not Vulkan) is also confirmed available in the same
+toolchain (`switch-mesa`/EGL/GLES, via a Switch-native `libdrm_nouveau`
+shim) -- meaning Wine's existing `wined3d` OpenGL backend is a more
+realistic long-term path to real D3D acceleration on this platform than
+DXVK/vkd3d, which need Vulkan and therefore aren't viable here. Neither has
+been prototyped yet; this is still a scoping conclusion, not built code.
 
-- deko3d compositor;
+Also acceptable, simpler fallback:
+
 - direct block-linear dirty conversion;
 - persistent software backing store plus one present per frame.
 
