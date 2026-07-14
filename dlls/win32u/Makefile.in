@@ -3,8 +3,16 @@ MODULE    = win32u.dll
 UNIXLIB   = win32u.so
 IMPORTLIB = win32u
 IMPORTS   = ntdll
-UNIX_CFLAGS  = $(FREETYPE_CFLAGS) $(FONTCONFIG_CFLAGS)
-UNIX_LIBS    = $(CORETEXT_LIBS) $(APPKIT_LIBS) $(PTHREAD_LIBS) -lm
+UNIX_CFLAGS  = $(FREETYPE_CFLAGS) $(FONTCONFIG_CFLAGS) $(SDL2_CFLAGS)
+UNIX_LIBS    = $(CORETEXT_LIBS) $(APPKIT_LIBS) $(PTHREAD_LIBS) $(SDL2_LIBS) -lm
+
+# SDL2_CFLAGS/SDL2_LIBS are not wired into configure.ac yet -- resolved via
+# pkg-config here for the host presentation-path simulation (see
+# winnx_host_sim.c) until a real configure.ac check replaces this. Requires
+# `brew install sdl2 pkg-config` on macOS or `apt install libsdl2-dev
+# pkg-config` on Linux. -framework Cocoa is only valid/needed on Darwin.
+SDL2_CFLAGS  := $(shell pkg-config --cflags sdl2 2>/dev/null)
+SDL2_LIBS    := $(shell pkg-config --libs sdl2 2>/dev/null) $(shell test "$$(uname)" = Darwin && echo -Wl,-framework,Cocoa)
 
 EXTRADLLFLAGS = -nodefaultlibs
 
@@ -55,4 +63,6 @@ SOURCES = \
 	vertical.c \
 	vulkan.c \
 	window.c \
+	winnx_drv.c \
+	winnx_host_sim.c \
 	winstation.c

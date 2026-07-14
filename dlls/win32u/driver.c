@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -1012,6 +1013,27 @@ static void load_display_driver(void)
 {
     USEROBJECTFLAGS flags;
     HWINSTA winstation;
+
+#ifndef __SWITCH__
+    /* Host simulation of the Switch presentation path: opt-in via env var so
+     * a normal host build keeps using its real graphics driver (macdrv/x11drv)
+     * untouched unless WINE_NX_HOST_SIM is set. See dlls/win32u/winnx_drv.c
+     * and dlls/win32u/winnx_host_sim.c (SDL2-backed). */
+    if (getenv( "WINE_NX_HOST_SIM" ))
+    {
+        extern BOOL wine_nx_drv_CreateWindow( HWND );
+        extern BOOL wine_nx_drv_CreateWindowSurface( HWND, BOOL, const RECT *, struct window_surface ** );
+        extern void wine_nx_drv_WindowPosChanged( HWND, HWND, HWND, UINT,
+                                                  const struct window_rects *, struct window_surface * );
+        extern BOOL wine_nx_drv_ProcessEvents( DWORD );
+        null_user_driver.pCreateWindow         = wine_nx_drv_CreateWindow;
+        null_user_driver.pCreateWindowSurface  = wine_nx_drv_CreateWindowSurface;
+        null_user_driver.pWindowPosChanged     = wine_nx_drv_WindowPosChanged;
+        null_user_driver.pProcessEvents        = wine_nx_drv_ProcessEvents;
+        __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
+        return;
+    }
+#endif
 
     if (is_service_process() || !load_desktop_driver( get_desktop_window() ) || user_driver == &lazy_load_driver)
     {
