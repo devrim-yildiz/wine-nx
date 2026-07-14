@@ -194,15 +194,48 @@ void wine_nx_fb_unlock(void)
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
 
+/* framebufferEnd() converts the *entire* 1280x720 shadow buffer to
+ * block-linear before queueing it, regardless of how small the actual dirty
+ * region was (see wine-nx-probe/README.md, "Presentation Is Still Too Slow").
+ * wine_nx_drv_ProcessEvents() already calls present() on every message-loop
+ * iteration, which can be far more often than any display can show distinct
+ * frames -- each of those extra calls pays the full conversion cost for
+ * zero visible benefit once you're already at the display's refresh rate.
+ * Capping how often the real conversion actually runs is a strict win, not a
+ * quality/latency trade: nothing above the display's refresh rate is ever
+ * visible, so skipped presents here aren't lost -- they just get folded into
+ * the next one that's actually due (pending_dirty stays set), the same way
+ * the existing batching already coalesces multiple flush() calls into one
+ * present.
+ *
+ * UNVERIFIED ON HARDWARE: no Switch console or working homebrew-capable
+ * emulator was available to measure this. The reasoning above is sound
+ * given framebufferEnd()'s documented full-buffer cost, but "how much did
+ * this actually help" has not been measured -- treat this as a reviewed,
+ * ready-to-test change, not a proven fix. */
+#define WINE_NX_FB_MIN_PRESENT_INTERVAL_MS 16  /* ~60 Hz cap; adjust to taste */
+
+static uint64_t wine_nx_fb_last_present_ms;
+
 void wine_nx_fb_present(void)
 {
+    uint64_t now_ms;
+
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (wine_nx_fb_ready && wine_nx_fb_pending_bits && wine_nx_fb_pending_dirty && !wine_nx_fb_lock_depth)
     {
-        framebufferEnd( &wine_nx_fb );
-        wine_nx_fb_pending_bits = NULL;
-        wine_nx_fb_pending_stride = 0;
-        wine_nx_fb_pending_dirty = 0;
+        now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        if (now_ms - wine_nx_fb_last_present_ms >= WINE_NX_FB_MIN_PRESENT_INTERVAL_MS)
+        {
+            framebufferEnd( &wine_nx_fb );
+            wine_nx_fb_pending_bits = NULL;
+            wine_nx_fb_pending_stride = 0;
+            wine_nx_fb_pending_dirty = 0;
+            wine_nx_fb_last_present_ms = now_ms;
+        }
+        /* else: leave pending_dirty set. The next call -- and there will be
+         * one, since ProcessEvents() calls present() on every message-loop
+         * iteration -- picks up these writes once the interval has passed. */
     }
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
