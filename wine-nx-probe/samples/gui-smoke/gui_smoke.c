@@ -12,6 +12,37 @@
 #define BADGE_W 360
 #define BADGE_H 132
 
+/* Bouncing-shapes demo: a ball and a few boxes moving inside the panel
+ * drawn by draw_scene(), redrawn every loop iteration so the present path
+ * (and its throttle, see wine-nx-probe/source/runtime.c) has continuous
+ * real work to do instead of a single static frame. */
+#define NUM_BOXES 3
+#define BALL_RADIUS 28
+#define SHAPE_MAX_SPEED 9
+#define SCENE_LEFT 90
+#define SCENE_TOP 90
+#define SCENE_RIGHT (WINE_NX_W - 90)
+#define SCENE_BOTTOM (WINE_NX_H - 90)
+
+typedef struct { int x, y, vx, vy; } ball_t;
+typedef struct { int x, y, w, h, vx, vy; COLORREF color; } box_t;
+
+static ball_t g_ball;
+static box_t g_boxes[NUM_BOXES];
+
+/* Touch is bridged to the conventional WM_LBUTTONDOWN/MOUSEMOVE/UP stream
+ * (see wine_nx_touch_poll() in runtime.c), so ordinary mouse messages are
+ * all this needs to react to a finger on the screen. */
+static int g_touch_active;
+static int g_touch_x, g_touch_y;
+
+/* Cached full-screen background: draw_scene() builds a lot of GDI state
+ * (fonts, the badge's own memory DC, the pixel ramp) that doesn't change
+ * frame to frame, so it's rendered once into an offscreen bitmap and
+ * BitBlt'd back every frame instead of rebuilt from scratch each time. */
+static HDC g_bg_dc;
+static HBITMAP g_bg_bitmap;
+
 static HFONT create_font( int height, int weight )
 {
     return CreateFontW( height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
@@ -195,10 +226,139 @@ static void draw_scene( HDC hdc )
     if (bg) DeleteObject( bg );
 }
 
+static void init_scene(void)
+{
+    static const COLORREF box_colors[NUM_BOXES] =
+    {
+        RGB( 94, 234, 212 ), RGB( 255, 92, 141 ), RGB( 130, 170, 255 )
+    };
+    int i;
+
+    g_ball.x = 200;
+    g_ball.y = 200;
+    g_ball.vx = 6;
+    g_ball.vy = 4;
+
+    for (i = 0; i < NUM_BOXES; i++)
+    {
+        box_t *b = &g_boxes[i];
+
+        b->w = 70 + i * 20;
+        b->h = 50 + i * 15;
+        b->x = SCENE_LEFT + 150 + i * 220;
+        b->y = SCENE_TOP + 60 + i * 90;
+        b->vx = 5 - i * 2;
+        if (!b->vx) b->vx = 3;
+        b->vy = 4 + i;
+        b->color = box_colors[i];
+    }
+}
+
+static int clampi( int v, int lo, int hi )
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Nudge velocity one unit per tick toward the touch point, clamped to a
+ * fixed top speed -- deliberately simple (no mass/easing) so the reaction
+ * is obviously alive without overshooting into wild orbits. */
+static void attract_towards_touch( int cx, int cy, int *vx, int *vy )
+{
+    int dx = g_touch_x - cx;
+    int dy = g_touch_y - cy;
+
+    *vx += (dx > 3) - (dx < -3);
+    *vy += (dy > 3) - (dy < -3);
+    *vx = clampi( *vx, -SHAPE_MAX_SPEED, SHAPE_MAX_SPEED );
+    *vy = clampi( *vy, -SHAPE_MAX_SPEED, SHAPE_MAX_SPEED );
+}
+
+static void bounce_step( int *x, int *y, int *vx, int *vy, int w, int h )
+{
+    *x += *vx;
+    *y += *vy;
+    if (*x < SCENE_LEFT) { *x = SCENE_LEFT; *vx = -*vx; }
+    if (*x + w > SCENE_RIGHT) { *x = SCENE_RIGHT - w; *vx = -*vx; }
+    if (*y < SCENE_TOP) { *y = SCENE_TOP; *vy = -*vy; }
+    if (*y + h > SCENE_BOTTOM) { *y = SCENE_BOTTOM - h; *vy = -*vy; }
+}
+
+static void update_scene(void)
+{
+    int i;
+
+    if (g_touch_active)
+        attract_towards_touch( g_ball.x + BALL_RADIUS, g_ball.y + BALL_RADIUS, &g_ball.vx, &g_ball.vy );
+    bounce_step( &g_ball.x, &g_ball.y, &g_ball.vx, &g_ball.vy, BALL_RADIUS * 2, BALL_RADIUS * 2 );
+
+    for (i = 0; i < NUM_BOXES; i++)
+    {
+        box_t *b = &g_boxes[i];
+
+        if (g_touch_active) attract_towards_touch( b->x + b->w / 2, b->y + b->h / 2, &b->vx, &b->vy );
+        bounce_step( &b->x, &b->y, &b->vx, &b->vy, b->w, b->h );
+    }
+}
+
+static void draw_moving_shapes( HDC hdc )
+{
+    HBRUSH ball_brush = CreateSolidBrush( RGB( 255, 209, 102 ) );
+    HPEN ball_pen = CreatePen( PS_SOLID, 3, RGB( 255, 92, 141 ) );
+    HGDIOBJ old_brush = NULL, old_pen = NULL;
+    int i;
+
+    if (ball_brush) old_brush = SelectObject( hdc, ball_brush );
+    if (ball_pen) old_pen = SelectObject( hdc, ball_pen );
+    Ellipse( hdc, g_ball.x, g_ball.y, g_ball.x + BALL_RADIUS * 2, g_ball.y + BALL_RADIUS * 2 );
+    if (old_pen) SelectObject( hdc, old_pen );
+    if (old_brush) SelectObject( hdc, old_brush );
+    if (ball_pen) DeleteObject( ball_pen );
+    if (ball_brush) DeleteObject( ball_brush );
+
+    for (i = 0; i < NUM_BOXES; i++)
+    {
+        box_t *b = &g_boxes[i];
+        HBRUSH brush = CreateSolidBrush( b->color );
+        HGDIOBJ old = brush ? SelectObject( hdc, brush ) : NULL;
+
+        Rectangle( hdc, b->x, b->y, b->x + b->w, b->y + b->h );
+        if (old) SelectObject( hdc, old );
+        if (brush) DeleteObject( brush );
+    }
+}
+
+static void ensure_background( HDC hdc )
+{
+    if (g_bg_dc) return;
+
+    g_bg_dc = CreateCompatibleDC( hdc );
+    if (!g_bg_dc) return;
+
+    g_bg_bitmap = CreateCompatibleBitmap( hdc, WINE_NX_W, WINE_NX_H );
+    if (!g_bg_bitmap)
+    {
+        DeleteDC( g_bg_dc );
+        g_bg_dc = NULL;
+        return;
+    }
+
+    SelectObject( g_bg_dc, g_bg_bitmap );
+    draw_scene( g_bg_dc );
+}
+
+static void draw_frame( HDC hdc )
+{
+    ensure_background( hdc );
+
+    if (g_bg_dc) BitBlt( hdc, 0, 0, WINE_NX_W, WINE_NX_H, g_bg_dc, 0, 0, SRCCOPY );
+    else draw_scene( hdc );   /* cache failed to allocate: draw straight through */
+
+    draw_moving_shapes( hdc );
+}
+
 static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 {
     (void)wp;
-    (void)lp;
 
     switch (msg)
     {
@@ -207,10 +367,25 @@ static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint( hwnd, &ps );
 
-        draw_scene( hdc );
+        draw_frame( hdc );
         EndPaint( hwnd, &ps );
         return 0;
     }
+    case WM_LBUTTONDOWN:
+        g_touch_active = 1;
+        g_touch_x = (short)LOWORD( lp );
+        g_touch_y = (short)HIWORD( lp );
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_touch_active)
+        {
+            g_touch_x = (short)LOWORD( lp );
+            g_touch_y = (short)HIWORD( lp );
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        g_touch_active = 0;
+        return 0;
     case WM_DESTROY:
         PostQuitMessage( 0 );
         return 0;
@@ -222,11 +397,13 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show )
 {
     WNDCLASSW wc = { 0 };
     HWND hwnd;
+    MSG msg;
 
     (void)prev;
     (void)cmd;
 
     probe_directory_enumeration();
+    init_scene();
 
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = inst;
@@ -245,5 +422,21 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show )
     ShowWindow( hwnd, show ? show : SW_SHOW );
     UpdateWindow( hwnd );   /* forces a synchronous WM_PAINT through the GDI path */
 
-    return 0;
+    /* Real-time loop: advance the animation, repaint, pump input, repeat.
+     * Runs until Minus is pressed (native-side exit(0), see runtime.c) or
+     * WM_QUIT is posted -- there's no in-app close button by design. */
+    for (;;)
+    {
+        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
+        {
+            if (msg.message == WM_QUIT) return (int)msg.wParam;
+            TranslateMessage( &msg );
+            DispatchMessageW( &msg );
+        }
+
+        update_scene();
+        InvalidateRect( hwnd, NULL, FALSE );
+        UpdateWindow( hwnd );
+        Sleep( 10 );
+    }
 }

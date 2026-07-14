@@ -35,7 +35,7 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
-#define WINE_NX_RUNTIME_BUILD "nx-batched-present-1"
+#define WINE_NX_RUNTIME_BUILD "nx-present-throttle-1"
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16
 
@@ -137,6 +137,11 @@ void wine_nx_runtime_trace( const char *msg )
 #define WINE_NX_FB_W 1280
 #define WINE_NX_FB_H 720
 
+/* Defined further down with the rest of the HUD/input state; started here so
+ * button polling runs at its own fixed rate from the moment the framebuffer
+ * comes up, instead of being tied to however often present() gets called. */
+static void wine_nx_hud_ensure_input_thread(void);
+
 /* Take the screen from the text console and bring up a linear framebuffer. */
 int wine_nx_fb_init(void)
 {
@@ -157,6 +162,7 @@ int wine_nx_fb_init(void)
     }
     framebufferMakeLinear( &wine_nx_fb );
     wine_nx_fb_ready = 1;
+    wine_nx_hud_ensure_input_thread();
     log_line( "[NXFB] framebuffer ready %dx%d", WINE_NX_FB_W, WINE_NX_FB_H );
     return 0;
 }
@@ -194,6 +200,193 @@ void wine_nx_fb_unlock(void)
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
 
+/***********************************************************************
+ * Debug HUD: a tiny native-side overlay proving the present-rate throttle
+ * (below) is actually doing something, without needing any bridge back to
+ * PE/Wine code. It draws directly into the same linear framebuffer the app
+ * already rendered into, right before framebufferEnd() submits it -- no
+ * new syscalls, no shared memory tricks, just raw pixels.
+ *
+ * "attempted" counts every present() call that had real dirty content
+ * ready to show; "executed" counts only the ones the throttle actually let
+ * through. Both are latched once per second into *_display alongside a
+ * live FPS reading (== executed/sec, since that's the real on-screen
+ * update rate). If the app hammers present() far faster than 60/sec,
+ * attempted should visibly run away from executed -- that gap *is* the
+ * throttle working.
+ *
+ * Toggled with the controller's Plus button; Minus exits to the homebrew
+ * menu. First hardware test found two real bugs here, both fixed below:
+ * Plus/Minus needed several presses (polling lived inline in present(),
+ * so a fast tap could land entirely between two poll calls on a slow
+ * render loop and never be seen as an edge -- see the dedicated input
+ * thread), and Minus crashed instead of exiting cleanly (it could call
+ * framebufferClose() while a framebufferBegin() was still outstanding,
+ * which is undefined/fatal -- the exit path now takes wine_nx_fb_mutex and
+ * balances any outstanding Begin with an End first). Not yet re-verified
+ * on hardware after this fix. If Minus still doesn't return to hbmenu, the
+ * physical HOME button always will.
+ */
+#define WINE_NX_HUD_SCALE 4  /* each 3x5 glyph cell -> 3*4 x 5*4 screen px */
+
+/* 3x5 bitmap font, 5 rows per glyph, low 3 bits per row (bit2=left pixel).
+ * Deliberately minimal: only the characters the HUD strings below use. */
+static unsigned char wine_nx_hud_glyph( char c, int row )
+{
+    static const unsigned char rows[][5] = {
+        /*0*/ {0x7,0x5,0x5,0x5,0x7}, /*1*/ {0x2,0x6,0x2,0x2,0x7},
+        /*2*/ {0x7,0x1,0x7,0x4,0x7}, /*3*/ {0x7,0x1,0x7,0x1,0x7},
+        /*4*/ {0x5,0x5,0x7,0x1,0x1}, /*5*/ {0x7,0x4,0x7,0x1,0x7},
+        /*6*/ {0x7,0x4,0x7,0x5,0x7}, /*7*/ {0x7,0x1,0x1,0x1,0x1},
+        /*8*/ {0x7,0x5,0x7,0x5,0x7}, /*9*/ {0x7,0x5,0x7,0x1,0x7},
+        /*F*/ {0x7,0x4,0x7,0x4,0x4}, /*P*/ {0x7,0x5,0x7,0x4,0x4},
+        /*S*/ {0x7,0x4,0x7,0x1,0x7}, /*R*/ {0x7,0x5,0x7,0x6,0x5},
+        /*E*/ {0x7,0x4,0x7,0x4,0x7}, /*A*/ {0x2,0x5,0x7,0x5,0x5},
+        /*T*/ {0x7,0x2,0x2,0x2,0x2}, /*X*/ {0x5,0x5,0x2,0x5,0x5},
+        /*I*/ {0x7,0x2,0x2,0x2,0x7}, /*:*/ {0x0,0x2,0x0,0x2,0x0},
+        /*[*/ {0x6,0x4,0x4,0x4,0x6}, /*]*/ {0x3,0x1,0x1,0x1,0x3},
+        /*+*/ {0x0,0x2,0x7,0x2,0x0}, /*-*/ {0x0,0x0,0x7,0x0,0x0},
+        /*V*/ {0x5,0x5,0x5,0x5,0x2}, /*G*/ {0x7,0x4,0x5,0x5,0x7},
+        /*M*/ {0x5,0x7,0x5,0x5,0x5}, /*N*/ {0x5,0x5,0x7,0x5,0x5},
+        /* */ {0x0,0x0,0x0,0x0,0x0},
+    };
+    static const char chars[] = "0123456789FPSREATXI:[]+-VGMN ";
+    const char *p = strchr( chars, c );
+    if (!p || row < 0 || row > 4) return 0;
+    return rows[p - chars][row];
+}
+
+static void wine_nx_hud_draw_text( uint32_t *fb, int fb_w, int fb_h, int stride,
+                                   int x0, int y0, const char *text, uint32_t color )
+{
+    int x = x0;
+
+    for (; *text; text++, x += 4 * WINE_NX_HUD_SCALE)
+    {
+        int row, col;
+        for (row = 0; row < 5; row++)
+        {
+            unsigned char bits = wine_nx_hud_glyph( *text, row );
+            for (col = 0; col < 3; col++)
+            {
+                int px, py;
+                if (!(bits & (1 << (2 - col)))) continue;
+                for (py = 0; py < WINE_NX_HUD_SCALE; py++)
+                for (px = 0; px < WINE_NX_HUD_SCALE; px++)
+                {
+                    int dx = x + col * WINE_NX_HUD_SCALE + px;
+                    int dy = y0 + row * WINE_NX_HUD_SCALE + py;
+                    if (dx >= 0 && dx < fb_w && dy >= 0 && dy < fb_h) fb[dy * stride + dx] = color;
+                }
+            }
+        }
+    }
+}
+
+#define WINE_NX_HUD_FPS_WINDOW 8  /* ~8s of 1s buckets for the rolling avg/min/max */
+
+static unsigned int wine_nx_hud_attempt_count, wine_nx_hud_executed_count;
+static unsigned int wine_nx_hud_attempt_display, wine_nx_hud_executed_display, wine_nx_hud_fps_display;
+static unsigned int wine_nx_hud_fps_history[WINE_NX_HUD_FPS_WINDOW];
+static unsigned int wine_nx_hud_fps_history_count, wine_nx_hud_fps_history_pos;
+static unsigned int wine_nx_hud_fps_avg_display, wine_nx_hud_fps_min_display, wine_nx_hud_fps_max_display;
+/* Wall-clock cost of the framebufferEnd() call itself (the actual
+ * linear->block-linear conversion + queue), separate from GDI paint cost or
+ * loop overhead -- added specifically to answer "is the ~60fps floor from
+ * the throttle below, or is each present() call itself taking far longer
+ * than that?" without guessing. */
+static uint64_t wine_nx_hud_present_ms_min = UINT64_MAX, wine_nx_hud_present_ms_max;
+static uint64_t wine_nx_hud_present_ms_min_display, wine_nx_hud_present_ms_max_display;
+static uint64_t wine_nx_hud_epoch_ms;
+static int wine_nx_hud_visible = 1;
+static PadState wine_nx_pad;
+
+/* Dedicated polling thread: Plus toggles the HUD, Minus exits to hbmenu.
+ * Runs at its own fixed ~30Hz rate independent of the present/render loop --
+ * button polling used to happen inline in present(), so a slow render loop
+ * (as turned out to be the case, see the present()-timing comment below)
+ * meant a fast tap could land entirely between two poll calls and never be
+ * seen as an edge at all. This thread can't miss a press for that reason. */
+static void *wine_nx_hud_input_thread_fn( void *arg )
+{
+    (void)arg;
+    padConfigureInput( 1, HidNpadStyleSet_NpadStandard );
+    padInitializeDefault( &wine_nx_pad );
+
+    for (;;)
+    {
+        u64 down;
+
+        padUpdate( &wine_nx_pad );
+        down = padGetButtonsDown( &wine_nx_pad );
+
+        if (down & HidNpadButton_Plus)
+        {
+            wine_nx_hud_visible = !wine_nx_hud_visible;
+            wine_nx_runtime_trace( wine_nx_hud_visible ? "[HUD] overlay ON" : "[HUD] overlay OFF" );
+        }
+        if (down & HidNpadButton_Minus)
+        {
+            wine_nx_runtime_trace( "[HUD] Minus pressed; exiting to hbmenu" );
+            /* Must hold the same mutex present()/lock() use: framebufferClose()
+             * while a framebufferBegin() is still outstanding (no matching End)
+             * is undefined/fatal, and this thread has no other way to know
+             * whether the render thread is mid-frame right now. Balance any
+             * outstanding Begin with an End first, then Close while still
+             * holding the lock so no new Begin can start underneath us. */
+            pthread_mutex_lock( &wine_nx_fb_mutex );
+            if (wine_nx_fb_ready)
+            {
+                if (wine_nx_fb_pending_bits) framebufferEnd( &wine_nx_fb );
+                framebufferClose( &wine_nx_fb );
+                wine_nx_fb_ready = 0;
+            }
+            pthread_mutex_unlock( &wine_nx_fb_mutex );
+            socketExit();
+            exit( 0 );
+        }
+
+        svcSleepThread( 33000000LL );   /* ~33ms, ~30Hz -- plenty for a button edge */
+    }
+    return NULL;
+}
+
+static pthread_t wine_nx_hud_input_thread;
+static int wine_nx_hud_input_thread_started;
+
+static void wine_nx_hud_ensure_input_thread(void)
+{
+    if (wine_nx_hud_input_thread_started) return;
+    wine_nx_hud_input_thread_started = 1;
+    pthread_create( &wine_nx_hud_input_thread, NULL, wine_nx_hud_input_thread_fn, NULL );
+}
+
+static void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride )
+{
+    char line[64];
+
+    if (!wine_nx_hud_visible) return;
+    /* Framebuffer byte order is R,G,B,A in memory (see wine_nx_surface_flush()
+     * in dlls/win32u/winnx_drv.c), so as a native uint32_t these constants are
+     * 0xAABBGGRR, not the more intuitive 0xAARRGGBB. */
+    snprintf( line, sizeof(line), "FPS:%u", wine_nx_hud_fps_display );
+    wine_nx_hud_draw_text( bits, fb_w, fb_h, stride, 24, 24, line, 0xffd4ea5eu ); /* RGB(94,234,212) */
+
+    snprintf( line, sizeof(line), "AVG:%u MIN:%u MAX:%u", wine_nx_hud_fps_avg_display,
+              wine_nx_hud_fps_min_display, wine_nx_hud_fps_max_display );
+    wine_nx_hud_draw_text( bits, fb_w, fb_h, stride, 24, 24 + 7 * WINE_NX_HUD_SCALE, line, 0xffd4ea5eu );
+
+    snprintf( line, sizeof(line), "PRES A:%u E:%u", wine_nx_hud_attempt_display, wine_nx_hud_executed_display );
+    wine_nx_hud_draw_text( bits, fb_w, fb_h, stride, 24, 24 + 14 * WINE_NX_HUD_SCALE, line, 0xffffffffu ); /* white */
+
+    snprintf( line, sizeof(line), "PMS MIN:%u MAX:%u", (unsigned)wine_nx_hud_present_ms_min_display,
+              (unsigned)wine_nx_hud_present_ms_max_display );
+    wine_nx_hud_draw_text( bits, fb_w, fb_h, stride, 24, 24 + 21 * WINE_NX_HUD_SCALE, line, 0xffffffffu );
+
+    wine_nx_hud_draw_text( bits, fb_w, fb_h, stride, 24, 24 + 28 * WINE_NX_HUD_SCALE,
+                           "[+]STATS [-]EXIT", 0xffffdbc4u ); /* RGB(196,219,255) */
+}
+
 /* framebufferEnd() converts the *entire* 1280x720 shadow buffer to
  * block-linear before queueing it, regardless of how small the actual dirty
  * region was (see wine-nx-probe/README.md, "Presentation Is Still Too Slow").
@@ -208,11 +401,25 @@ void wine_nx_fb_unlock(void)
  * the existing batching already coalesces multiple flush() calls into one
  * present.
  *
- * UNVERIFIED ON HARDWARE: no Switch console or working homebrew-capable
- * emulator was available to measure this. The reasoning above is sound
- * given framebufferEnd()'s documented full-buffer cost, but "how much did
- * this actually help" has not been measured -- treat this as a reviewed,
- * ready-to-test change, not a proven fix. */
+ * First hardware numbers (2fps, identical before/after a CPU overclock) rule
+ * out this 16ms/~60fps floor as the cause by themselves: armGetSystemTick()
+ * is the ARM generic timer, a fixed-frequency reference clock that is
+ * deliberately independent of core clock speed (required so wall-clock time
+ * stays correct under CPU overclocking), so this comparison would behave
+ * identically at any CPU clock regardless of whether the 16ms threshold
+ * itself were the bottleneck. That rules out "the threshold math reads a
+ * clock the overclock affects" but not "something takes longer than 16ms
+ * every time, so the threshold never actually binds" -- CPU-clock-invariant
+ * results are equally consistent with framebufferEnd()'s own conversion
+ * cost being the real, non-CPU-bound floor (e.g. a fixed-function/DMA path,
+ * matching this project's own pre-existing "Presentation Is Still Too Slow"
+ * note above) as with a bug elsewhere in the loop. wine_nx_hud_present_ms_*
+ * below measures the actual wall time inside framebufferEnd() itself, so the
+ * next hardware run gives a real answer instead of another guess: if PMS
+ * MIN/MAX is itself close to 500ms, framebufferEnd() is the bottleneck; if
+ * it's small (close to the 16ms floor) while FPS is still ~2, the loop is
+ * stalling somewhere else (GDI paint cost, Sleep(), message dispatch) and
+ * that's where to look next. */
 #define WINE_NX_FB_MIN_PRESENT_INTERVAL_MS 16  /* ~60 Hz cap; adjust to taste */
 
 static uint64_t wine_nx_fb_last_present_ms;
@@ -224,10 +431,55 @@ void wine_nx_fb_present(void)
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (wine_nx_fb_ready && wine_nx_fb_pending_bits && wine_nx_fb_pending_dirty && !wine_nx_fb_lock_depth)
     {
+        wine_nx_hud_attempt_count++;
         now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        if (!wine_nx_hud_epoch_ms) wine_nx_hud_epoch_ms = now_ms;
+        if (now_ms - wine_nx_hud_epoch_ms >= 1000)
+        {
+            unsigned int i, sum, mn, mx;
+
+            wine_nx_hud_attempt_display = wine_nx_hud_attempt_count;
+            wine_nx_hud_executed_display = wine_nx_hud_executed_count;
+            wine_nx_hud_fps_display = wine_nx_hud_executed_count;
+
+            wine_nx_hud_fps_history[wine_nx_hud_fps_history_pos] = wine_nx_hud_executed_count;
+            wine_nx_hud_fps_history_pos = (wine_nx_hud_fps_history_pos + 1) % WINE_NX_HUD_FPS_WINDOW;
+            if (wine_nx_hud_fps_history_count < WINE_NX_HUD_FPS_WINDOW) wine_nx_hud_fps_history_count++;
+
+            sum = 0;
+            mn = mx = wine_nx_hud_fps_history[0];
+            for (i = 0; i < wine_nx_hud_fps_history_count; i++)
+            {
+                unsigned int v = wine_nx_hud_fps_history[i];
+                sum += v;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            wine_nx_hud_fps_avg_display = sum / wine_nx_hud_fps_history_count;
+            wine_nx_hud_fps_min_display = mn;
+            wine_nx_hud_fps_max_display = mx;
+
+            wine_nx_hud_present_ms_min_display = wine_nx_hud_executed_count ? wine_nx_hud_present_ms_min : 0;
+            wine_nx_hud_present_ms_max_display = wine_nx_hud_present_ms_max;
+
+            wine_nx_hud_attempt_count = 0;
+            wine_nx_hud_executed_count = 0;
+            wine_nx_hud_present_ms_min = UINT64_MAX;
+            wine_nx_hud_present_ms_max = 0;
+            wine_nx_hud_epoch_ms = now_ms;
+        }
         if (now_ms - wine_nx_fb_last_present_ms >= WINE_NX_FB_MIN_PRESENT_INTERVAL_MS)
         {
+            uint64_t t0, t1, dt;
+
+            wine_nx_hud_executed_count++;
+            wine_nx_hud_draw( wine_nx_fb_pending_bits, WINE_NX_FB_W, WINE_NX_FB_H, wine_nx_fb_pending_stride );
+            t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
             framebufferEnd( &wine_nx_fb );
+            t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+            dt = t1 - t0;
+            if (dt < wine_nx_hud_present_ms_min) wine_nx_hud_present_ms_min = dt;
+            if (dt > wine_nx_hud_present_ms_max) wine_nx_hud_present_ms_max = dt;
             wine_nx_fb_pending_bits = NULL;
             wine_nx_fb_pending_stride = 0;
             wine_nx_fb_pending_dirty = 0;
