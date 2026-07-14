@@ -575,6 +575,7 @@ target_link_libraries(wine-nx-deko3d-smoke PRIVATE deko3d nx m)
 
 add_executable(wine-nx-runtime
     source/runtime.c
+    source/runtime_deko3d.c
     source/runtime_platform.c
     source/ntdll_pe_compat.c
     source/ws2_32_unix_stub.c
@@ -625,7 +626,7 @@ find_library(SWITCH_PNG png HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_BZ2 bz2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_Z z HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 target_link_libraries(wine-nx-runtime PRIVATE
-    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} nx m)
+    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} deko3d nx m)
 
 find_program(NACPTOOL nacptool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(ELF2NRO elf2nro HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")

@@ -50,6 +50,13 @@ extern const char *wine_nx_loader_last_open_path(void);
 extern NTSTATUS wine_nx_loader_last_open_status(void);
 extern const char *wine_nx_loader_last_export_diag(void);
 
+/* Deko3d compositor backend (runtime_deko3d.c) -- additive, opt-in via
+ * WINE_NX_DEKO3D, see wine_nx_fb_backend_select() below. */
+extern int wine_nx_deko3d_fb_init(void);
+extern void *wine_nx_deko3d_fb_lock( int *width, int *height, int *stride_px );
+extern void wine_nx_deko3d_fb_unlock(void);
+extern void wine_nx_deko3d_fb_present(void);
+
 static FILE *log_file;
 
 struct runtime_module
@@ -142,17 +149,81 @@ void wine_nx_runtime_trace( const char *msg )
  * comes up, instead of being tied to however often present() gets called. */
 static void wine_nx_hud_ensure_input_thread(void);
 
-/* Take the screen from the text console and bring up a linear framebuffer. */
+/* Defined further down (near target.txt/run-entry.txt handling); forward
+ * declared here so backend selection can reuse the exact same file-based
+ * config pattern instead of inventing a second one. */
+static int read_bool_file( const char *path );
+
+/* Backend selection: additive and opt-in, same spirit as WINE_NX_HOST_SIM
+ * gating the win32u display driver choice in dlls/win32u/driver.c. Default
+ * (WINE_NX_DEKO3D unset/false) is this file's existing libnx-framebuffer
+ * path, completely untouched below -- the deko3d path lives entirely in
+ * runtime_deko3d.c and is only reached via the dispatch checks at the top
+ * of each of the four functions below.
+ *
+ * Checks an env var first, as asked -- but this runtime is launched as
+ * Switch homebrew via hbmenu, not from a shell, and nothing else in this
+ * project relies on getenv() ever seeing anything real in that launch path
+ * (grep the tree: the only other getenv() call is inside the *hosted PE*
+ * environment-variable emulation, a completely different, internal table,
+ * not real process environment). Every other piece of "configure this
+ * launch without a shell" in this project (target.txt, run-entry.txt) is a
+ * file on the SD card instead, so WINE_ROOT/deko3d.txt is checked too --
+ * without it, WINE_NX_DEKO3D would very likely be silently unreachable
+ * from an actual hbmenu launch, defeating the entire point of an opt-in
+ * switch. Whichever one (if either) actually engages, the choice made is
+ * always logged explicitly (not just inferred from later log lines), so a
+ * silent fallback to the default path never looks like deko3d engaged. */
+static int wine_nx_fb_backend_checked;
+static int wine_nx_fb_use_deko3d;
+
+static void wine_nx_fb_backend_select(void)
+{
+    const char *env;
+    int file_flag;
+    if (wine_nx_fb_backend_checked) return;
+    wine_nx_fb_backend_checked = 1;
+    env = getenv( "WINE_NX_DEKO3D" );
+    file_flag = read_bool_file( RUNTIME_DIR "/deko3d.txt" );
+    wine_nx_fb_use_deko3d = (env && env[0]) || file_flag;
+    log_line( "[NXFB] backend: %s (env=%s file=%s)",
+             wine_nx_fb_use_deko3d ? "deko3d" : "libnx framebuffer (default)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
+/* Take the screen from the text console and bring up a linear framebuffer.
+ * The console-exit step is shared by both backends -- deko3d's swapchain
+ * needs the same nwindow handoff the libnx Framebuffer path already needed,
+ * so it's hoisted above the backend dispatch rather than duplicated in
+ * runtime_deko3d.c. wine_nx_console_active itself is the idempotency guard
+ * (already 0 after the first call), so doing this check before the
+ * existing wine_nx_fb_ready early-return doesn't change observable
+ * behavior for the libnx path -- console-exit still only ever runs once. */
 int wine_nx_fb_init(void)
 {
     Result rc;
-    if (wine_nx_fb_ready) return 0;
-    log_line( "[NXFB] fb_init: taking screen from console" );
+    wine_nx_fb_backend_select();
     if (wine_nx_console_active)
     {
         consoleExit( NULL );
         wine_nx_console_active = 0;
+        /* consoleInit()'s default (non-GPU) renderer registers its own
+         * buffers against nwindowGetDefault() -- per native_window.h,
+         * "all buffers registered with a NWindow must have the same
+         * dimensions, format and usage", and nwindowReleaseBuffers() is
+         * the documented API for clearing that registration so a new
+         * producer can configure the window fresh. The libnx Framebuffer
+         * path below has always worked without this call because
+         * framebufferCreate() apparently tolerates/renegotiates a stale
+         * registration; dkSwapchainCreate() is not proven to, and this is
+         * the first codepath to hand the post-console nwindow to deko3d,
+         * so release explicitly rather than relying on that assumption. */
+        nwindowReleaseBuffers( nwindowGetDefault() );
+        log_line( "[NXFB] nwindow buffers released (console handoff)" );
     }
+    if (wine_nx_fb_use_deko3d) return wine_nx_deko3d_fb_init();
+    if (wine_nx_fb_ready) return 0;
+    log_line( "[NXFB] fb_init: taking screen from console" );
     rc = framebufferCreate( &wine_nx_fb, nwindowGetDefault(),
                             WINE_NX_FB_W, WINE_NX_FB_H, PIXEL_FORMAT_RGBA_8888, 3 );
     if (R_FAILED( rc ))
@@ -172,6 +243,9 @@ void *wine_nx_fb_lock( int *width, int *height, int *stride_px )
 {
     u32 stride = 0;
     void *bits = NULL;
+
+    wine_nx_fb_backend_select();
+    if (wine_nx_fb_use_deko3d) return wine_nx_deko3d_fb_lock( width, height, stride_px );
 
     if (!wine_nx_fb_ready && wine_nx_fb_init()) return NULL;
     pthread_mutex_lock( &wine_nx_fb_mutex );
@@ -195,6 +269,8 @@ void *wine_nx_fb_lock( int *width, int *height, int *stride_px )
 
 void wine_nx_fb_unlock(void)
 {
+    if (wine_nx_fb_use_deko3d) { wine_nx_deko3d_fb_unlock(); return; }
+
     wine_nx_fb_pending_dirty = 1;
     if (wine_nx_fb_lock_depth > 0) wine_nx_fb_lock_depth--;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
@@ -427,6 +503,8 @@ static uint64_t wine_nx_fb_last_present_ms;
 void wine_nx_fb_present(void)
 {
     uint64_t now_ms;
+
+    if (wine_nx_fb_use_deko3d) { wine_nx_deko3d_fb_present(); return; }
 
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (wine_nx_fb_ready && wine_nx_fb_pending_bits && wine_nx_fb_pending_dirty && !wine_nx_fb_lock_depth)
