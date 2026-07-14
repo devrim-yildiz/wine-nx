@@ -128,6 +128,24 @@ The current real-app milestone is Wine Notepad:
 - popups can be drawn and dismissed;
 - the app is visibly alive, but slow and not yet a comfortable UI.
 
+### GUI Smoke Demo: Animated HUD
+
+`wine-nx-probe/samples/gui-smoke/gui_smoke.c` (`WINE_NX_APP=gui`) extends the
+Notepad-adjacent GDI smoke test with a small bouncing-ball/rectangles
+animation (touch-attraction while held) driven by a real `PeekMessageW` loop,
+instead of a single static paint. A native-side HUD (drawn directly into the
+framebuffer, no PE-side cost) overlays live present-rate stats: instantaneous
+FPS, an 8-second rolling avg/min/max, attempted-vs-executed presents per
+second, and the wall-clock cost of `framebufferEnd()` itself -- toggled with
+Plus.
+
+**Tested on hardware:** shapes animate and bounce correctly; Plus reliably
+toggles the HUD overlay on/off.
+**Known issue, not yet fixed:** Minus (intended to exit cleanly back to
+hbmenu) crashes to the system Home Menu instead. Deferred to a later pass --
+not blocking, but real; the physical HOME button is the only clean way out
+of this demo for now.
+
 ### Host-Side Development (macOS/Linux, No Console Needed)
 
 `dlls/win32u/winnx_drv.c` (the Switch display driver) turns out to call zero
@@ -175,8 +193,25 @@ present path can still become expensive.
 The current batching patch reduces how often this happens, and a present-rate
 cap (~60Hz, in `wine_nx_fb_present()`) was added on top of that so redundant
 full-buffer conversions beyond what the display can even show get folded into
-the next due present instead of each paying the full cost -- **compile-verified
-only, not yet measured on hardware or an emulator.**
+the next due present instead of each paying the full cost.
+
+**Update, first real hardware measurement (via the animated HUD demo, see
+below):** this theory does **not** hold up as the current bottleneck. Real
+numbers, both at stock clock and under a CPU overclock:
+
+| | FPS | attempted | executed | `framebufferEnd()` ms |
+|---|---|---|---|---|
+| overclocked | 2 | 2 | 2 | 3-4 |
+| stock clock | 2 | 2 | 2 | 4-5 |
+
+`framebufferEnd()` itself is fast -- 3-5ms, nowhere near the ~500ms/frame
+that a steady 2fps implies -- and attempted == executed means the ~60Hz
+throttle isn't gating anything right now; every attempt is already going
+through. Whatever caps this at 2fps is elsewhere: GDI paint cost, `Sleep()`,
+message dispatch, or how often `wine_nx_fb_present()` actually gets invoked
+per loop iteration. The full-buffer block-linear conversion may still matter
+once that real bottleneck is found and fixed, but **it is not where the next
+investigation should start.**
 
 The real performance step is still a GPU presentation path. The preferred
 direction is a Vulkan/NVK compositor: upload Wine DIB/window surfaces into GPU
@@ -352,7 +387,7 @@ WINE_NX_APP=notepad ./wine-nx-probe/build-switch.sh
 4. Confirm the runtime log starts with the expected marker, for example:
 
 ```text
-[BUILD] nx-batched-present-1
+[BUILD] nx-present-throttle-1
 ```
 
 5. Check:
