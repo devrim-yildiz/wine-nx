@@ -36,7 +36,14 @@
 
 #include "fsync.h"
 
+/* ntsync_tmp.h pulls in <linux/types.h>, Linux-only. Every use of its
+ * NTSYNC_IOC_* constants below is already guarded by
+ * #ifdef NTSYNC_IOC_EVENT_READ with a working fallback, so skipping this
+ * on non-Linux hosts (e.g. macOS) is safe -- same fix as
+ * dlls/ntdll/unix/sync.c. */
+#ifdef __linux__
 #include "ntsync_tmp.h"
+#endif
 
 #ifdef NTSYNC_IOC_EVENT_READ
 

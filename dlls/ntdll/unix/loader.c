@@ -42,7 +42,11 @@
 #endif
 #include <sys/wait.h>
 #include <unistd.h>
-#include <malloc.h>
+#ifdef __linux__
+/* glibc-only (mallopt/M_PERTURB below is already independently guarded by
+ * #ifdef M_PERTURB, so just skipping this on non-Linux hosts is safe). */
+# include <malloc.h>
+#endif
 #ifdef __SWITCH__
 # include "horizon_dlfcn.h"
 #else

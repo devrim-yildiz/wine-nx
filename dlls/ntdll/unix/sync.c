@@ -65,7 +65,11 @@
 # include <sys/event.h>
 #endif
 
-#ifndef __SWITCH__
+/* ntsync_tmp.h pulls in <linux/types.h>, which only exists on Linux. Every
+ * actual use of its NTSYNC_IOC_* constants further down is already guarded by
+ * #ifdef NTSYNC_IOC_EVENT_READ with a working fallback path, so just not
+ * defining them on a non-Linux host (e.g. macOS) is safe. */
+#if !defined(__SWITCH__) && defined(__linux__)
 # include "ntsync_tmp.h"
 #endif
 

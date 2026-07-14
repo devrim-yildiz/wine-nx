@@ -25,7 +25,12 @@
 
 #include "config.h"
 
-#ifdef __SWITCH__
+/* The real implementation below is Linux-only (raw __NR_futex*syscalls, no
+ * portability guards). __SWITCH__ already has a matching stub with identical
+ * signatures; reuse it for any other non-Linux host (e.g. macOS host builds)
+ * instead of hitting undeclared __NR_futex there. fsync_enabled=0 just makes
+ * Wine fall back to normal wineserver-mediated sync objects. */
+#if defined(__SWITCH__) || !defined(__linux__)
 
 #include <pthread.h>
 

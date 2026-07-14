@@ -52,6 +52,14 @@
 #define __NR_futex_waitv 449
 #endif
 
+/* futex_wake() below is only ever reached on paths gated by
+ * fsync_check_support(), which is already #ifdef __linux__ (returns 0
+ * elsewhere) -- this placeholder just lets it compile on non-Linux hosts
+ * (e.g. macOS) without ever actually being invoked there. */
+#ifndef __NR_futex
+#define __NR_futex 240
+#endif
+
 int do_fsync_cached = -1;
 
 int fsync_check_support(void)
