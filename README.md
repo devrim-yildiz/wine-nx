@@ -128,6 +128,37 @@ The current real-app milestone is Wine Notepad:
 - popups can be drawn and dismissed;
 - the app is visibly alive, but slow and not yet a comfortable UI.
 
+### Host-Side Development (macOS/Linux, No Console Needed)
+
+`dlls/win32u/winnx_drv.c` (the Switch display driver) turns out to call zero
+libnx symbols directly -- it only calls a handful of `wine_nx_fb_*`/
+`wine_nx_touch_poll()` hooks that `wine-nx-probe/source/runtime.c` implements
+on hardware via the libnx framebuffer. `dlls/win32u/winnx_host_sim.c`
+implements those same hooks with SDL2 instead, so the real, unmodified
+display driver links and runs against a plain host build:
+
+```sh
+WINE_NX_HOST_SIM=1 wine ...
+```
+
+See `wine-nx-probe/switch-shims/README.md` for the architecture and what's
+*not* faithfully simulated (multi-touch, and critically, presentation
+*performance* -- SDL2's cost model has nothing to do with the real
+block-linear conversion bottleneck below, so this is for rendering/input
+correctness, not perf).
+
+`wine-nx-probe/docker-host-sim/` runs this in a Linux container, needed
+because native execution on at least one macOS host hit an unrelated,
+OS-level block -- see
+`wine-nx-probe/switch-shims/macos26-loader-incompatibility.md`.
+
+Status: compiles and links cleanly on both macOS and Linux/aarch64.
+Actually rendering something on screen through this path is still blocked by
+a separate, pre-existing bug in this fork's customized PE loader -- any
+top-level `wine <program>` invocation fails to load kernel32.dll right after
+the automatic wineboot spawn/wait, reproducible even with a trivial
+hello-world and independent of the host-sim itself. Not yet fixed.
+
 ## Current Problems
 
 ### Presentation Is Still Too Slow
@@ -141,11 +172,20 @@ the driver easy to write, but every `framebufferEnd()` converts the full
 Switch compositor. Even if Wine only changes a small menu highlight, the
 present path can still become expensive.
 
-The current batching patch reduces how often this happens, but the real
-performance step is a GPU presentation path. Since this tree already has a
-Mesa/NVK Vulkan port available, the preferred direction is a Vulkan/NVK
-compositor: upload Wine DIB/window surfaces into GPU textures, composite them,
-and present once per frame.
+The current batching patch reduces how often this happens, and a present-rate
+cap (~60Hz, in `wine_nx_fb_present()`) was added on top of that so redundant
+full-buffer conversions beyond what the display can even show get folded into
+the next due present instead of each paying the full cost -- **compile-verified
+only, not yet measured on hardware or an emulator.**
+
+The real performance step is still a GPU presentation path. The preferred
+direction is a Vulkan/NVK compositor: upload Wine DIB/window surfaces into GPU
+textures, composite them, and present once per frame -- but there is currently
+**no** Mesa/NVK Vulkan port anywhere in this tree (a prior version of this
+README claimed otherwise; that wasn't accurate). See
+`wine-nx-probe/3d-accel-scoping.md` for scoping notes on this milestone,
+including the deko3d-vs-NVK tradeoff and why finding/building that port is the
+actual first blocker, ahead of writing any compositor code.
 
 ### UI Completeness Is Still Early
 
@@ -355,6 +395,16 @@ dlls/ntdll/unix/file.c
 dlls/ntdll/unix/process.c
 dlls/ntdll/unix/thread.c
 dlls/ntdll/unix/signal_arm64.c
+```
+
+Host-side development (no console needed, see "Host-Side Development" above):
+
+```text
+dlls/win32u/winnx_host_sim.c
+wine-nx-probe/switch-shims/README.md
+wine-nx-probe/switch-shims/macos26-loader-incompatibility.md
+wine-nx-probe/docker-host-sim/
+wine-nx-probe/3d-accel-scoping.md
 ```
 
 Smoke targets:
