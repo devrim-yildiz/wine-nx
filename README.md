@@ -146,6 +146,31 @@ hbmenu) crashes to the system Home Menu instead. Deferred to a later pass --
 not blocking, but real; the physical HOME button is the only clean way out
 of this demo for now.
 
+### Deko3d Bring-Up Smoke Test
+
+`wine-nx-probe/source/deko3d_smoke.c` (`wine-nx-deko3d-smoke.nro`, standalone
+homebrew, independent of the Wine runtime and SD package) is the GPU-
+compositor milestone's proof-of-pipeline, built in three stages, all
+**hardware-confirmed running together at 60-62fps** for a 5-10 second test:
+device/queue/swapchain/present against the same `nwindowGetDefault()` handle
+`wine_nx_fb_init()` uses (scissor+clear only, no shaders); a CPU-generated
+texture uploaded straight onto a framebuffer sub-rect via
+`dkCmdBufCopyBufferToImage()`; and a real shader-driven rotating cube (uam-
+compiled shaders, depth buffer, a fence-protected dynamic command ring for
+the per-frame rotation matrix). Real shader/geometry work costs no
+measurable fps over the clear-only baseline. See
+`wine-nx-probe/3d-accel-scoping.md` for the full writeup, including what's
+still open (an actual sampled-textured-quad -- upload and shaders are each
+proven, not combined -- and the real `wine_nx_fb_lock/unlock/present` swap).
+
+Two real crash bugs surfaced building this, both root-caused from hardware
+crash logs rather than guessed at: a missing `romfsInit()` call (so
+`fopen("romfs:/shaders/...")` returned `NULL` and the very next line
+crashed), and `DkMemBlockCreate()` sizes that weren't rounded up to the
+required 4096-byte alignment for small CPU-data buffers. Both are documented
+at the top of `deko3d_smoke.c` for anyone touching deko3d in this project
+next.
+
 ### Host-Side Development (macOS/Linux, No Console Needed)
 
 `dlls/win32u/winnx_drv.c` (the Switch display driver) turns out to call zero
@@ -215,18 +240,22 @@ investigation should start.**
 
 The real performance step is still a GPU presentation path: upload Wine
 DIB/window surfaces into GPU textures, composite them, and present once per
-frame. **The Vulkan/NVK question is now resolved, not just corrected:**
-checked directly against the devkitpro/devkita64 toolchain image (the same
-one `build-switch.sh` builds with) -- there is no Vulkan, NVK, or any
-Vulkan-capable driver anywhere in it, and there structurally can't be one
-under Horizon OS, since NVK is built on Linux's `nouveau` DRM kernel driver
-and Horizon isn't Linux. Real Mesa **OpenGL ES** is available instead (a
-Switch-native `libdrm_nouveau` shim under the same old, pre-NVK Mesa), and
-**deko3d** (Switch homebrew's own low-level GPU API) is available too --
-both already installed in the toolchain, both bind to the same
-`nwindowGetDefault()` handle `wine_nx_fb_init()` already uses. See
-`wine-nx-probe/3d-accel-scoping.md` for the full evidence and the updated
-recommendation (deko3d over OpenGL ES, both over the now-dead NVK option).
+frame. **The Vulkan/NVK question is resolved:** checked directly against the
+devkitpro/devkita64 toolchain image (the same one `build-switch.sh` builds
+with) -- there is no Vulkan, NVK, or any Vulkan-capable driver anywhere in
+it, and there structurally can't be one under Horizon OS, since NVK is built
+on Linux's `nouveau` DRM kernel driver and Horizon isn't Linux. Real Mesa
+**OpenGL ES** is available instead (a Switch-native `libdrm_nouveau` shim
+under the same old, pre-NVK Mesa), and **deko3d** (Switch homebrew's own
+low-level GPU API) is available too -- both bind to the same
+`nwindowGetDefault()` handle `wine_nx_fb_init()` already uses.
+
+**deko3d is now hardware-confirmed, not just recommended:** a standalone
+bring-up smoke test (see "Deko3d Bring-Up Smoke Test" above) proves device/
+queue/swapchain/present, a CPU-to-GPU texture upload, and real shader-driven
+3D geometry all running together at 60-62fps. Not yet wired into
+`wine_nx_fb_lock/unlock/present` -- see `wine-nx-probe/3d-accel-scoping.md`
+for the full evidence and what's still open before that swap happens.
 
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
@@ -474,22 +503,28 @@ Smoke targets:
 ```text
 wine-nx-probe/samples/gui-smoke
 wine-nx-probe/samples/curl-arm64
+wine-nx-probe/source/deko3d_smoke.c
 ```
 
 ## Next Milestones
 
 1. Presentation performance
 
-Replace or bypass the expensive linear framebuffer path. **Resolved:** NVK
-(Mesa's Vulkan driver) is confirmed not available for Switch homebrew --
-verified directly against the devkitpro/devkita64 toolchain image, not
-assumed. See `wine-nx-probe/3d-accel-scoping.md` for the evidence and the
-updated recommendation (deko3d, not Vulkan/NVK):
+Replace or bypass the expensive linear framebuffer path. **NVK confirmed
+not available** for Switch homebrew (verified directly against the
+devkitpro/devkita64 toolchain image, not assumed), and **deko3d's core
+pipeline is hardware-confirmed working** (device/queue/swapchain/present,
+texture upload, and real shader-driven geometry, all at 60-62fps -- see
+"Deko3d Bring-Up Smoke Test" above and `wine-nx-probe/3d-accel-scoping.md`).
+Still open before this is a real compositor:
 
-- deko3d compositor for Wine software window surfaces;
-- DIB/window surface upload into GPU textures;
-- popup/window composition on GPU;
-- one present per frame.
+- an actual sampled-textured-quad (upload and shaders are each proven,
+  never combined -- may or may not turn out to be necessary);
+- wiring the validated deko3d logic into
+  `wine_nx_fb_lock/unlock/present` in `wine-nx-probe/source/runtime.c`,
+  kept alongside (not replacing) the current libnx-framebuffer path so
+  there's a fallback;
+- popup/window composition on GPU, one present per frame.
 
 Real Mesa **OpenGL ES** (not Vulkan) is also confirmed available in the same
 toolchain (`switch-mesa`/EGL/GLES, via a Switch-native `libdrm_nouveau`
