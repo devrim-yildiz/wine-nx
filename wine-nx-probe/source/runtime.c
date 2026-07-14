@@ -221,7 +221,24 @@ int wine_nx_fb_init(void)
         nwindowReleaseBuffers( nwindowGetDefault() );
         log_line( "[NXFB] nwindow buffers released (console handoff)" );
     }
-    if (wine_nx_fb_use_deko3d) return wine_nx_deko3d_fb_init();
+    if (wine_nx_fb_use_deko3d)
+    {
+        if (wine_nx_deko3d_fb_init() == 0) return 0;
+        /* Safety net: any deko3d init failure, at any step, degrades to the
+         * proven libnx path instead of leaving the app with a permanently
+         * zeroed framebuffer -- confirmed on hardware to otherwise spin the
+         * message loop uncontrolled with nothing to pace itself against
+         * (no crash, no fallback, just a dead compositor). Flipping the
+         * shared wine_nx_fb_use_deko3d flag here means every other dispatch
+         * point (wine_nx_fb_lock/unlock/present) automatically follows suit
+         * from now on -- they already just read this same flag, so nothing
+         * else needs to change for the fallback to hold for the rest of the
+         * run. This is unconditional: whatever the future root cause of a
+         * deko3d failure turns out to be, this path must still degrade
+         * gracefully rather than hang. */
+        log_line( "[NXFB] deko3d init failed; falling back to libnx framebuffer path" );
+        wine_nx_fb_use_deko3d = 0;
+    }
     if (wine_nx_fb_ready) return 0;
     log_line( "[NXFB] fb_init: taking screen from console" );
     rc = framebufferCreate( &wine_nx_fb, nwindowGetDefault(),
@@ -245,7 +262,23 @@ void *wine_nx_fb_lock( int *width, int *height, int *stride_px )
     void *bits = NULL;
 
     wine_nx_fb_backend_select();
-    if (wine_nx_fb_use_deko3d) return wine_nx_deko3d_fb_lock( width, height, stride_px );
+    if (wine_nx_fb_use_deko3d)
+    {
+        void *deko3d_bits = wine_nx_deko3d_fb_lock( width, height, stride_px );
+        if (deko3d_bits) return deko3d_bits;
+        /* wine_nx_deko3d_fb_lock() only ever returns NULL when its own lazy
+         * wine_nx_deko3d_fb_init() failed (confirmed by reading its body --
+         * every other return path hands back a real, non-NULL staging
+         * pointer). This is the actual first call site that triggers
+         * deko3d init in practice (confirmed on hardware: the runtime never
+         * reaches wine_nx_fb_init() before this), so the same safety-net
+         * fallback lives here too, not just in wine_nx_fb_init(). Falling
+         * through to wine_nx_fb_init() below now runs it with
+         * wine_nx_fb_use_deko3d already cleared, so it takes the libnx
+         * path directly instead of re-attempting and re-failing deko3d. */
+        log_line( "[NXFB] deko3d fb_lock failed (init never succeeded); falling back to libnx framebuffer path" );
+        wine_nx_fb_use_deko3d = 0;
+    }
 
     if (!wine_nx_fb_ready && wine_nx_fb_init()) return NULL;
     pthread_mutex_lock( &wine_nx_fb_mutex );
