@@ -250,12 +250,24 @@ under the same old, pre-NVK Mesa), and **deko3d** (Switch homebrew's own
 low-level GPU API) is available too -- both bind to the same
 `nwindowGetDefault()` handle `wine_nx_fb_init()` already uses.
 
-**deko3d is now hardware-confirmed, not just recommended:** a standalone
-bring-up smoke test (see "Deko3d Bring-Up Smoke Test" above) proves device/
-queue/swapchain/present, a CPU-to-GPU texture upload, and real shader-driven
-3D geometry all running together at 60-62fps. Not yet wired into
-`wine_nx_fb_lock/unlock/present` -- see `wine-nx-probe/3d-accel-scoping.md`
-for the full evidence and what's still open before that swap happens.
+**deko3d is hardware-confirmed as a standalone smoke test, but the actual
+compositor swap is architecturally blocked, not just unfinished:** the
+smoke test (see "Deko3d Bring-Up Smoke Test" above) proves device/queue/
+swapchain/present, a CPU-to-GPU texture upload, and real shader-driven 3D
+geometry all running together at 60-62fps. Wiring that into
+`wine_nx_fb_lock/unlock/present` as an opt-in backend was attempted and
+consistently fails at swapchain/display creation, root-caused through
+hardware-log-driven diagnosis into libnx's own `__appInit`/`__nx_win_init`
+crt0 hook: this binary's required libnx-framebuffer fallback references
+`nwindowGetDefault()`, which unconditionally opens a `vi` display before
+`main()` even runs, before deko3d ever gets a chance to be the first
+consumer -- the exact scenario every real deko3d reference (Borealis,
+`deko_basic`, `deko_console`) requires and none of them violate, because
+none of them ship a runtime-selectable libnx/deko3d choice in one binary.
+The runtime falls back to the proven libnx path automatically on any
+deko3d failure, so this is a parked dead end, not a regression -- see
+`wine-nx-probe/3d-accel-scoping.md` for the full root-cause trace and the
+real path forward (a separate build target, not a fix to this one).
 
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
@@ -513,18 +525,19 @@ wine-nx-probe/source/deko3d_smoke.c
 Replace or bypass the expensive linear framebuffer path. **NVK confirmed
 not available** for Switch homebrew (verified directly against the
 devkitpro/devkita64 toolchain image, not assumed), and **deko3d's core
-pipeline is hardware-confirmed working** (device/queue/swapchain/present,
-texture upload, and real shader-driven geometry, all at 60-62fps -- see
-"Deko3d Bring-Up Smoke Test" above and `wine-nx-probe/3d-accel-scoping.md`).
-Still open before this is a real compositor:
-
-- an actual sampled-textured-quad (upload and shaders are each proven,
-  never combined -- may or may not turn out to be necessary);
-- wiring the validated deko3d logic into
-  `wine_nx_fb_lock/unlock/present` in `wine-nx-probe/source/runtime.c`,
-  kept alongside (not replacing) the current libnx-framebuffer path so
-  there's a fallback;
-- popup/window composition on GPU, one present per frame.
+pipeline is hardware-confirmed working in isolation** (device/queue/
+swapchain/present, texture upload, and real shader-driven geometry, all at
+60-62fps -- see "Deko3d Bring-Up Smoke Test" above), but **wiring it into
+`wine_nx_fb_lock/unlock/present` as an opt-in backend is architecturally
+blocked**, not just unfinished: this binary's required libnx-framebuffer
+fallback references `nwindowGetDefault()`, which libnx's own `__appInit`/
+`__nx_win_init` crt0 hook unconditionally opens a `vi` display for before
+`main()` even runs -- deko3d can never be the first `vi` consumer in a
+binary that also contains the libnx fallback. Full root-cause trace and
+what a real fix would require (a separate build target, not a change to
+this one) in `wine-nx-probe/3d-accel-scoping.md`. The opt-in code
+(`runtime_deko3d.c`) is kept, with an automatic, hardware-confirmed
+fallback to the libnx path on any deko3d failure -- parked, not removed.
 
 Real Mesa **OpenGL ES** (not Vulkan) is also confirmed available in the same
 toolchain (`switch-mesa`/EGL/GLES, via a Switch-native `libdrm_nouveau`
@@ -532,8 +545,11 @@ shim) -- meaning Wine's existing `wined3d` OpenGL backend is a more
 realistic long-term path to real D3D acceleration on this platform than
 DXVK/vkd3d, which need Vulkan and therefore aren't viable here. Neither has
 been prototyped yet; this is still a scoping conclusion, not built code.
+Since it would hit the exact same `vi`-bootstrap conflict as deko3d if
+wired the same way, it's not a workaround for the blocker above either.
 
-Also acceptable, simpler fallback:
+With GPU compositing blocked for this binary shape, the more realistic
+near-term path is the simpler fallback already scoped:
 
 - direct block-linear dirty conversion;
 - persistent software backing store plus one present per frame.

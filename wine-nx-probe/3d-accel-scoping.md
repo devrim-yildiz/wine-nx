@@ -1,14 +1,19 @@
 # 3D-accel (GPU compositor) milestone -- scoping
 
-Status: the Mesa/NVK dependency question is **resolved** (see below), and
-the deko3d bring-up smoke test (`wine-nx-probe/source/deko3d_smoke.c`,
-target `wine-nx-deko3d-smoke`) now covers device/queue/swapchain creation,
-a CPU-to-GPU texture upload, and a real shader-driven rotating cube --
-**all three hardware-confirmed together**, holding steady 60-62fps for a
-5-10 second test run with no measurable fps cost from the shader/geometry
-work over the earlier clear-only baseline. See "What's actually built" at
-the bottom for the full picture, including what still isn't built (the
-actual compositor swap into `wine_nx_fb_lock/unlock/present`).
+Status: the Mesa/NVK dependency question is **resolved** (see below), the
+deko3d bring-up smoke test (`wine-nx-probe/source/deko3d_smoke.c`, target
+`wine-nx-deko3d-smoke`) hardware-confirmed device/queue/swapchain creation,
+a CPU-to-GPU texture upload, and a real shader-driven rotating cube all
+running together at 60-62fps -- and the actual compositor swap into
+`wine_nx_fb_lock/unlock/present` (`wine-nx-probe/source/runtime_deko3d.c`)
+has been attempted and is now **architecturally blocked** for the
+single-binary, runtime-selectable-backend design this project uses. See
+"Compositor-swap attempt: blocked by libnx's pre-main() vi bootstrap"
+below for the root cause and the real path forward, and "What's actually
+built vs. planned" at the bottom for the full picture. The runtime falls
+back to the proven libnx-framebuffer path automatically and unconditionally
+on any deko3d failure, so this is a parked dead end, not a regression --
+the app works today exactly as it did before this milestone was attempted.
 
 ## Resolved: does a usable Mesa/NVK (Vulkan) port exist for this project?
 
@@ -166,11 +171,101 @@ presentation-compositor milestone specifically.
    simpler). Only actually needed if the real compositor swap turns out to
    require GPU-side sampling rather than a second direct
    `CopyBufferToImage`-style upload; not yet clear which one it needs.
-4. **Only then** replace `wine_nx_fb_lock/unlock/present`'s libnx-framebuffer
-   implementation in `wine-nx-probe/source/runtime.c` with the validated
-   deko3d logic, gated behind the existing `__SWITCH__` build, kept
-   alongside (not replacing) the current path so there's a fallback if the
-   GPU path regresses something the CPU path didn't.
+4. ~~Replace `wine_nx_fb_lock/unlock/present`'s libnx-framebuffer
+   implementation with the validated deko3d logic, kept alongside (not
+   replacing) the current path~~ **Attempted, architecturally blocked.**
+   Wired as an opt-in backend (`wine-nx-probe/source/runtime_deko3d.c`,
+   selected via `WINE_NX_DEKO3D` env var or `sdmc:/switch/wine/deko3d.txt`,
+   same pattern as `WINE_NX_HOST_SIM`) with the existing libnx path left
+   completely untouched and still the default. See the dedicated section
+   below for why this can't work as a single-binary runtime choice, and
+   what the real path forward looks like.
+
+## Compositor-swap attempt: blocked by libnx's pre-main() vi bootstrap
+
+The opt-in deko3d compositor backend (`wine-nx-probe/source/runtime_deko3d.c`)
+implements `wine_nx_fb_lock/unlock/present` using the exact mechanism
+`deko3d_smoke.c` stage 2 proved on hardware: a CPU-writable staging buffer
+copied onto the swapchain image via `dkCmdBufCopyBufferToImage()`, no
+shaders needed since Wine's DIB is already flat RGBA8 pixel data. It builds
+and, when selected, engages correctly (`[NXFB] backend: deko3d` logs, device
+and framebuffer-image creation succeed) -- but swapchain creation
+consistently fails or crashes, root-caused through three rounds of
+hardware-log-driven diagnosis, each grounded in real reference source
+(devkitPro's `deko3d`/`libnx` GitHub repos, not memory):
+
+1. **First failure**: `dkSwapchainCreate()` crashed hard (no debug-callback
+   fire, no further log line) when handed `nwindowGetDefault()` -- the same
+   nwindow the libnx-framebuffer path already reuses successfully after
+   `consoleExit()`. Traced into deko3d's real `Swapchain::initialize()`
+   source (`dk_swapchain.cpp`): it calls `nwindowSetDimensions()`
+   internally as its first step. A direct diagnostic call to the same
+   function, with the same args, confirmed the actual failure:
+   `MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized)` (0xf59) --
+   not a crash, a clean, documented precondition violation
+   (`nwindowSetDimensions()`: "cannot be called when there are buffers
+   registered"). `nwindowReleaseBuffers()`, added as a fix, compiled and
+   ran but had zero observable effect on the outcome.
+2. **Root cause of #1**: `nwindowGetDefault()`'s underlying `NWindow` gets
+   `nwindowSetDimensions()` called on it exactly once, automatically, by
+   libnx's own `__nx_win_init()` (`nx/source/display/default_window.c`) --
+   *before `main()` even runs*, regardless of `consoleInit()`. No public
+   libnx API undoes that lock.
+3. **Second attempt**: build a dedicated `ViDisplay`/`ViLayer`/`NWindow`
+   instead of sharing the default one, following libnx's own
+   `__nx_win_init()` sequence exactly
+   (`viInitialize` -> `viOpenDefaultDisplay` -> `viCreateLayer` ->
+   `viSetLayerScalingMode` -> `nwindowCreateFromLayer` ->
+   `nwindowSetDimensions`) -- confirmed via `vi.c` that `viInitialize` is
+   refcounted and `viCreateLayer` is a plain per-call IPC request, not a
+   singleton. `viInitialize` succeeded; `viOpenDefaultDisplay` failed with
+   a genuine `vi`-service-level rejection (module 114, description 9 --
+   undocumented in switchbrew's public error table).
+4. **Root cause of #3, and the actual architectural blocker**: traced into
+   libnx's `nx/source/runtime/init.c`. `__nx_win_init` is a *weak* symbol;
+   `default_window.c`'s real definition (and the `viOpenDefaultDisplay`
+   call inside it) only gets linked in -- and only then gets invoked,
+   unconditionally, before `main()`, from `__appInit()`'s
+   `if (&__nx_win_init) __nx_win_init();` -- if `nwindowGetDefault` is
+   *referenced anywhere in the binary*. This binary's libnx-framebuffer
+   path (the required fallback, and the pre-existing default) calls
+   `nwindowGetDefault()` directly, so that reference always exists, so
+   `__nx_win_init()` always runs, so a `ViDisplay` for "Default" is always
+   already open before `main()` starts -- **completely independent of
+   whether `consoleInit()` is ever called, or which backend gets selected
+   at runtime.** Confirmed this isn't console-specific by checking whether
+   skipping `consoleInit()` on the deko3d path would help: it can't,
+   because the conflict is created at link/startup time, not by anything
+   `main()` does.
+
+**The real constraint**: a single binary that contains *any* reference to
+`nwindowGetDefault()` -- which the required libnx fallback always does --
+can never let deko3d be the first and only `vi` consumer, because libnx's
+own crt0-level bootstrap gets there first, unconditionally. Every real
+deko3d reference this project checked (`borealis`, `deko3d`'s own
+`deko_basic`/`deko_console` examples) is a *single-purpose* binary that
+either never touches console or *is* console's own renderer from the very
+first `consoleInit()` call -- none of them ship a runtime-selectable
+choice between a libnx path and a deko3d path in the same executable,
+because that combination is exactly what triggers this conflict.
+
+**Safety net (kept, and generalized beyond this specific failure)**: any
+deko3d init failure, at any step and for any reason, now falls back to the
+libnx-framebuffer path automatically -- confirmed on hardware that without
+this, a failed deko3d init left the app with a permanently zeroed
+framebuffer and an unthrottled, spinning message loop (no crash, no
+fallback, just a dead compositor). `wine_nx_fb_init()` and
+`wine_nx_fb_lock()` (the two call sites that can trigger deko3d init) both
+check its result and flip the shared backend flag on failure; `unlock()`
+and `present()` need no changes since they already just read that flag.
+
+**Path forward, if revisited**: not a runtime flag in the shared
+`wine-nx-runtime` binary -- a genuinely separate build target/executable
+where deko3d is the *only* thing that ever touches `vi`/`nwindow`, with no
+reference to `nwindowGetDefault()` or the libnx-framebuffer path anywhere
+in that binary's link closure. That's a materially different project
+shape (two runtime binaries instead of one with a flag), not a bug fix, so
+it's being parked here rather than attempted in this pass.
 
 ## What's actually built vs. planned
 
@@ -181,14 +276,23 @@ presentation-compositor milestone specifically.
   running together at 60-62fps: deko3d device/queue/swapchain
   creation/present against the same `nwindowGetDefault()` handle, a CPU
   texture upload onto a live framebuffer, and real shader-compiled,
-  depth-tested, per-frame-animated 3D geometry. None of this is wired into
-  `wine_nx_fb_lock/unlock/present` yet -- it's a standalone smoke test. The
-  Mesa/NVK dependency question is resolved with direct evidence, not
-  assumption (see above).
-- **Not built**: sampling an uploaded texture from a shader (upload and
-  shaders are each proven, not combined), and the actual compositor swap
-  into `wine_nx_fb_lock/unlock/present`. Two crash bugs surfaced building
-  the cube stage, both root-caused from hardware crash logs rather than
-  guessed at (missing `romfsInit()`; un-rounded `DkMemBlockCreate()`
-  sizes) -- worth knowing about before writing more deko3d code in this
-  project, see the top of `deko3d_smoke.c` for details.
+  depth-tested, per-frame-animated 3D geometry. The Mesa/NVK dependency
+  question is resolved with direct evidence, not assumption (see above).
+  The compositor swap itself is wired as an opt-in backend
+  (`runtime_deko3d.c`) with a hardware-confirmed automatic fallback to the
+  libnx path on any deko3d failure -- the app works today exactly as
+  before this milestone, regardless of the outcome below.
+- **Not built, now understood to be architecturally blocked as a
+  single-binary runtime choice**: the actual compositor swap. See
+  "Compositor-swap attempt: blocked by libnx's pre-main() vi bootstrap"
+  above for the full root-cause trace (into libnx's `__appInit`/
+  `__nx_win_init` crt0 hook) and the real path forward (a separate build
+  target with no libnx-fallback reference at all, not a fix to this one).
+  Sampling an uploaded texture from a shader (upload and shaders are each
+  proven separately, never combined) is now moot for this milestone as
+  scoped, since there's no compositor left to feed it into. Two crash bugs
+  surfaced building the smoke test's cube stage, both root-caused from
+  hardware crash logs rather than guessed at (missing `romfsInit()`;
+  un-rounded `DkMemBlockCreate()` sizes) -- worth knowing about before
+  writing more deko3d code in this project, see the top of
+  `deko3d_smoke.c` for details.
