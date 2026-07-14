@@ -6,6 +6,7 @@
  * final framebuffer visible after the PE terminates.
  */
 #include <windows.h>
+#include <stdio.h>
 
 #define WINE_NX_W 1280
 #define WINE_NX_H 720
@@ -356,6 +357,94 @@ static void draw_frame( HDC hdc )
     draw_moving_shapes( hdc );
 }
 
+/* Loop-phase timing: framebufferEnd() itself measured 3-5ms on hardware and
+ * attempted==executed at the throttle (see wine_nx_hud_present_ms_* in
+ * runtime.c and the README's "Presentation Is Still Too Slow" update) --
+ * that rules out presentation/conversion cost as the ~2fps bottleneck, so
+ * the remaining suspects are all on this side of the boundary: message
+ * dispatch, the scene-physics update, the GDI paint itself (UpdateWindow ->
+ * WM_PAINT -> draw_frame's background BitBlt + shape draws), and whether
+ * Sleep(10) actually sleeps ~10ms or something far longer. Each phase is
+ * averaged over 1-second windows and written to a log file instead of drawn
+ * on screen so the extra GDI text some other on-screen readout would need
+ * can't itself skew the paint-cost number being measured.
+ *
+ * Deliberately NOT GetTickCount64(): the first version of this used it and
+ * produced an empty log every time. Root cause (see README, "GetTickCount/
+ * GetTickCount64 Are Frozen") -- it reads a shared-memory field that's only
+ * ever kept ticking by the wineserver's poll loop, which this Switch port
+ * never runs, so the value is frozen for the life of the process and every
+ * delta reads as 0ms. QueryPerformanceCounter() routes through a different,
+ * working clock_gettime()-backed path instead. */
+#define TIMING_LOG_PATH L"C:\\gui\\gui_timing.log"
+
+typedef struct { unsigned long long sum_ms; unsigned long long count; } phase_stat_t;
+
+static phase_stat_t g_stat_dispatch, g_stat_update, g_stat_paint, g_stat_sleep, g_stat_total;
+static HANDLE g_timing_file = INVALID_HANDLE_VALUE;
+static ULONGLONG g_timing_epoch_ms;
+static ULONGLONG g_qpc_freq;
+
+static ULONGLONG now_ms(void)
+{
+    LARGE_INTEGER counter;
+
+    if (!g_qpc_freq)
+    {
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency( &freq );
+        g_qpc_freq = (ULONGLONG)freq.QuadPart;
+    }
+    QueryPerformanceCounter( &counter );
+    return g_qpc_freq ? (ULONGLONG)counter.QuadPart * 1000ULL / g_qpc_freq : 0;
+}
+
+static void timing_open(void)
+{
+    g_timing_file = CreateFileW( TIMING_LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+}
+
+static void timing_stat_add( phase_stat_t *s, ULONGLONG ms )
+{
+    s->sum_ms += ms;
+    s->count++;
+}
+
+static unsigned long long timing_avg( const phase_stat_t *s )
+{
+    return s->count ? s->sum_ms / s->count : 0;
+}
+
+static void timing_maybe_flush(void)
+{
+    ULONGLONG now = now_ms();
+    char line[256];
+    int len;
+    DWORD written;
+
+    if (!g_timing_epoch_ms) g_timing_epoch_ms = now;
+    if (now - g_timing_epoch_ms < 1000) return;
+
+    len = snprintf( line, sizeof(line),
+                    "iters=%llu dispatch_avg=%llums update_avg=%llums paint_avg=%llums "
+                    "sleep_avg=%llums total_avg=%llums\r\n",
+                    g_stat_total.count, timing_avg( &g_stat_dispatch ), timing_avg( &g_stat_update ),
+                    timing_avg( &g_stat_paint ), timing_avg( &g_stat_sleep ), timing_avg( &g_stat_total ) );
+    if (len > 0 && g_timing_file != INVALID_HANDLE_VALUE)
+    {
+        WriteFile( g_timing_file, line, (DWORD)len, &written, NULL );
+        FlushFileBuffers( g_timing_file );
+    }
+
+    g_stat_dispatch.sum_ms = g_stat_dispatch.count = 0;
+    g_stat_update.sum_ms = g_stat_update.count = 0;
+    g_stat_paint.sum_ms = g_stat_paint.count = 0;
+    g_stat_sleep.sum_ms = g_stat_sleep.count = 0;
+    g_stat_total.sum_ms = g_stat_total.count = 0;
+    g_timing_epoch_ms = now;
+}
+
 static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 {
     (void)wp;
@@ -404,6 +493,7 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show )
 
     probe_directory_enumeration();
     init_scene();
+    timing_open();
 
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = inst;
@@ -427,16 +517,36 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show )
      * WM_QUIT is posted -- there's no in-app close button by design. */
     for (;;)
     {
+        ULONGLONG t_iter = now_ms();
+        ULONGLONG t0, t1;
+
+        t0 = now_ms();
         while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
         {
             if (msg.message == WM_QUIT) return (int)msg.wParam;
             TranslateMessage( &msg );
             DispatchMessageW( &msg );
         }
+        t1 = now_ms();
+        timing_stat_add( &g_stat_dispatch, t1 - t0 );
 
+        t0 = now_ms();
         update_scene();
+        t1 = now_ms();
+        timing_stat_add( &g_stat_update, t1 - t0 );
+
+        t0 = now_ms();
         InvalidateRect( hwnd, NULL, FALSE );
-        UpdateWindow( hwnd );
+        UpdateWindow( hwnd );   /* synchronous WM_PAINT -> draw_frame() happens in here */
+        t1 = now_ms();
+        timing_stat_add( &g_stat_paint, t1 - t0 );
+
+        t0 = now_ms();
         Sleep( 10 );
+        t1 = now_ms();
+        timing_stat_add( &g_stat_sleep, t1 - t0 );
+
+        timing_stat_add( &g_stat_total, now_ms() - t_iter );
+        timing_maybe_flush();
     }
 }

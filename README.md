@@ -228,6 +228,27 @@ both already installed in the toolchain, both bind to the same
 `wine-nx-probe/3d-accel-scoping.md` for the full evidence and the updated
 recommendation (deko3d over OpenGL ES, both over the now-dead NVK option).
 
+### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
+
+Found while debugging the animated-HUD demo's timing instrumentation (see
+"GUI Smoke Demo" above), but this affects any app, not just that one:
+`GetTickCount()`/`GetTickCount64()` read `user_shared_data->TickCount`, a
+shared-memory field that is only ever written by `set_current_time()` in
+`server/fd.c`, which is itself only called from the wineserver's poll loop
+(`main_loop()`, also `server/fd.c`). On this Switch port `main_loop()` is
+never invoked -- the server code is linked in as a function library, not
+run as its own continuously-polling process the way real Wine's separate
+`wineserver` process would -- so that field stays at its zero-initialized
+value for the entire life of the process. Any app or Wine subsystem relying
+on `GetTickCount`/`GetTickCount64` for timers, animation pacing, or
+elapsed-time checks gets a frozen value, not real time.
+`QueryPerformanceCounter`/`QueryPerformanceFrequency` are unaffected (they
+route through a different, working `clock_gettime()`-backed path) and are a
+safe substitute today. **Proposed fix, not yet implemented:** a small
+periodic thread in `wine-nx-probe/source/runtime.c` calling
+`set_current_time()` roughly every 15ms, standing in for the wineserver
+poll loop this port doesn't run.
+
 ### UI Completeness Is Still Early
 
 Known rough areas:
