@@ -120,6 +120,9 @@ fi
 if [ -f "$BUILD_DIR/wine-nx-ntdll-file-smoke.nro" ]; then
     echo "Built $BUILD_DIR/wine-nx-ntdll-file-smoke.nro"
 fi
+if [ -f "$BUILD_DIR/wine-nx-deko3d-smoke.nro" ]; then
+    echo "Built $BUILD_DIR/wine-nx-deko3d-smoke.nro"
+fi
 if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ]; then
     echo "Built $BUILD_DIR/wine-nx-runtime.nro"
 fi

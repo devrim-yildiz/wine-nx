@@ -554,6 +554,25 @@ target_link_options(wine-nx-ntdll-file-smoke PRIVATE -Wl,--gc-sections)
 
 target_link_libraries(wine-nx-ntdll-file-smoke PRIVATE nx)
 
+add_executable(wine-nx-deko3d-smoke
+    source/deko3d_smoke.c
+)
+
+set_target_properties(wine-nx-deko3d-smoke PROPERTIES SUFFIX ".elf")
+
+target_compile_options(wine-nx-deko3d-smoke PRIVATE
+    -std=gnu99
+    -Wall
+    -Wextra
+    -Werror=implicit-function-declaration
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_link_options(wine-nx-deko3d-smoke PRIVATE -Wl,--gc-sections)
+
+target_link_libraries(wine-nx-deko3d-smoke PRIVATE deko3d nx)
+
 add_executable(wine-nx-runtime
     source/runtime.c
     source/runtime_platform.c
@@ -626,6 +645,8 @@ if(NACPTOOL AND ELF2NRO)
     set(NTDLL_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-smoke.nro")
     set(NTDLL_FILE_SMOKE_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-file-smoke.nacp")
     set(NTDLL_FILE_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-file-smoke.nro")
+    set(DEKO3D_SMOKE_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-deko3d-smoke.nacp")
+    set(DEKO3D_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-deko3d-smoke.nro")
     set(RUNTIME_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime.nacp")
     set(RUNTIME_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime.nro")
 
@@ -733,6 +754,21 @@ if(NACPTOOL AND ELF2NRO)
     )
 
     add_custom_target(wine-nx-ntdll-file-smoke-nro ALL DEPENDS "${NTDLL_FILE_SMOKE_NRO_FILE}")
+
+    add_custom_command(
+        OUTPUT "${DEKO3D_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX deko3d Smoke" "Codex" "0.1.0" "${DEKO3D_SMOKE_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${DEKO3D_SMOKE_NRO_FILE}"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-deko3d-smoke>" "${DEKO3D_SMOKE_NRO_FILE}" "--nacp=${DEKO3D_SMOKE_NACP_FILE}"
+        DEPENDS wine-nx-deko3d-smoke "${DEKO3D_SMOKE_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_target(wine-nx-deko3d-smoke-nro ALL DEPENDS "${DEKO3D_SMOKE_NRO_FILE}")
 
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
