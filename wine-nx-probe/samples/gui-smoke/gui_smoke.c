@@ -88,17 +88,28 @@ static void probe_directory_enumeration(void)
 
 static void draw_pixel_ramp( HDC hdc )
 {
-    int i;
+    BITMAPINFO bmi;
+    DWORD pixels[240 * 3];
+    int i, row;
 
     for (i = 0; i < 240; i++)
     {
         BYTE r = (BYTE)(80 + i / 3);
         BYTE g = (BYTE)(220 - i / 4);
         BYTE b = (BYTE)(130 + i / 5);
-        SetPixel( hdc, 520 + i, 615, RGB( r, g, b ) );
-        SetPixel( hdc, 520 + i, 616, RGB( r, g, b ) );
-        SetPixel( hdc, 520 + i, 617, RGB( r, g, b ) );
+        DWORD color = ((DWORD)r << 16) | ((DWORD)g << 8) | b; /* 32bpp BI_RGB: B,G,R,pad in memory */
+        for (row = 0; row < 3; row++) pixels[row * 240 + i] = color;
     }
+
+    memset( &bmi, 0, sizeof(bmi) );
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = 240;
+    bmi.bmiHeader.biHeight = 3;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    StretchDIBits( hdc, 520, 615, 240, 3, 0, 0, 240, 3, pixels, &bmi, DIB_RGB_COLORS, SRCCOPY );
 }
 
 static void draw_badge( HDC hdc )

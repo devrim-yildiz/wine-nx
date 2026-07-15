@@ -42,6 +42,15 @@
 
 extern void wine_nx_runtime_trace( const char *msg );
 
+/* Shared HUD stat-tracking/drawing, factored out of runtime.c's libnx
+ * wine_nx_fb_present() so this backend drives the exact same on-screen FPS
+ * overlay and rolling window/avg/min/max stats instead of a second, drifted
+ * implementation -- see the comment on wine_nx_hud_mark_attempt() in
+ * runtime.c for the attempted/executed semantics. */
+extern void wine_nx_hud_mark_attempt(void);
+extern void wine_nx_hud_mark_executed( uint64_t present_ms );
+extern void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride );
+
 #define WINE_NX_DEKO3D_FB_W 1280
 #define WINE_NX_DEKO3D_FB_H 720
 #define WINE_NX_DEKO3D_FB_NUM 2
@@ -339,10 +348,16 @@ void *wine_nx_deko3d_fb_lock( int *width, int *height, int *stride_px )
          * so the CPU doesn't overwrite pixels the GPU hasn't consumed yet.
          * Same technique gpu_console.c uses to protect its own CPU-written
          * charBuf (dkFenceWait before touching it, dkQueueSignalFence
-         * right after submitting the commands that read it). */
+         * right after submitting the commands that read it). Timed because
+         * this is a genuine CPU-stall point the old libnx path never had:
+         * if the GPU is behind, this is where a frame's time actually goes,
+         * not in GDI paint cost or the message loop. */
         if (g_dk_stagingFenceValid)
         {
+            uint64_t t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
             dkFenceWait( &g_dk_stagingFence, UINT64_MAX );
+            uint64_t t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+            wine_nx_deko3d_trace( "[NXDK][TIMING] fenceWait took %ums", (unsigned)(t1 - t0) );
             g_dk_stagingFenceValid = 0;
         }
         g_dk_pendingBits = g_dk_stagingCpuAddr;
@@ -361,12 +376,28 @@ void wine_nx_deko3d_fb_unlock(void)
     pthread_mutex_unlock( &g_dk_mutex );
 }
 
+/* Independent of wine_nx_hud_mark_attempt/executed's rolling window (which
+ * feeds the on-screen HUD, shared with the libnx path) -- this is a separate,
+ * deko3d-only counter specifically for the hardware log, so a presents/sec
+ * number is readable straight from wine-nx-runtime-deko3d.log without
+ * needing to read pixels off a screenshot. */
+static unsigned int g_dk_presentLogCount;
+static uint64_t g_dk_presentLogEpochMs;
+
 void wine_nx_deko3d_fb_present(void)
 {
     pthread_mutex_lock( &g_dk_mutex );
     if (g_dk_ready && g_dk_pendingBits && g_dk_pendingDirty && !g_dk_lockDepth)
     {
-        int slot = dkQueueAcquireImage( g_dk_queue, g_dk_swapchain );
+        uint64_t t0, t1, now_ms;
+        int slot;
+
+        wine_nx_hud_mark_attempt();
+
+        t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        slot = dkQueueAcquireImage( g_dk_queue, g_dk_swapchain );
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        wine_nx_deko3d_trace( "[NXDK][TIMING] dkQueueAcquireImage took %ums slot=%d", (unsigned)(t1 - t0), slot );
 
         if (slot < 0 || slot >= WINE_NX_DEKO3D_FB_NUM)
         {
@@ -380,13 +411,29 @@ void wine_nx_deko3d_fb_present(void)
         }
         else
         {
+            wine_nx_hud_draw( g_dk_pendingBits, WINE_NX_DEKO3D_FB_W, WINE_NX_DEKO3D_FB_H, WINE_NX_DEKO3D_FB_W );
+
+            t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
             dkQueueSubmitCommands( g_dk_queue, g_dk_cmdsCopy[slot] );
             dkQueueSignalFence( g_dk_queue, &g_dk_stagingFence, false );
             g_dk_stagingFenceValid = 1;
             dkQueuePresentImage( g_dk_queue, g_dk_swapchain, slot );
+            t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+            wine_nx_deko3d_trace( "[NXDK][TIMING] submit+signal+present took %ums", (unsigned)(t1 - t0) );
+            wine_nx_hud_mark_executed( t1 - t0 );
 
             g_dk_pendingBits = NULL;
             g_dk_pendingDirty = 0;
+
+            g_dk_presentLogCount++;
+            now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+            if (!g_dk_presentLogEpochMs) g_dk_presentLogEpochMs = now_ms;
+            if (now_ms - g_dk_presentLogEpochMs >= 1000)
+            {
+                wine_nx_deko3d_trace( "[NXDK][TIMING] presents/sec=%u", g_dk_presentLogCount );
+                g_dk_presentLogCount = 0;
+                g_dk_presentLogEpochMs = now_ms;
+            }
         }
     }
     pthread_mutex_unlock( &g_dk_mutex );

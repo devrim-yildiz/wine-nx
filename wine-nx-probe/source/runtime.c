@@ -35,7 +35,25 @@ u32 __nx_exception_ignoredebug = 1;
 #define WINE_SYSTEM_DIR WINE_DRIVE_C "/windows/system32"
 #define RUNTIME_DIR WINE_ROOT
 #define DEFAULT_TARGET WINE_DRIVE_C "/curl/curl.exe"
+/* WINE_NX_DEKO3D_ONLY is a compile-time, per-target define (see
+ * CMakeLists.txt's wine-nx-runtime-deko3d target) -- a completely separate
+ * binary from wine-nx-runtime, not a runtime flag. It must never reference
+ * nwindowGetDefault()/consoleInit()/Framebuffer, since libnx's own
+ * __appInit() unconditionally runs __nx_win_init() before main() whenever
+ * nwindowGetDefault is referenced anywhere in the binary (confirmed against
+ * libnx's nx/source/runtime/init.c and nx/source/display/default_window.c),
+ * which always wins the "first vi consumer" race against our own deko3d
+ * init -- see wine-nx-probe/3d-accel-scoping.md for the full trace. This
+ * build exists specifically to not contain that reference at all, so deko3d
+ * really is the first and only vi consumer, matching every real reference
+ * (Borealis, deko_basic) that actually works. */
+#ifdef WINE_NX_DEKO3D_ONLY
+#define WINE_NX_RUNTIME_BUILD "nx-deko3d-only-1"
+#define WINE_NX_RUNTIME_LOG_NAME "/wine-nx-runtime-deko3d.log"
+#else
 #define WINE_NX_RUNTIME_BUILD "nx-present-throttle-1"
+#define WINE_NX_RUNTIME_LOG_NAME "/wine-nx-runtime.log"
+#endif
 #define MAX_RUNTIME_MODULES 64
 #define MAX_IMPORT_DEPTH 16
 
@@ -104,14 +122,17 @@ static int wine_nx_fb_lock_depth;
 
 static void log_line( const char *fmt, ... )
 {
+#ifndef WINE_NX_DEKO3D_ONLY
     /* The software console aborts the process (framebufferBegin →
      * diagAbortWithResult) when driven from any thread but the one that
      * called consoleInit, including exception handlers running on Wine
      * secondary threads.  Off the main thread, log to the file only. */
     int on_main = wine_nx_console_active &&
                   (!log_main_thread_set || pthread_equal( pthread_self(), log_main_thread ));
+#endif
     va_list args;
 
+#ifndef WINE_NX_DEKO3D_ONLY
     if (on_main)
     {
         va_start( args, fmt );
@@ -119,6 +140,7 @@ static void log_line( const char *fmt, ... )
         va_end( args );
         putchar( '\n' );
     }
+#endif
 
     if (log_file)
     {
@@ -128,7 +150,9 @@ static void log_line( const char *fmt, ... )
         fputc( '\n', log_file );
         fflush( log_file );
     }
+#ifndef WINE_NX_DEKO3D_ONLY
     if (on_main) consoleUpdate( NULL );
+#endif
 }
 
 void wine_nx_runtime_trace( const char *msg )
@@ -148,6 +172,14 @@ void wine_nx_runtime_trace( const char *msg )
  * button polling runs at its own fixed rate from the moment the framebuffer
  * comes up, instead of being tied to however often present() gets called. */
 static void wine_nx_hud_ensure_input_thread(void);
+
+/* Defined further down alongside the rest of the HUD state; not static --
+ * runtime_deko3d.c calls these three directly so the deko3d present path
+ * drives the exact same on-screen FPS overlay and rolling stats the libnx
+ * path already does, instead of a second, drifted implementation. */
+void wine_nx_hud_mark_attempt(void);
+void wine_nx_hud_mark_executed( uint64_t present_ms );
+void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride );
 
 /* Defined further down (near target.txt/run-entry.txt handling); forward
  * declared here so backend selection can reuse the exact same file-based
@@ -190,6 +222,51 @@ static void wine_nx_fb_backend_select(void)
              wine_nx_fb_use_deko3d ? "deko3d" : "libnx framebuffer (default)",
              (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
 }
+
+/* Off by default. The raw per-syscall [SYSCALL] entry/exit trace in
+ * dlls/ntdll/unix/signal_arm64.c is extremely high-frequency -- every NT
+ * syscall logs two lines, and log_line() below fflush()es every line to
+ * the SD card -- and was found to be the actual cause of the "2fps" gui
+ * stalls: a single WM_PAINT dispatch containing 720 SetPixel calls alone
+ * produced ~1440 synchronous SD-card writes. Non-static so signal_arm64.c
+ * (a different translation unit, compiled into ntdll, not this runtime)
+ * can read it directly with no per-syscall function-call overhead.
+ * Same env-var-then-file-fallback pattern as wine_nx_fb_backend_select()
+ * above, for the same hbmenu-has-no-real-environment reason. */
+int wine_nx_syscall_trace_enabled;
+
+static void wine_nx_syscall_trace_select(void)
+{
+    const char *env = getenv( "WINE_NX_SYSCALL_TRACE" );
+    int file_flag = read_bool_file( RUNTIME_DIR "/systrace.txt" );
+    wine_nx_syscall_trace_enabled = (env && env[0]) || file_flag;
+    log_line( "[NXTRACE] raw syscall trace: %s (env=%s file=%s)",
+             wine_nx_syscall_trace_enabled ? "ON" : "off (default)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
+#ifdef WINE_NX_DEKO3D_ONLY
+
+/* This build's entire purpose is to never make this call -- deko3d must be
+ * the first and only vi consumer, so there is no console to hand off from
+ * and no libnx-framebuffer fallback to fall back to. A deko3d init failure
+ * here is fatal to presentation for this binary; it fails cleanly and logs
+ * why, rather than trying to limp along on a path this build deliberately
+ * doesn't have. See the WINE_NX_DEKO3D_ONLY comment near the top of this
+ * file for why that's the right tradeoff, not a regression from
+ * wine-nx-runtime's safety-net fallback. */
+int wine_nx_fb_init(void)
+{
+    if (wine_nx_deko3d_fb_init() == 0)
+    {
+        wine_nx_hud_ensure_input_thread();
+        return 0;
+    }
+    log_line( "[NXFB] deko3d init FAILED -- this build has no fallback by design, presentation blocked" );
+    return -1;
+}
+
+#else
 
 /* Take the screen from the text console and bring up a linear framebuffer.
  * The console-exit step is shared by both backends -- deko3d's swapchain
@@ -255,6 +332,31 @@ int wine_nx_fb_init(void)
     return 0;
 }
 
+#endif /* WINE_NX_DEKO3D_ONLY */
+
+#ifdef WINE_NX_DEKO3D_ONLY
+
+/* wine_nx_deko3d_fb_lock() already does its own lazy wine_nx_deko3d_fb_init()
+ * internally (see runtime_deko3d.c) and is the actual first call site that
+ * reaches it in practice, so this just delegates straight through -- no
+ * dual-backend decision to make in this build. wine_nx_hud_ensure_input_thread()
+ * is idempotent (see its own guard), so calling it here on every successful
+ * lock guarantees Minus-to-exit works regardless of whether wine_nx_fb_init()
+ * ever actually runs on its own. */
+void *wine_nx_fb_lock( int *width, int *height, int *stride_px )
+{
+    void *bits = wine_nx_deko3d_fb_lock( width, height, stride_px );
+    if (bits) wine_nx_hud_ensure_input_thread();
+    return bits;
+}
+
+void wine_nx_fb_unlock(void)
+{
+    wine_nx_deko3d_fb_unlock();
+}
+
+#else
+
 /* Acquire the back buffer for writing; returns linear RGBA8888 pixels. */
 void *wine_nx_fb_lock( int *width, int *height, int *stride_px )
 {
@@ -308,6 +410,8 @@ void wine_nx_fb_unlock(void)
     if (wine_nx_fb_lock_depth > 0) wine_nx_fb_lock_depth--;
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
+
+#endif /* WINE_NX_DEKO3D_ONLY */
 
 /***********************************************************************
  * Debug HUD: a tiny native-side overlay proving the present-rate throttle
@@ -437,6 +541,7 @@ static void *wine_nx_hud_input_thread_fn( void *arg )
         if (down & HidNpadButton_Minus)
         {
             wine_nx_runtime_trace( "[HUD] Minus pressed; exiting to hbmenu" );
+#ifndef WINE_NX_DEKO3D_ONLY
             /* Must hold the same mutex present()/lock() use: framebufferClose()
              * while a framebufferBegin() is still outstanding (no matching End)
              * is undefined/fatal, and this thread has no other way to know
@@ -451,6 +556,11 @@ static void *wine_nx_hud_input_thread_fn( void *arg )
                 wine_nx_fb_ready = 0;
             }
             pthread_mutex_unlock( &wine_nx_fb_mutex );
+#endif
+            /* deko3d-only build: no libnx Framebuffer to balance/close, and no
+             * reference example (deko_basic included) bothers with explicit
+             * deko3d teardown before a plain process exit either -- Horizon
+             * reclaims the device/queue/memory on process exit regardless. */
             socketExit();
             exit( 0 );
         }
@@ -470,7 +580,68 @@ static void wine_nx_hud_ensure_input_thread(void)
     pthread_create( &wine_nx_hud_input_thread, NULL, wine_nx_hud_input_thread_fn, NULL );
 }
 
-static void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride )
+/* Shared by both backends -- extracted out of wine_nx_fb_present()'s libnx
+ * body so the deko3d present path can drive the exact same rolling-window
+ * FPS/min/max stats wine_nx_hud_draw() displays, instead of a second,
+ * drifted copy of this bucketing logic. Split into two calls (not one) to
+ * preserve the original semantics exactly: the libnx path calls _attempt()
+ * on every present() call with dirty bits pending (even ones the present-
+ * rate throttle below skips), and only calls _executed() for the ones that
+ * actually ran framebufferEnd() -- that attempted/executed gap is what the
+ * on-screen "PRES A:/E:" line and the README's throttle investigation are
+ * about. The deko3d path has no such throttle, so it calls both for every
+ * present that actually submits a frame -- attempted == executed there,
+ * which is an honest reflection of its behavior, not a workaround. */
+void wine_nx_hud_mark_attempt(void)
+{
+    uint64_t now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+
+    wine_nx_hud_attempt_count++;
+    if (!wine_nx_hud_epoch_ms) wine_nx_hud_epoch_ms = now_ms;
+    if (now_ms - wine_nx_hud_epoch_ms >= 1000)
+    {
+        unsigned int i, sum, mn, mx;
+
+        wine_nx_hud_attempt_display = wine_nx_hud_attempt_count;
+        wine_nx_hud_executed_display = wine_nx_hud_executed_count;
+        wine_nx_hud_fps_display = wine_nx_hud_executed_count;
+
+        wine_nx_hud_fps_history[wine_nx_hud_fps_history_pos] = wine_nx_hud_executed_count;
+        wine_nx_hud_fps_history_pos = (wine_nx_hud_fps_history_pos + 1) % WINE_NX_HUD_FPS_WINDOW;
+        if (wine_nx_hud_fps_history_count < WINE_NX_HUD_FPS_WINDOW) wine_nx_hud_fps_history_count++;
+
+        sum = 0;
+        mn = mx = wine_nx_hud_fps_history[0];
+        for (i = 0; i < wine_nx_hud_fps_history_count; i++)
+        {
+            unsigned int v = wine_nx_hud_fps_history[i];
+            sum += v;
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        wine_nx_hud_fps_avg_display = sum / wine_nx_hud_fps_history_count;
+        wine_nx_hud_fps_min_display = mn;
+        wine_nx_hud_fps_max_display = mx;
+
+        wine_nx_hud_present_ms_min_display = wine_nx_hud_executed_count ? wine_nx_hud_present_ms_min : 0;
+        wine_nx_hud_present_ms_max_display = wine_nx_hud_present_ms_max;
+
+        wine_nx_hud_attempt_count = 0;
+        wine_nx_hud_executed_count = 0;
+        wine_nx_hud_present_ms_min = UINT64_MAX;
+        wine_nx_hud_present_ms_max = 0;
+        wine_nx_hud_epoch_ms = now_ms;
+    }
+}
+
+void wine_nx_hud_mark_executed( uint64_t present_ms )
+{
+    wine_nx_hud_executed_count++;
+    if (present_ms < wine_nx_hud_present_ms_min) wine_nx_hud_present_ms_min = present_ms;
+    if (present_ms > wine_nx_hud_present_ms_max) wine_nx_hud_present_ms_max = present_ms;
+}
+
+void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride )
 {
     char line[64];
 
@@ -533,6 +704,15 @@ static void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride )
 
 static uint64_t wine_nx_fb_last_present_ms;
 
+#ifdef WINE_NX_DEKO3D_ONLY
+
+void wine_nx_fb_present(void)
+{
+    wine_nx_deko3d_fb_present();
+}
+
+#else
+
 void wine_nx_fb_present(void)
 {
     uint64_t now_ms;
@@ -542,55 +722,17 @@ void wine_nx_fb_present(void)
     pthread_mutex_lock( &wine_nx_fb_mutex );
     if (wine_nx_fb_ready && wine_nx_fb_pending_bits && wine_nx_fb_pending_dirty && !wine_nx_fb_lock_depth)
     {
-        wine_nx_hud_attempt_count++;
+        wine_nx_hud_mark_attempt();
         now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        if (!wine_nx_hud_epoch_ms) wine_nx_hud_epoch_ms = now_ms;
-        if (now_ms - wine_nx_hud_epoch_ms >= 1000)
-        {
-            unsigned int i, sum, mn, mx;
-
-            wine_nx_hud_attempt_display = wine_nx_hud_attempt_count;
-            wine_nx_hud_executed_display = wine_nx_hud_executed_count;
-            wine_nx_hud_fps_display = wine_nx_hud_executed_count;
-
-            wine_nx_hud_fps_history[wine_nx_hud_fps_history_pos] = wine_nx_hud_executed_count;
-            wine_nx_hud_fps_history_pos = (wine_nx_hud_fps_history_pos + 1) % WINE_NX_HUD_FPS_WINDOW;
-            if (wine_nx_hud_fps_history_count < WINE_NX_HUD_FPS_WINDOW) wine_nx_hud_fps_history_count++;
-
-            sum = 0;
-            mn = mx = wine_nx_hud_fps_history[0];
-            for (i = 0; i < wine_nx_hud_fps_history_count; i++)
-            {
-                unsigned int v = wine_nx_hud_fps_history[i];
-                sum += v;
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
-            }
-            wine_nx_hud_fps_avg_display = sum / wine_nx_hud_fps_history_count;
-            wine_nx_hud_fps_min_display = mn;
-            wine_nx_hud_fps_max_display = mx;
-
-            wine_nx_hud_present_ms_min_display = wine_nx_hud_executed_count ? wine_nx_hud_present_ms_min : 0;
-            wine_nx_hud_present_ms_max_display = wine_nx_hud_present_ms_max;
-
-            wine_nx_hud_attempt_count = 0;
-            wine_nx_hud_executed_count = 0;
-            wine_nx_hud_present_ms_min = UINT64_MAX;
-            wine_nx_hud_present_ms_max = 0;
-            wine_nx_hud_epoch_ms = now_ms;
-        }
         if (now_ms - wine_nx_fb_last_present_ms >= WINE_NX_FB_MIN_PRESENT_INTERVAL_MS)
         {
-            uint64_t t0, t1, dt;
+            uint64_t t0, t1;
 
-            wine_nx_hud_executed_count++;
             wine_nx_hud_draw( wine_nx_fb_pending_bits, WINE_NX_FB_W, WINE_NX_FB_H, wine_nx_fb_pending_stride );
             t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
             framebufferEnd( &wine_nx_fb );
             t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-            dt = t1 - t0;
-            if (dt < wine_nx_hud_present_ms_min) wine_nx_hud_present_ms_min = dt;
-            if (dt > wine_nx_hud_present_ms_max) wine_nx_hud_present_ms_max = dt;
+            wine_nx_hud_mark_executed( t1 - t0 );
             wine_nx_fb_pending_bits = NULL;
             wine_nx_fb_pending_stride = 0;
             wine_nx_fb_pending_dirty = 0;
@@ -602,6 +744,8 @@ void wine_nx_fb_present(void)
     }
     pthread_mutex_unlock( &wine_nx_fb_mutex );
 }
+
+#endif /* WINE_NX_DEKO3D_ONLY */
 
 /* Return the primary touchscreen contact in native 1280x720 display
  * coordinates.  Win32u turns it into the conventional mouse stream expected
@@ -1336,13 +1480,24 @@ int main( int argc, char **argv )
 
     log_main_thread = pthread_self();
     log_main_thread_set = 1;
+#ifndef WINE_NX_DEKO3D_ONLY
     consoleInit( NULL );
+#endif
+    /* deko3d-only build never calls consoleInit() at all -- confirmed via
+     * libnx's console_sw.c (the default renderer) that it calls
+     * nwindowGetDefault() internally, so even calling consoleInit() just to
+     * show boot-trace text would pull in the same __nx_win_init() conflict
+     * this whole binary exists to avoid. No on-screen boot trace in this
+     * build by design (matches deko_basic/Borealis, neither of which show
+     * one either) -- the log file is the only source of truth, same as it's
+     * been for every hardware diagnosis this session. */
     mkdir( "sdmc:/switch", 0777 );
     mkdir( RUNTIME_DIR, 0777 );
     mkdir( WINE_DRIVE_C, 0777 );
     mkdir( WINE_DRIVE_C "/windows", 0777 );
     mkdir( WINE_SYSTEM_DIR, 0777 );
-    log_file = fopen( RUNTIME_DIR "/wine-nx-runtime.log", "w" );
+    log_file = fopen( RUNTIME_DIR WINE_NX_RUNTIME_LOG_NAME, "w" );
+    wine_nx_syscall_trace_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );

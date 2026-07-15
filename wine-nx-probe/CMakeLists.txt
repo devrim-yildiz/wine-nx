@@ -628,6 +628,75 @@ find_library(SWITCH_Z z HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} deko3d nx m)
 
+# Deko3d-only runtime: a genuinely separate binary, not a runtime flag inside
+# wine-nx-runtime, specifically so it never references nwindowGetDefault() or
+# anything (consoleInit() included -- see runtime.c's WINE_NX_DEKO3D_ONLY
+# comment) that pulls in libnx's default_window.c. That reference is what
+# makes libnx's __appInit() run __nx_win_init() before main(), unconditionally
+# opening a vi display before deko3d ever gets a chance to be the first
+# consumer -- see wine-nx-probe/3d-accel-scoping.md. Compiles source/runtime.c
+# a second time with WINE_NX_DEKO3D_ONLY defined, which compiles out every
+# libnx-framebuffer/console code path entirely (not just branches around it at
+# runtime -- the symbol references themselves must not exist in this binary).
+# wine-nx-runtime itself is untouched: its own compilation of runtime.c never
+# defines this macro, so its behavior is byte-for-byte identical to before.
+add_executable(wine-nx-runtime-deko3d
+    source/runtime.c
+    source/runtime_deko3d.c
+    source/runtime_platform.c
+    source/ntdll_pe_compat.c
+    source/ws2_32_unix_stub.c
+    $<TARGET_OBJECTS:wine-horizon-real>
+    $<TARGET_OBJECTS:wine-server-real>
+    $<TARGET_OBJECTS:wine-sync-real>
+    $<TARGET_OBJECTS:wine-file-real>
+    $<TARGET_OBJECTS:wine-thread-real>
+    $<TARGET_OBJECTS:wine-virtual-real>
+    $<TARGET_OBJECTS:wine-signal-arm64-real>
+    $<TARGET_OBJECTS:wine-env-real>
+    $<TARGET_OBJECTS:wine-debug-real>
+    $<TARGET_OBJECTS:wine-system-real>
+    $<TARGET_OBJECTS:wine-loadorder-real>
+    $<TARGET_OBJECTS:wine-loader-unix-real>
+    $<TARGET_OBJECTS:wine-ntdll-loader-real>
+    $<TARGET_OBJECTS:wine-registry-real>
+    $<TARGET_OBJECTS:wine-security-real>
+    $<TARGET_OBJECTS:wine-process-real>
+    $<TARGET_OBJECTS:wine-socket-real>
+    $<TARGET_OBJECTS:wine-serial-real>
+    $<TARGET_OBJECTS:wine-cdrom-real>
+    $<TARGET_OBJECTS:wine-tape-real>
+    $<TARGET_OBJECTS:wine-win32u-real>
+)
+
+set_target_properties(wine-nx-runtime-deko3d PROPERTIES SUFFIX ".elf")
+
+target_compile_definitions(wine-nx-runtime-deko3d PRIVATE ${WINE_SWITCH_NTDLL_DEFS} WINE_NX_DEKO3D_ONLY=1)
+
+target_compile_options(wine-nx-runtime-deko3d PRIVATE
+    -std=gnu99
+    -Wall
+    -Wextra
+    -Werror=implicit-function-declaration
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_include_directories(wine-nx-runtime-deko3d PRIVATE ${WINE_SWITCH_NTDLL_INCLUDES})
+
+# --gc-sections is not just an optimization here: with -ffunction-sections it's
+# also what actually drops any never-called libnx console/framebuffer code
+# that might otherwise still end up in the final binary from other object
+# files pulled in for unrelated symbols. It does not, by itself, prevent
+# __appInit() from invoking __nx_win_init() -- that trigger is a symbol
+# *reference*, resolved at link time before gc-sections prunes anything -- so
+# it's this binary's lack of any nwindowGetDefault()/consoleInit() call at
+# all (see runtime.c) that matters, not this flag.
+target_link_options(wine-nx-runtime-deko3d PRIVATE -Wl,--gc-sections)
+
+target_link_libraries(wine-nx-runtime-deko3d PRIVATE
+    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} deko3d nx m)
+
 find_program(NACPTOOL nacptool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(ELF2NRO elf2nro HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(UAM uam HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
@@ -680,6 +749,8 @@ if(NACPTOOL AND ELF2NRO)
     set(DEKO3D_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-deko3d-smoke.nro")
     set(RUNTIME_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime.nacp")
     set(RUNTIME_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime.nro")
+    set(RUNTIME_DEKO3D_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime-deko3d.nacp")
+    set(RUNTIME_DEKO3D_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime-deko3d.nro")
 
     add_custom_command(
         OUTPUT "${NACP_FILE}"
@@ -822,4 +893,19 @@ if(NACPTOOL AND ELF2NRO)
     )
 
     add_custom_target(wine-nx-runtime-nro ALL DEPENDS "${RUNTIME_NRO_FILE}")
+
+    add_custom_command(
+        OUTPUT "${RUNTIME_DEKO3D_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime (deko3d)" "Codex" "0.1.0" "${RUNTIME_DEKO3D_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${RUNTIME_DEKO3D_NRO_FILE}"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-runtime-deko3d>" "${RUNTIME_DEKO3D_NRO_FILE}" "--nacp=${RUNTIME_DEKO3D_NACP_FILE}"
+        DEPENDS wine-nx-runtime-deko3d "${RUNTIME_DEKO3D_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_target(wine-nx-runtime-deko3d-nro ALL DEPENDS "${RUNTIME_DEKO3D_NRO_FILE}")
 endif()

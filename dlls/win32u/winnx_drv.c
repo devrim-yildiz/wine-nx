@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -302,6 +305,9 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     int fbw = 0, fbh = 0, fbstride = 0;
     DWORD *fb;
     int sy, sx;
+#ifdef __SWITCH__
+    u64 t0, t1;
+#endif
 
     (void)rect;
 
@@ -314,6 +320,20 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     nxdrv_trace_hot( "[NXDRV] fb_lock -> fb=%d fbw=%d fbh=%d stride=%d", fb ? 1 : 0, fbw, fbh, fbstride );
     if (!fb) return TRUE;
 
+    /* Diagnosing a ~795ms/frame GDI-paint stall (gui_smoke.c's own QPC-based
+     * phase timing). This scalar, unvectorized per-pixel loop is confirmed
+     * to run synchronously inside EndPaint() -- NtUserEndPaint ->
+     * switch_present_surface_dirty -> window_surface_flush -> this
+     * function's .flush vtable slot (dlls/win32u/dce.c:1819-1826) -- so it's
+     * in scope for what paint_avg measures, not deferred elsewhere. For a
+     * full-window InvalidateRect(hwnd, NULL, FALSE) it's up to width*height
+     * iterations of bounds-checking and BGRX->RGBA bit-swizzling with no
+     * batching -- a real candidate the deko3d GPU-sync timing (all
+     * near-zero) and the redraw_window/get_update_region/get_visible_region
+     * IPC timing (~10% of paint_avg) didn't explain. */
+#ifdef __SWITCH__
+    t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+#endif
     for (sy = blit.top; sy < blit.bottom; sy++)
     {
         int v = sy;
@@ -335,6 +355,18 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
             dst[dx] = 0xff000000u | (p & 0x0000ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
         }
     }
+#ifdef __SWITCH__
+    t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    /* Unlimited nxdrv_trace(), not the rate-limited nxdrv_trace_hot() used
+     * just above -- that helper's 120-call budget is shared across every
+     * call site in this file, and burning it 50% faster here would starve
+     * whichever of these three lines runs out first. Call frequency is
+     * already bounded by the (slow) frame rate itself, so there's no real
+     * flooding risk from leaving this one unlimited. */
+    nxdrv_trace( "[NXDRV][TIMING] pixel loop took %dms w=%d h=%d px=%d",
+                (int)(t1 - t0), blit.right - blit.left, blit.bottom - blit.top,
+                (blit.right - blit.left) * (blit.bottom - blit.top) );
+#endif
 
     wine_nx_fb_unlock();
     return TRUE;

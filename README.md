@@ -232,11 +232,61 @@ numbers, both at stock clock and under a CPU overclock:
 `framebufferEnd()` itself is fast -- 3-5ms, nowhere near the ~500ms/frame
 that a steady 2fps implies -- and attempted == executed means the ~60Hz
 throttle isn't gating anything right now; every attempt is already going
-through. Whatever caps this at 2fps is elsewhere: GDI paint cost, `Sleep()`,
-message dispatch, or how often `wine_nx_fb_present()` actually gets invoked
-per loop iteration. The full-buffer block-linear conversion may still matter
-once that real bottleneck is found and fixed, but **it is not where the next
-investigation should start.**
+through. The full-buffer block-linear conversion is not the bottleneck.
+
+**Update, root cause found (partially) and fixed, hardware-confirmed 2fps
+-> 4fps:** deko3d's own GPU-sync points (`dkFenceWait`, `dkQueueAcquireImage`,
+submit+signal+present) were timed directly and are all sub-millisecond, so
+the bottleneck is not presentation-mechanism-specific -- it affects both the
+libnx and deko3d backends equally. Per-phase timing added to the GUI smoke
+test's own message loop (`gui_smoke.c`) pointed at `paint_avg` (the
+`InvalidateRect`+`UpdateWindow` span) as the outlier: ~800ms/frame, dwarfing
+dispatch/update/sleep. Tracing *why* found two stacked problems, both real:
+
+1. **Every NT syscall was being traced with a synchronous SD-card
+   `fflush()` per line.** `wine_nx_do_syscall()`
+   (`dlls/ntdll/unix/signal_arm64.c`) logs syscall entry/exit for
+   essentially every PE->native syscall, and `log_line()`
+   (`wine-nx-probe/source/runtime.c`) `fflush()`s the log file on every
+   single call -- and that log file lives on the SD card
+   (`sdmc:/switch/wine/...`), so every traced syscall was a real,
+   synchronous filesystem-IPC write. A single `WM_PAINT` dispatch in the
+   GUI smoke test alone produced ~1440 of these (see next point), enough
+   at even a fraction of a millisecond each to plausibly account for most
+   of the measured 800ms.
+2. **`draw_pixel_ramp()` in `gui_smoke.c` drew a 240px gradient with 720
+   individual `SetPixel()` calls** (3 rows x 240 columns), each one a
+   full syscall round-trip -- by far the single largest contributor to
+   the per-frame syscall-trace volume above.
+
+Fixed both: the raw per-syscall trace in `signal_arm64.c` is now gated
+behind `wine_nx_syscall_trace_enabled` (off by default; opt in via
+`WINE_NX_SYSCALL_TRACE` env var or `sdmc:/switch/wine/systrace.txt`, same
+file-fallback pattern as `deko3d.txt`, since hbmenu launches don't reliably
+see a real process environment) -- when off, neither the trace call nor its
+`fflush()` runs. `log_line()` itself, and every other (far lower-frequency)
+trace call site (`[NXIPC]`, `[NXDRV]`, `[NXDK]`, HUD stats), is untouched --
+those still `fflush()` every write, since they need to survive a crash and
+aren't high-frequency enough to matter here. `draw_pixel_ramp()` now blits
+the gradient with a single `StretchDIBits()` call instead of 720 `SetPixel`
+calls.
+
+**Result, hardware-confirmed with tracing off by default: 2fps -> 4fps.**
+`paint_avg` dropped from ~800ms to ~270-300ms/frame. That's real progress,
+not the full answer -- `paint_avg` is still ~95% of total frame time. Of
+that remainder, three synchronous IPC round-trips hidden inside
+`InvalidateRect`+`BeginPaint` (`redraw_window`, `get_update_region`,
+`get_visible_region`, all real handlers in `dlls/ntdll/unix/horizon.c`)
+account for roughly 25% (~70-80ms/frame, at a ~14ms-per-call transport
+floor that turned out to be universal across every IPC request type, not
+specific to these three). The rest (~200ms/frame) is still unidentified --
+next candidates to trace are GDI resource churn in the sample app itself
+(three `HFONT`s created and destroyed from scratch every single frame in
+`draw_scene()`/`draw_badge()`, each triggering full font-family/file/
+charmap resolution, plus per-character `GetGlyphOutline` rasterization with
+no cross-frame glyph cache) and the ~14ms generic IPC transport floor
+itself (real syscall/FS-IPC cost vs. an avoidable sleep/poll interval,
+not yet determined).
 
 The real performance step is still a GPU presentation path: upload Wine
 DIB/window surfaces into GPU textures, composite them, and present once per
@@ -250,24 +300,39 @@ under the same old, pre-NVK Mesa), and **deko3d** (Switch homebrew's own
 low-level GPU API) is available too -- both bind to the same
 `nwindowGetDefault()` handle `wine_nx_fb_init()` already uses.
 
-**deko3d is hardware-confirmed as a standalone smoke test, but the actual
-compositor swap is architecturally blocked, not just unfinished:** the
-smoke test (see "Deko3d Bring-Up Smoke Test" above) proves device/queue/
-swapchain/present, a CPU-to-GPU texture upload, and real shader-driven 3D
-geometry all running together at 60-62fps. Wiring that into
-`wine_nx_fb_lock/unlock/present` as an opt-in backend was attempted and
-consistently fails at swapchain/display creation, root-caused through
-hardware-log-driven diagnosis into libnx's own `__appInit`/`__nx_win_init`
-crt0 hook: this binary's required libnx-framebuffer fallback references
-`nwindowGetDefault()`, which unconditionally opens a `vi` display before
-`main()` even runs, before deko3d ever gets a chance to be the first
-consumer -- the exact scenario every real deko3d reference (Borealis,
-`deko_basic`, `deko_console`) requires and none of them violate, because
-none of them ship a runtime-selectable libnx/deko3d choice in one binary.
-The runtime falls back to the proven libnx path automatically on any
-deko3d failure, so this is a parked dead end, not a regression -- see
-`wine-nx-probe/3d-accel-scoping.md` for the full root-cause trace and the
-real path forward (a separate build target, not a fix to this one).
+**deko3d is hardware-confirmed as a standalone smoke test, and as a real
+compositor backend for the full Wine GUI stack, via a separate binary:**
+the smoke test (see "Deko3d Bring-Up Smoke Test" above) proves device/
+queue/swapchain/present, a CPU-to-GPU texture upload, and real
+shader-driven 3D geometry all running together at 60-62fps. Wiring that
+into `wine_nx_fb_lock/unlock/present` as an opt-in backend *inside
+`wine-nx-runtime`* consistently failed at swapchain/display creation,
+root-caused through hardware-log-driven diagnosis into libnx's own
+`__appInit`/`__nx_win_init` crt0 hook: that binary's required
+libnx-framebuffer fallback references `nwindowGetDefault()`, which
+unconditionally opens a `vi` display before `main()` even runs, before
+deko3d ever gets a chance to be the first consumer -- the exact scenario
+every real deko3d reference (Borealis, `deko_basic`, `deko_console`)
+requires and none of them violate, because none of them ship a
+runtime-selectable libnx/deko3d choice in one binary. Full root-cause
+trace in `wine-nx-probe/3d-accel-scoping.md`.
+
+The real fix was exactly what that trace called for: a separate build
+target, not a change to the existing one. **`wine-nx-runtime-deko3d`**
+(`wine-nx-probe/CMakeLists.txt`) compiles `source/runtime.c` a second time
+with `WINE_NX_DEKO3D_ONLY` defined, which compiles out every
+libnx-framebuffer/console code path entirely -- not just branches around
+it at runtime, the symbol references themselves don't exist in this
+binary, so `nwindowGetDefault()`/`consoleInit()` are never linked in and
+deko3d really is the first and only `vi` consumer. **Hardware-confirmed
+working end-to-end:** all six ViLayer/swapchain init steps succeed, and
+the full GUI smoke test app (see "GUI Smoke Demo" above) renders and
+presents real Win32 GDI output through it, including the fflush/SetPixel
+performance investigation above, which was run against this exact binary.
+`wine-nx-runtime` (the libnx-only binary) is untouched and behaves
+byte-for-byte as before -- the opt-in `WINE_NX_DEKO3D` runtime flag inside
+it is kept parked, not removed, since it can never work for the
+`__appInit` reason above.
 
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
@@ -285,10 +350,26 @@ on `GetTickCount`/`GetTickCount64` for timers, animation pacing, or
 elapsed-time checks gets a frozen value, not real time.
 `QueryPerformanceCounter`/`QueryPerformanceFrequency` are unaffected (they
 route through a different, working `clock_gettime()`-backed path) and are a
-safe substitute today. **Proposed fix, not yet implemented:** a small
-periodic thread in `wine-nx-probe/source/runtime.c` calling
-`set_current_time()` roughly every 15ms, standing in for the wineserver
-poll loop this port doesn't run.
+safe substitute today.
+
+**Update: the originally-proposed fix (a periodic thread calling
+`set_current_time()`) does not work and was not built.** Investigated while
+chasing the 2fps stall above, on the theory that a frozen clock might be
+making `Sleep()` or a message-dispatch timeout compute something huge.
+Tracing `Sleep()` -> `NtDelayExecution` on this fork found it's backed by a
+`select()` loop keyed on `NtQuerySystemTime` (real `clock_gettime()`), never
+`user_shared_data->TickCount` -- so the frozen clock does not explain that
+stall (the actual cause was the fflush/SetPixel issue documented above).
+Separately, `server/fd.c` (where `set_current_time()` lives) is not part of
+this Switch build's link closure at all (`server/` isn't compiled in --
+this port's entire wineserver role is played by
+`dlls/ntdll/unix/horizon.c`, a from-scratch reimplementation that never
+references `TickCount`/`user_shared_data`/`set_current_time()`), so the
+proposed fix would not even link as described. The clock is still frozen
+and still worth fixing for any app that does rely on it for real elapsed
+time, but the fix needs to write `user_shared_data->TickCount` from
+somewhere reachable in this port's actual link closure -- not yet
+implemented.
 
 ### UI Completeness Is Still Early
 
@@ -525,19 +606,25 @@ wine-nx-probe/source/deko3d_smoke.c
 Replace or bypass the expensive linear framebuffer path. **NVK confirmed
 not available** for Switch homebrew (verified directly against the
 devkitpro/devkita64 toolchain image, not assumed), and **deko3d's core
-pipeline is hardware-confirmed working in isolation** (device/queue/
+pipeline is hardware-confirmed working**, both in isolation (device/queue/
 swapchain/present, texture upload, and real shader-driven geometry, all at
-60-62fps -- see "Deko3d Bring-Up Smoke Test" above), but **wiring it into
-`wine_nx_fb_lock/unlock/present` as an opt-in backend is architecturally
-blocked**, not just unfinished: this binary's required libnx-framebuffer
-fallback references `nwindowGetDefault()`, which libnx's own `__appInit`/
-`__nx_win_init` crt0 hook unconditionally opens a `vi` display for before
-`main()` even runs -- deko3d can never be the first `vi` consumer in a
-binary that also contains the libnx fallback. Full root-cause trace and
-what a real fix would require (a separate build target, not a change to
-this one) in `wine-nx-probe/3d-accel-scoping.md`. The opt-in code
-(`runtime_deko3d.c`) is kept, with an automatic, hardware-confirmed
-fallback to the libnx path on any deko3d failure -- parked, not removed.
+60-62fps -- see "Deko3d Bring-Up Smoke Test" above) and as the actual
+compositor backend for the full Wine GUI stack, via the separate
+`wine-nx-runtime-deko3d` binary (see "Presentation Is Still Too Slow" above) --
+`wine_nx_fb_lock/unlock/present` wired to deko3d inside the original
+`wine-nx-runtime` binary is still architecturally blocked for the
+`__appInit`/`nwindowGetDefault()` reason documented there, but that no
+longer matters since the separate binary is the real path forward and
+already works.
+
+**Current bottleneck on the deko3d binary: presentation is CPU-bound, not
+GPU-bound.** With deko3d confirmed fast (sub-ms GPU-sync) and the
+fflush/SetPixel fix above landed, the GUI smoke test runs at a
+hardware-confirmed 4fps (up from 2fps), still dominated by `paint_avg`
+(~270-300ms/frame). Remaining known contributors: ~25% from three
+synchronous IPC round-trips per paint (`redraw_window`/`get_update_region`/
+`get_visible_region`), the rest not yet identified -- see "Presentation Is
+Still Too Slow" above for the current state of that investigation.
 
 Real Mesa **OpenGL ES** (not Vulkan) is also confirmed available in the same
 toolchain (`switch-mesa`/EGL/GLES, via a Switch-native `libdrm_nouveau`

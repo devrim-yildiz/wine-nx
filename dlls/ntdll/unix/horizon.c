@@ -427,6 +427,76 @@ struct horizon_fd_queue
 #define FILE_OVERWRITE_IF 5
 #endif
 
+/* Not visible in this file's include context despite being standard NT
+ * constants (include/winnt.h) -- same situation as the FILE_READ_DATA et al
+ * fallbacks just above, same fix: guarded local fallbacks. Copied as the
+ * exact symbolic expressions from winnt.h, not hand-resolved hex, so the
+ * preprocessor computes the values instead of a manually-computed number
+ * that would be unverifiable at a glance. Needed for
+ * horizon_server_map_generic_access() below. */
+#ifndef SYNCHRONIZE
+#define SYNCHRONIZE 0x00100000
+#endif
+#ifndef READ_CONTROL
+#define READ_CONTROL 0x00020000
+#endif
+#ifndef STANDARD_RIGHTS_REQUIRED
+#define STANDARD_RIGHTS_REQUIRED 0x000f0000
+#endif
+#ifndef STANDARD_RIGHTS_READ
+#define STANDARD_RIGHTS_READ READ_CONTROL
+#endif
+#ifndef STANDARD_RIGHTS_WRITE
+#define STANDARD_RIGHTS_WRITE READ_CONTROL
+#endif
+#ifndef STANDARD_RIGHTS_EXECUTE
+#define STANDARD_RIGHTS_EXECUTE READ_CONTROL
+#endif
+#ifndef FILE_READ_EA
+#define FILE_READ_EA 0x0008
+#endif
+#ifndef FILE_WRITE_EA
+#define FILE_WRITE_EA 0x0010
+#endif
+#ifndef FILE_EXECUTE
+#define FILE_EXECUTE 0x0020
+#endif
+#ifndef FILE_READ_ATTRIBUTES
+#define FILE_READ_ATTRIBUTES 0x0080
+#endif
+#ifndef FILE_WRITE_ATTRIBUTES
+#define FILE_WRITE_ATTRIBUTES 0x0100
+#endif
+#ifndef FILE_ALL_ACCESS
+#define FILE_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED|SYNCHRONIZE|0x1ff)
+#endif
+#ifndef FILE_GENERIC_READ
+#define FILE_GENERIC_READ (STANDARD_RIGHTS_READ | FILE_READ_DATA | \
+                           FILE_READ_ATTRIBUTES | FILE_READ_EA | \
+                           SYNCHRONIZE)
+#endif
+#ifndef FILE_GENERIC_WRITE
+#define FILE_GENERIC_WRITE (STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA | \
+                            FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | \
+                            FILE_APPEND_DATA | SYNCHRONIZE)
+#endif
+#ifndef FILE_GENERIC_EXECUTE
+#define FILE_GENERIC_EXECUTE (STANDARD_RIGHTS_EXECUTE | FILE_EXECUTE | \
+                              FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+#endif
+#ifndef GENERIC_READ
+#define GENERIC_READ 0x80000000
+#endif
+#ifndef GENERIC_WRITE
+#define GENERIC_WRITE 0x40000000
+#endif
+#ifndef GENERIC_EXECUTE
+#define GENERIC_EXECUTE 0x20000000
+#endif
+#ifndef GENERIC_ALL
+#define GENERIC_ALL 0x10000000
+#endif
+
 enum horizon_select_opcode
 {
     HORIZON_SELECT_NONE,
@@ -2931,17 +3001,47 @@ static void horizon_server_write_utf16_name( unsigned char *dst, const char *nam
         *wide = (unsigned char)*name;
 }
 
-static unsigned int horizon_server_file_open_flags( const struct horizon_create_file_request *request,
+/* Real Wine's wineserver maps GENERIC_READ/WRITE/EXECUTE/ALL to their
+ * object-type-specific rights before caching or acting on an access mask
+ * (server/object.h's map_access(), applied via server/file.c's file_type
+ * mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE,
+ * FILE_ALL_ACCESS }). horizon.c, this port's in-process replacement for
+ * that server, never did this step -- every CreateFileW(GENERIC_WRITE, ...)
+ * handle carries the raw 0x40000000 GENERIC_WRITE bit forever, which shares
+ * no bits with FILE_WRITE_DATA/FILE_APPEND_DATA, so open() picked O_RDONLY
+ * here and server_get_unix_fd()'s bitwise access check (dlls/ntdll/unix/
+ * server.c) denied every subsequent WriteFile()/FlushFileBuffers() with
+ * STATUS_ACCESS_DENIED -- silently, since callers rarely check those
+ * return values. Confirmed via gui_smoke.c's gui_timing.log being
+ * permanently empty despite running for many seconds past its first
+ * 1-second flush window. This mirrors server/object.h's map_access()
+ * exactly, scoped to the FILE object type only (the one concretely
+ * reproduced here) -- not applied to the SOCK path (horizon_server_handle_
+ * open_file_object already hardcodes full access for sockets regardless of
+ * what's cached, so it isn't affected) or the SECTION-rights mapping_access
+ * field in horizon_server_handle_create_mapping (a different rights
+ * namespace this hasn't been shown to need). */
+static unsigned int horizon_server_map_generic_access( unsigned int access )
+{
+    if (access & GENERIC_READ)    access |= FILE_GENERIC_READ;
+    if (access & GENERIC_WRITE)   access |= FILE_GENERIC_WRITE;
+    if (access & GENERIC_EXECUTE) access |= FILE_GENERIC_EXECUTE;
+    if (access & GENERIC_ALL)     access |= FILE_ALL_ACCESS;
+    return access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+}
+
+static unsigned int horizon_server_file_open_flags( unsigned int access,
+                                                    const struct horizon_create_file_request *request,
                                                     int *flags )
 {
-    int wants_read = request->access & FILE_READ_DATA;
-    int wants_write = request->access & (FILE_WRITE_DATA | FILE_APPEND_DATA);
+    int wants_read = access & FILE_READ_DATA;
+    int wants_write = access & (FILE_WRITE_DATA | FILE_APPEND_DATA);
 
     if (wants_read && wants_write) *flags = O_RDWR;
     else if (wants_write) *flags = O_WRONLY;
     else *flags = O_RDONLY;
 
-    if (request->access & FILE_APPEND_DATA) *flags |= O_APPEND;
+    if (access & FILE_APPEND_DATA) *flags |= O_APPEND;
 
     switch (request->create)
     {
@@ -5793,6 +5893,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
     char *stored_name = NULL;
     unsigned int attr_size;
     unsigned int filename_size;
+    unsigned int mapped_access = horizon_server_map_generic_access( request->access );
     int flags;
     int is_dir = 0;
     int fd = -1;
@@ -5808,7 +5909,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
         {
             memcpy( filename, data + attr_size, filename_size );
             filename[filename_size] = 0;
-            reply.header.error = horizon_server_file_open_flags( request, &flags );
+            reply.header.error = horizon_server_file_open_flags( mapped_access, request, &flags );
             is_dir = !!(request->options & HORIZON_FILE_DIRECTORY_FILE);
             if (is_dir && (request->options & HORIZON_FILE_NON_DIRECTORY_FILE))
                 reply.header.error = HORIZON_STATUS_INVALID_PARAMETER;
@@ -5840,7 +5941,7 @@ static int horizon_server_handle_create_file( struct horizon_server_connection *
         {
             entry->object->file_fd = fd;
             entry->object->file_name = stored_name;
-            entry->object->file_access = request->access;
+            entry->object->file_access = mapped_access;
             entry->object->file_options = request->options;
             entry->object->file_is_dir = is_dir;
             reply.handle = entry->handle;

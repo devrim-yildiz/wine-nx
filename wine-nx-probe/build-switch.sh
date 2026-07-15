@@ -126,6 +126,9 @@ fi
 if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ]; then
     echo "Built $BUILD_DIR/wine-nx-runtime.nro"
 fi
+if [ -f "$BUILD_DIR/wine-nx-runtime-deko3d.nro" ]; then
+    echo "Built $BUILD_DIR/wine-nx-runtime-deko3d.nro"
+fi
 
 if [ -d "$WINE_PE_BUILD_DIR" ]; then
     for module in "${REQUIRED_WINE_DLL_MODULES[@]}"; do
@@ -223,6 +226,9 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     fi
     if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ]; then
         cp "$BUILD_DIR/wine-nx-runtime.nro" "$PACKAGE_DIR/wine-nx-runtime.nro"
+    fi
+    if [ -f "$BUILD_DIR/wine-nx-runtime-deko3d.nro" ]; then
+        cp "$BUILD_DIR/wine-nx-runtime-deko3d.nro" "$PACKAGE_DIR/wine-nx-runtime-deko3d.nro"
     fi
     # GUI smoke app: WINE_NX_APP=gui stages the win32u software-window test exe.
     if [ "$APP_KIND" = "gui" ]; then

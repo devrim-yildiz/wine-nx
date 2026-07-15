@@ -303,6 +303,13 @@ extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[];
 /* C dispatcher called from the assembly trampoline below */
 extern void wine_nx_runtime_trace( const char *msg );
 
+/* Off by default (see wine_nx_syscall_trace_select() in runtime.c). The
+ * raw per-syscall trace below is high enough frequency that its fflush()
+ * per line was found to be the actual cause of multi-hundred-ms UI
+ * stalls, so it must stay opt-in rather than always-on like the other
+ * [NXIPC]/[NXDRV]/HUD trace call sites. */
+extern int wine_nx_syscall_trace_enabled;
+
 /* Reacquire the Windows platform register after returning from Unix code.
  * Nested callbacks may unwind past a dispatcher frame, so restoring a saved
  * x18 is not sufficient; Unix TLS remains the authoritative TEB source. */
@@ -325,7 +332,8 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
     ULONG_PTR *handler;
     unsigned int arg_bytes;
     NTSTATUS result;
-    BOOL trace_syscall = !(table_idx == 1 && func_idx == 1051); /* NtUserGetMessage idle polling */
+    BOOL trace_syscall = wine_nx_syscall_trace_enabled &&
+                          !(table_idx == 1 && func_idx == 1051); /* NtUserGetMessage idle polling */
 
     if (func_idx >= table->ServiceLimit)
         return STATUS_INVALID_SYSTEM_SERVICE;

@@ -253,6 +253,34 @@ static DECLSPEC_NORETURN void server_protocol_perror( const char *err )
 }
 
 
+#ifdef __SWITCH__
+/* Diagnosing a ~795ms/frame GDI-paint stall traced (via gui_smoke.c's own
+ * QPC-based phase timing) to three unconditional per-frame server calls --
+ * redraw_window (from InvalidateRect), get_update_region and
+ * get_visible_region (both from BeginPaint) -- inside dlls/win32u/dce.c's
+ * window bookkeeping. horizon.c's handlers for all three are cheap (a
+ * mutex, an O(1) window-handle lookup, a few field reads, a reply) --
+ * confirmed by reading them, not assumed -- so if these three are actually
+ * where the time goes, the cost has to be in this transport (the request/
+ * reply pipe round trip to horizon_server_thread), not in request-handling
+ * logic. wine_server_call() -> server_call_unlocked() is the one chokepoint
+ * every server request of any kind funnels through, and req->name (set by
+ * SERVER_START_REQ's `__req.name = #type;`) already gives per-request-type
+ * identification for free, so this is instrumented here rather than at each
+ * of the three win32u call sites individually. */
+extern void wine_nx_runtime_trace( const char *msg );
+
+static void wine_nx_server_call_trace( const char *fmt, ... )
+{
+    char buf[256];
+    va_list args;
+    va_start( args, fmt );
+    vsnprintf( buf, sizeof(buf), fmt, args );
+    va_end( args );
+    wine_nx_runtime_trace( buf );
+}
+#endif
+
 /***********************************************************************
  *           send_request
  *
@@ -367,11 +395,37 @@ unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
+#ifdef __SWITCH__
+    u64 t0, t1, dt;
+#endif
 
     FTRACE_BLOCK_START("req %s", req->name)
+#ifdef __SWITCH__
+    t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+#endif
     TRACE_(client)("%s start\n", req->name); \
     if (!(ret = send_request( req )))
         ret = wait_reply( req );
+#ifdef __SWITCH__
+    t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    dt = t1 - t0;
+    /* Log the three specific suspects unconditionally (even at 0ms, so
+     * their absence or presence is itself informative), plus anything else
+     * that takes >5ms as a safety net for a slow call this investigation
+     * didn't anticipate. Deliberately NOT logging every call unconditionally
+     * -- fflush-per-line (log_line()'s durability discipline, proven
+     * elsewhere this session) on every single server request, when there
+     * can be dozens of different request types per frame, would add its
+     * own overhead and risk skewing the exact numbers this is trying to
+     * measure. */
+    if (dt > 5 ||
+        !strcmp( req->name, "redraw_window" ) ||
+        !strcmp( req->name, "get_update_region" ) ||
+        !strcmp( req->name, "get_visible_region" ))
+    {
+        wine_nx_server_call_trace( "[NXIPC][TIMING] %s took %ums", req->name, (unsigned)dt );
+    }
+#endif
     TRACE_(client)("%s end\n", req->name);
     FTRACE_BLOCK_END()
     return ret;
