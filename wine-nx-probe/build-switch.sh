@@ -249,6 +249,27 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             fi
         fi
     fi
+    # Direct-blit test app: WINE_NX_APP=blit stages the no-InvalidateRect/
+    # no-BeginPaint GetDC+StretchDIBits comparison test (see
+    # samples/direct-blit/direct_blit.c's file header for what this isolates).
+    if [ "$APP_KIND" = "blit" ]; then
+        BLIT_SRC="$SCRIPT_DIR/samples/direct-blit/direct_blit.c"
+        BLIT_EXE="$SCRIPT_DIR/samples/direct-blit/direct_blit.exe"
+        BLIT_CC="$LLVM_MINGW_BIN_DIR/aarch64-w64-mingw32-clang"
+        if [ -f "$BLIT_SRC" ]; then
+            if [ ! -x "$BLIT_CC" ]; then
+                BLIT_CC="$(command -v aarch64-w64-mingw32-clang || true)"
+            fi
+            if [ -z "$BLIT_CC" ] || [ ! -x "$BLIT_CC" ]; then
+                echo "Missing aarch64-w64-mingw32-clang; cannot build direct-blit test app" >&2
+                exit 1
+            fi
+            if [ ! -f "$BLIT_EXE" ] || [ "$BLIT_SRC" -nt "$BLIT_EXE" ]; then
+                "$BLIT_CC" -municode -mwindows -O2 -Wall -Wextra \
+                    -o "$BLIT_EXE" "$BLIT_SRC" -luser32 -lgdi32
+            fi
+        fi
+    fi
     if [ "$APP_KIND" = "gui" ] && [ -f "$SCRIPT_DIR/samples/gui-smoke/gui_smoke.exe" ]; then
         GUI_DIR="$PACKAGE_DIR/drive_c/gui"
         mkdir -p "$GUI_DIR"
@@ -257,6 +278,14 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged GUI smoke app as runtime target (WINE_NX_APP=gui)"
+    elif [ "$APP_KIND" = "blit" ] && [ -f "$SCRIPT_DIR/samples/direct-blit/direct_blit.exe" ]; then
+        BLIT_DIR="$PACKAGE_DIR/drive_c/blit"
+        mkdir -p "$BLIT_DIR"
+        cp "$SCRIPT_DIR/samples/direct-blit/direct_blit.exe" "$BLIT_DIR/direct_blit.exe"
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/blit/direct_blit.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged direct-blit test app as runtime target (WINE_NX_APP=blit)"
     elif [ "$APP_KIND" = "notepad" ] && [ -f "$NOTEPAD_EXE" ]; then
         cp "$NOTEPAD_EXE" "$SYSTEM_DIR/notepad.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/windows/system32/notepad.exe' > "$PACKAGE_DIR/target.txt"
