@@ -441,12 +441,12 @@ Diagnosis is solid -- both the `usleep` scan and the `get_update_region`
 next step for either optimization is hardware-in-the-loop testing, not
 more source reading.
 
-### Autonomous Session Follow-Ups (No Hardware Access)
+### Autonomous Session Follow-Ups
 
-Two further autonomous rounds, each on a checkpoint branch
-(`autonomous-multitrack-checkpoint`), not merged to `main` pending
-hardware verification. Full per-change reasoning is in that branch's
-commit messages; summarized here.
+Two further autonomous rounds, done on a checkpoint branch, since
+hardware-verified, merged into `main`, and deleted. Full per-change
+reasoning is in the commit history; summarized here, with hardware
+results folded in below each item.
 
 **Round 1** -- WM_ERASEBKGND (`erase`, ~47ms) split into
 `erase_get_dcex`/`erase_clipbox`/`erase_wm_erasebkgnd`/`erase_release_dc`
@@ -463,7 +463,12 @@ on instead. The frozen-`GetTickCount` write-side fix was investigated
 and deliberately not attempted: `user_shared_data` is a fixed address
 (`0x7ffe0000`) real Wine maps read-only for ordinary processes, and
 writing to it without hardware to verify write access risks trading a
-frozen clock for a hard crash.
+frozen clock for a hard crash. **Hardware-tested since: the crash
+persists identically with the `svcExitProcess()` swap in place**,
+ruling out the "libc `exit()`'s atexit path races the main thread's
+GPU/socket state" theory this fix was built around. Root cause remains
+unresolved; the step-by-step `[EXIT]` logging stays in place for
+whenever this gets picked back up.
 
 **Round 2** -- three more ideas, chosen freely:
 
@@ -486,7 +491,11 @@ frozen clock for a hard crash.
    possibly-read-only shared page -- both deliberately out of scope
    here. Logs a rate-limited `[NXTICK]` sample once/second so real,
    monotonically-increasing values are visible without reintroducing
-   per-call fflush cost.
+   per-call fflush cost. **Hardware-confirmed: `[NXTICK]` samples show
+   real, monotonically increasing values** (no longer frozen). This fix
+   also had a real, initially-surprising side effect on
+   `flush_window_surfaces()`'s idle debounce -- see "Two More Threads"
+   below for how that was resolved.
 2. **The paint-trace tier's own instrumentation overhead, fixed at the
    tool level.** `switch_paint_trace()` (`dce.c`) no longer
    `fflush()`es one line per call -- it accumulates each phase's
@@ -514,8 +523,36 @@ frozen clock for a hard crash.
    already efficient. A clean negative result, reported rather than
    forced into a fix that wasn't needed.
 
-All three round-2 changes compile-verified only, on the same checkpoint
-branch, not hardware-tested.
+Items 1 and 2 above are hardware-confirmed (see inline notes); item 3
+needed no further testing since it was a pure negative/ruled-out finding
+with no code change.
+
+### Two More Threads: The NtUserGetDCEx Gap, and the Clock Fix's Side Effect
+
+Two more tracks, both hardware-tested and closed out cleanly.
+
+**Track A -- the ~30ms `NtUserGetDCEx` gap.** `getdcex_flags_fixup`,
+`getdcex_dce_lookup`, and `getdcex_clip_setup` (the three candidates
+flagged when `erase_get_dcex`'s cost was first isolated) all came back at
+0ms on hardware. The gap lives entirely inside `update_visible_region()`'s
+own client-side work following the `get_visible_region` IPC call
+(`getdcex_vis_rgn` reproduces `erase`'s full ~46-48ms), not in
+`NtUserGetDCEx`'s own bookkeeping. Narrowed, not closed --
+`update_visible_region()`'s internals (`NtGdiCombineRgn`, surface lookup,
+`pGetDC`, `set_visible_region`) haven't been sub-instrumented themselves
+yet.
+
+**Track B -- was the `NtGetTickCount()` fix a net win or a net loss?**
+Fixing the frozen clock had an accidental, non-diagnostic side effect:
+`flush_window_surfaces()`'s idle debounce, structurally unable to run
+while `now - last_flush` always read `0 < 50` on the frozen clock, started
+actually evaluating for the first time -- discovered via a `paint_avg`
+drop the first time both fixes were tested together, not predicted in
+advance. `WINE_NX_FLUSH_LEGACY` (env var / `sdmc:/switch/wine/flushlegacy.txt`)
+was added specifically to A/B this in one binary/session, forcing the old
+always-skip behavior back on for direct same-run comparison instead of
+trusting noisy separate launches. Result: -1.1% -- within run-to-run
+noise, net-neutral. Confirmed rather than assumed.
 
 ### Batched `get_paint_regions` Request: Landed, Hardware-Confirmed, Didn't Fix fps
 
