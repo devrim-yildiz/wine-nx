@@ -27,6 +27,9 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "ntgdi_private.h"
@@ -36,6 +39,39 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+
+#ifdef __SWITCH__
+/* Sub-phase timing for NtUserBeginPaint/NtUserEndPaint, added to find out
+ * which specific step inside that span accounts for the gap between
+ * paint_avg (measured in wine-nx-probe/samples/gui-smoke/gui_smoke.c) and
+ * the sum of everything already individually timed (draw_frame's
+ * blit_avg/shapes_avg, the [NXIPC][TIMING] calls, the [NXDRV][TIMING]
+ * pixel loop) -- see README, "Presentation Is Still Too Slow".
+ *
+ * Update: as this got split into finer and finer sub-phases (down to
+ * window_surface_flush()'s individual lock/rect-math/get_color/shape/
+ * trace-macro/funcs_flush/unlock steps), every actual piece of work came
+ * back at 0ms or single-digit ms -- the remaining "unaccounted" time
+ * tracked the number of trace calls themselves, not any real operation.
+ * Same root cause as the raw syscall trace fixed earlier (log_line()
+ * fflush()es every line to the SD card), just relocated to this
+ * lower-frequency-per-call-site-but-many-call-sites tier: up to ~14
+ * fflushes per window_surface_flush() invocation. Gated off by default
+ * behind wine_nx_paint_trace_enabled (WINE_NX_PAINT_TRACE env var or
+ * sdmc:/switch/wine/painttrace.txt, same pattern as the syscall trace)
+ * for exactly that reason -- flip it on when actively debugging this
+ * span, leave it off for a clean fps measurement. */
+extern void wine_nx_runtime_trace( const char *msg );
+extern int wine_nx_paint_trace_enabled;
+
+static void switch_paint_trace( const char *phase, unsigned int ms )
+{
+    char buf[128];
+    if (!wine_nx_paint_trace_enabled) return;
+    snprintf( buf, sizeof(buf), "[NXPAINT][TIMING] %s took %ums", phase, ms );
+    wine_nx_runtime_trace( buf );
+}
+#endif
 
 struct dce
 {
@@ -632,9 +668,43 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
+#ifdef __SWITCH__
+    u64 t0, t1;
+    if (wine_nx_paint_trace_enabled)
+    {
+        /* A source-only scan (checked update_now()'s dispatch loop, the
+         * default WM_NCPAINT/WM_ERASEBKGND handlers, release_dc(), and
+         * NtUserReleaseDC()) didn't turn up a confirmed second caller for
+         * why this fires ~2x/paint-cycle while BeginPaint/EndPaint's own
+         * sub-phases don't -- see README, "Presentation Is Still Too Slow".
+         * Logging the actual return address settles it with certainty
+         * instead of more guessing; resolve with addr2line/nm against the
+         * matching build's .elf once a log comes back. Gated the same as
+         * switch_paint_trace() above, for the same fflush-cost reason. */
+        char buf[64];
+        snprintf( buf, sizeof(buf), "[NXPAINT][CALLER] window_surface_flush ret=%p",
+                 __builtin_return_address( 0 ) );
+        wine_nx_runtime_trace( buf );
+    }
+#endif
 
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     window_surface_lock( surface );
+#ifdef __SWITCH__
+    t1 = armGetSystemTick();
+    /* Time to *acquire* the lock -- if this is where present_dirty's
+     * ~110ms unexplained-vs-its-own-children gap turns out to live, that's
+     * lock contention or a slow lock primitive on this port, a different
+     * class of bug than anything found so far (see README, "Presentation
+     * Is Still Too Slow"), not just more bookkeeping to shrug off. */
+    switch_paint_trace( "surface_lock", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     /* align bounds / dirty rect to help with 1bpp shape bitmap updates */
     bounds.left = surface->bounds.left & ~7;
     bounds.top = surface->bounds.top;
@@ -642,21 +712,60 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     bounds.bottom = surface->bounds.bottom;
 
     OffsetRect( &dirty, -dirty.left, -dirty.top );
+#ifdef __SWITCH__
+    t1 = armGetSystemTick();
+    switch_paint_trace( "rect_math", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
     {
-        BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
-        void *shape_bits = window_surface_get_shape( surface, shape_info );
+        BOOL shape_changed;
+#ifdef __SWITCH__
+        t1 = armGetSystemTick();
+        switch_paint_trace( "surface_get_color", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
 
+        t0 = armGetSystemTick();
+#endif
+        shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
+        void *shape_bits = window_surface_get_shape( surface, shape_info );
+#ifdef __SWITCH__
+        t1 = armGetSystemTick();
+        switch_paint_trace( "surface_shape", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
+
+#ifdef __SWITCH__
+        t0 = armGetSystemTick();
+#endif
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+#ifdef __SWITCH__
+        t1 = armGetSystemTick();
+        switch_paint_trace( "trace_macro", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 
+#ifdef __SWITCH__
+        t0 = armGetSystemTick();
+#endif
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
             reset_bounds( &surface->bounds );
+#ifdef __SWITCH__
+        t1 = armGetSystemTick();
+        switch_paint_trace( "surface_funcs_flush", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
     }
 
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     window_surface_unlock( surface );
+#ifdef __SWITCH__
+    t1 = armGetSystemTick();
+    switch_paint_trace( "surface_unlock", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 }
 
 W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
@@ -1804,12 +1913,29 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     BOOL erase;
     RECT rect;
     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+#ifdef __SWITCH__
+    u64 t0, t1;
+#endif
 
     NtUserHideCaret( hwnd );
 
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+#ifdef __SWITCH__
+    t1 = armGetSystemTick();
+    switch_paint_trace( "ncpaint", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
+#ifdef __SWITCH__
+    t1 = armGetSystemTick();
+    switch_paint_trace( "erase", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 
     TRACE( "hdc = %p box = (%s), fErase = %d\n", hdc, wine_dbgstr_rect(&rect), erase );
 
@@ -1831,18 +1957,50 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
 static void switch_present_surface_dirty( struct window_surface *surface )
 {
     extern void wine_nx_fb_present( void ) __attribute__((weak));
+    u64 t0, t1;
 
+    /* present_dirty (NtUserEndPaint's own timer around this whole function)
+     * measured ~99.9ms while window_surface_flush()'s own known children
+     * (lock/get_color/shape/funcs_flush/unlock) and wine_nx_fb_present()'s
+     * known children (dkQueueAcquireImage/submit+signal+present) only
+     * summed to ~29.5ms -- a ~70ms gap not attributable to either
+     * function's already-timed internals from source alone (checked
+     * wine_nx_hud_draw(), wine_nx_hud_mark_attempt(), and g_dk_mutex
+     * contention -- all too small or not applicable). Splitting the timer
+     * at this exact boundary answers which *side* the gap is actually on
+     * before tracing either one further -- see README, "Presentation Is
+     * Still Too Slow". */
+    t0 = armGetSystemTick();
     window_surface_flush( surface );
-    if (&wine_nx_fb_present) wine_nx_fb_present();
+    t1 = armGetSystemTick();
+    switch_paint_trace( "surface_flush_call", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+
+    if (&wine_nx_fb_present)
+    {
+        t0 = armGetSystemTick();
+        wine_nx_fb_present();
+        t1 = armGetSystemTick();
+        switch_paint_trace( "fb_present_call", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    }
 }
 #endif
 
 BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
 {
     struct window_surface *surface;
+#ifdef __SWITCH__
+    u64 t0, t1;
+#endif
 
     NtUserShowCaret( hwnd );
+#ifdef __SWITCH__
+    t0 = armGetSystemTick();
+#endif
     flush_window_surfaces( FALSE );
+#ifdef __SWITCH__
+    t1 = armGetSystemTick();
+    switch_paint_trace( "flush_surfaces", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
     if (!ps)
     {
         if ((surface = window_surface_get( hwnd ))) window_surface_release( surface );
@@ -1853,7 +2011,10 @@ BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
 #ifdef __SWITCH__
     if ((surface = window_surface_get( hwnd )))
     {
+        t0 = armGetSystemTick();
         switch_present_surface_dirty( surface );
+        t1 = armGetSystemTick();
+        switch_paint_trace( "present_dirty", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
         window_surface_release( surface );
     }
     else user_driver->pProcessEvents( 0 );

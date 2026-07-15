@@ -36,6 +36,7 @@ extern void  wine_nx_fb_unlock( void );
 extern void  wine_nx_fb_present( void );
 extern int   wine_nx_touch_poll( int *x, int *y );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+extern int   wine_nx_paint_trace_enabled;
 
 struct wine_nx_surface
 {
@@ -315,8 +316,43 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     if (nx_surface->has_clip && !intersect_rect( &blit, &blit, &nx_surface->clip_rect )) return TRUE;
 
     nxdrv_trace_hot( "[NXDRV] flush dirty=%d,%d-%d,%d", blit.left, blit.top, blit.right, blit.bottom );
+
+    /* surface_funcs_flush (this whole function, timed from dce.c) was
+     * ~39ms bigger than the pixel loop alone -- splitting the three other
+     * things this function does (sample tracing, the fb_lock call --
+     * itself already known to be ~0ms for its own internal dkFenceWait,
+     * so this isolates whatever else fb_lock/mutex-acquire costs -- and
+     * fb_unlock) into their own timers instead of guessing which one it
+     * is. See README, "Presentation Is Still Too Slow".
+     *
+     * Update: that split found every real piece of work here was already
+     * small -- the "missing" time tracked the trace calls' own fflush()
+     * cost, not any actual operation. Gated behind wine_nx_paint_trace_enabled
+     * (see dlls/win32u/dce.c's switch_paint_trace()) for the same reason,
+     * off by default. */
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+#endif
     trace_surface_samples( color_info, color_bits );
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        nxdrv_trace( "[NXDRV][TIMING] trace_samples took %dms", (int)(t1 - t0), 0, 0, 0 );
+    }
+#endif
+
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+#endif
     fb = wine_nx_fb_lock( &fbw, &fbh, &fbstride );
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        nxdrv_trace( "[NXDRV][TIMING] fb_lock_call took %dms", (int)(t1 - t0), 0, 0, 0 );
+    }
+#endif
     nxdrv_trace_hot( "[NXDRV] fb_lock -> fb=%d fbw=%d fbh=%d stride=%d", fb ? 1 : 0, fbw, fbh, fbstride );
     if (!fb) return TRUE;
 
@@ -368,7 +404,17 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
                 (blit.right - blit.left) * (blit.bottom - blit.top) );
 #endif
 
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+#endif
     wine_nx_fb_unlock();
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+        nxdrv_trace( "[NXDRV][TIMING] fb_unlock_call took %dms", (int)(t1 - t0), 0, 0, 0 );
+    }
+#endif
     return TRUE;
 }
 

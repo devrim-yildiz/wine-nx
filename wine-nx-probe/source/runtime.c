@@ -245,6 +245,31 @@ static void wine_nx_syscall_trace_select(void)
              (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
 }
 
+/* Off by default, same reasoning and same pattern as
+ * wine_nx_syscall_trace_enabled above -- this one gates the
+ * [NXPAINT][TIMING]/[NXPAINT][CALLER] tier added while chasing
+ * paint_avg (dlls/win32u/dce.c's switch_paint_trace() call sites, plus
+ * the trace_samples/fb_lock_call/fb_unlock_call additions in
+ * dlls/win32u/winnx_drv.c). That investigation found the exact same
+ * bug relocated one level down: every one of those trace calls' own
+ * fflush() lands in the untimed gap between two phase timers, so the
+ * tier meant to measure paint_avg's cost was itself becoming a
+ * meaningful fraction of it -- up to ~14 fflushes per
+ * window_surface_flush() call. See README, "Presentation Is Still Too
+ * Slow". Non-static for the same cross-translation-unit reason as
+ * wine_nx_syscall_trace_enabled. */
+int wine_nx_paint_trace_enabled;
+
+static void wine_nx_paint_trace_select(void)
+{
+    const char *env = getenv( "WINE_NX_PAINT_TRACE" );
+    int file_flag = read_bool_file( RUNTIME_DIR "/painttrace.txt" );
+    wine_nx_paint_trace_enabled = (env && env[0]) || file_flag;
+    log_line( "[NXTRACE] paint sub-phase trace: %s (env=%s file=%s)",
+             wine_nx_paint_trace_enabled ? "ON" : "off (default)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
 #ifdef WINE_NX_DEKO3D_ONLY
 
 /* This build's entire purpose is to never make this call -- deko3d must be
@@ -1498,6 +1523,7 @@ int main( int argc, char **argv )
     mkdir( WINE_SYSTEM_DIR, 0777 );
     log_file = fopen( RUNTIME_DIR WINE_NX_RUNTIME_LOG_NAME, "w" );
     wine_nx_syscall_trace_select();
+    wine_nx_paint_trace_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );

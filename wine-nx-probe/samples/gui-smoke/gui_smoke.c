@@ -44,11 +44,30 @@ static int g_touch_x, g_touch_y;
 static HDC g_bg_dc;
 static HBITMAP g_bg_bitmap;
 
+/* draw_scene()/draw_badge() only ever run once in practice (guarded by
+ * ensure_background()'s cache below), so these three were already only
+ * created/destroyed once, not per-frame -- but caching them here removes
+ * the footgun for good (a future change to ensure_background()'s cache
+ * guard would otherwise silently turn this back into a per-frame cost)
+ * and matches the same create-once-reuse treatment as the background
+ * bitmap and draw_pixel_ramp's DIB blit. Deleted only at actual exit,
+ * in wWinMain()'s WM_QUIT path. */
+static HFONT g_title_font, g_body_font, g_badge_font;
+
 static HFONT create_font( int height, int weight )
 {
     return CreateFontW( height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                         ANTIALIASED_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Tahoma" );
+}
+
+static void ensure_fonts(void)
+{
+    if (g_title_font) return;
+
+    g_title_font = create_font( -58, FW_BOLD );
+    g_body_font = create_font( -30, FW_SEMIBOLD );
+    g_badge_font = create_font( -24, FW_BOLD );
 }
 
 static void select_font( HDC hdc, HFONT font, HGDIOBJ *old_font )
@@ -123,7 +142,6 @@ static void draw_badge( HDC hdc )
     HBRUSH bg = NULL;
     HBRUSH fill = NULL;
     HPEN pen = NULL;
-    HFONT font = NULL;
     RECT rect;
 
     if (!memdc) return;
@@ -139,7 +157,6 @@ static void draw_badge( HDC hdc )
     bg = CreateSolidBrush( RGB( 10, 15, 28 ) );
     fill = CreateSolidBrush( RGB( 48, 64, 98 ) );
     pen = CreatePen( PS_SOLID, 3, RGB( 94, 234, 212 ) );
-    font = create_font( -24, FW_BOLD );
 
     rect.left = 0;
     rect.top = 0;
@@ -154,7 +171,7 @@ static void draw_badge( HDC hdc )
 
     SetBkMode( memdc, TRANSPARENT );
     SetTextColor( memdc, RGB( 255, 255, 255 ) );
-    select_font( memdc, font, &old_font );
+    select_font( memdc, g_badge_font, &old_font );
     text_out( memdc, 34, 42, L"GDI SURFACE" );
     text_out( memdc, 34, 72, L"BITBLT PATH" );
 
@@ -165,7 +182,6 @@ static void draw_badge( HDC hdc )
     if (old_pen) SelectObject( memdc, old_pen );
     if (old_brush) SelectObject( memdc, old_brush );
     if (old_bitmap) SelectObject( memdc, old_bitmap );
-    if (font) DeleteObject( font );
     if (pen) DeleteObject( pen );
     if (fill) DeleteObject( fill );
     if (bg) DeleteObject( bg );
@@ -181,12 +197,12 @@ static void draw_scene( HDC hdc )
     HBRUSH accent = CreateSolidBrush( RGB( 94, 234, 212 ) );
     HPEN cyan = CreatePen( PS_SOLID, 5, RGB( 94, 234, 212 ) );
     HPEN pink = CreatePen( PS_SOLID, 3, RGB( 255, 92, 141 ) );
-    HFONT title_font = create_font( -58, FW_BOLD );
-    HFONT body_font = create_font( -30, FW_SEMIBOLD );
     HGDIOBJ old_brush = NULL;
     HGDIOBJ old_pen = NULL;
     HGDIOBJ old_font = NULL;
     RECT rect;
+
+    ensure_fonts();
 
     if (bg)
     {
@@ -210,7 +226,7 @@ static void draw_scene( HDC hdc )
 
     SetBkMode( hdc, TRANSPARENT );
     SetTextColor( hdc, RGB( 255, 255, 255 ) );
-    select_font( hdc, title_font, &old_font );
+    select_font( hdc, g_title_font, &old_font );
     rect.left = 0;
     rect.top = 284;
     rect.right = WINE_NX_W;
@@ -220,7 +236,7 @@ static void draw_scene( HDC hdc )
     if (old_font) SelectObject( hdc, old_font );
     old_font = NULL;
     SetTextColor( hdc, RGB( 196, 219, 255 ) );
-    select_font( hdc, body_font, &old_font );
+    select_font( hdc, g_body_font, &old_font );
     text_out( hdc, 474, 382, L"REAL WIN32 GDI PAINT" );
 
     draw_badge( hdc );
@@ -229,8 +245,6 @@ static void draw_scene( HDC hdc )
     if (old_font) SelectObject( hdc, old_font );
     if (old_pen) SelectObject( hdc, old_pen );
     if (old_brush) SelectObject( hdc, old_brush );
-    if (body_font) DeleteObject( body_font );
-    if (title_font) DeleteObject( title_font );
     if (pink) DeleteObject( pink );
     if (cyan) DeleteObject( cyan );
     if (accent) DeleteObject( accent );
@@ -358,16 +372,6 @@ static void ensure_background( HDC hdc )
     draw_scene( g_bg_dc );
 }
 
-static void draw_frame( HDC hdc )
-{
-    ensure_background( hdc );
-
-    if (g_bg_dc) BitBlt( hdc, 0, 0, WINE_NX_W, WINE_NX_H, g_bg_dc, 0, 0, SRCCOPY );
-    else draw_scene( hdc );   /* cache failed to allocate: draw straight through */
-
-    draw_moving_shapes( hdc );
-}
-
 /* Loop-phase timing: framebufferEnd() itself measured 3-5ms on hardware and
  * attempted==executed at the throttle (see wine_nx_hud_present_ms_* in
  * runtime.c and the README's "Presentation Is Still Too Slow" update) --
@@ -392,6 +396,14 @@ static void draw_frame( HDC hdc )
 typedef struct { unsigned long long sum_ms; unsigned long long count; } phase_stat_t;
 
 static phase_stat_t g_stat_dispatch, g_stat_update, g_stat_paint, g_stat_sleep, g_stat_total;
+/* blit/shapes are sub-phases inside paint_avg (see draw_frame() below),
+ * split out to find out how much of paint_avg is the full 1280x720
+ * cached-background BitBlt vs. the moving-shape GDI churn (5
+ * CreateSolidBrush/CreatePen + select + delete cycles per frame), rather
+ * than guessing -- both were previously ruled out as "fast, local,
+ * non-IPC" from source alone, which is true per-call but says nothing
+ * about their cost at this specific size/frequency. */
+static phase_stat_t g_stat_blit, g_stat_shapes;
 static HANDLE g_timing_file = INVALID_HANDLE_VALUE;
 static ULONGLONG g_timing_epoch_ms;
 static ULONGLONG g_qpc_freq;
@@ -439,9 +451,10 @@ static void timing_maybe_flush(void)
 
     len = snprintf( line, sizeof(line),
                     "iters=%llu dispatch_avg=%llums update_avg=%llums paint_avg=%llums "
-                    "sleep_avg=%llums total_avg=%llums\r\n",
+                    "blit_avg=%llums shapes_avg=%llums sleep_avg=%llums total_avg=%llums\r\n",
                     g_stat_total.count, timing_avg( &g_stat_dispatch ), timing_avg( &g_stat_update ),
-                    timing_avg( &g_stat_paint ), timing_avg( &g_stat_sleep ), timing_avg( &g_stat_total ) );
+                    timing_avg( &g_stat_paint ), timing_avg( &g_stat_blit ), timing_avg( &g_stat_shapes ),
+                    timing_avg( &g_stat_sleep ), timing_avg( &g_stat_total ) );
     if (len > 0 && g_timing_file != INVALID_HANDLE_VALUE)
     {
         WriteFile( g_timing_file, line, (DWORD)len, &written, NULL );
@@ -451,9 +464,29 @@ static void timing_maybe_flush(void)
     g_stat_dispatch.sum_ms = g_stat_dispatch.count = 0;
     g_stat_update.sum_ms = g_stat_update.count = 0;
     g_stat_paint.sum_ms = g_stat_paint.count = 0;
+    g_stat_blit.sum_ms = g_stat_blit.count = 0;
+    g_stat_shapes.sum_ms = g_stat_shapes.count = 0;
     g_stat_sleep.sum_ms = g_stat_sleep.count = 0;
     g_stat_total.sum_ms = g_stat_total.count = 0;
     g_timing_epoch_ms = now;
+}
+
+static void draw_frame( HDC hdc )
+{
+    ULONGLONG t0, t1;
+
+    ensure_background( hdc );
+
+    t0 = now_ms();
+    if (g_bg_dc) BitBlt( hdc, 0, 0, WINE_NX_W, WINE_NX_H, g_bg_dc, 0, 0, SRCCOPY );
+    else draw_scene( hdc );   /* cache failed to allocate: draw straight through */
+    t1 = now_ms();
+    timing_stat_add( &g_stat_blit, t1 - t0 );
+
+    t0 = now_ms();
+    draw_moving_shapes( hdc );
+    t1 = now_ms();
+    timing_stat_add( &g_stat_shapes, t1 - t0 );
 }
 
 static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
@@ -534,7 +567,13 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show )
         t0 = now_ms();
         while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
         {
-            if (msg.message == WM_QUIT) return (int)msg.wParam;
+            if (msg.message == WM_QUIT)
+            {
+                if (g_title_font) DeleteObject( g_title_font );
+                if (g_body_font) DeleteObject( g_body_font );
+                if (g_badge_font) DeleteObject( g_badge_font );
+                return (int)msg.wParam;
+            }
             TranslateMessage( &msg );
             DispatchMessageW( &msg );
         }
