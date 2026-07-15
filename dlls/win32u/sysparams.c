@@ -300,7 +300,20 @@ union sysparam_all_entry
     struct sysparam_pref_entry   pref;
 };
 
-static UINT system_dpi;
+/* Defaults to USER_DEFAULT_SCREEN_DPI (96) instead of an implicit 0 so
+ * that anything reading this before sysparams_init()'s registry-based
+ * LogPixels read runs (e.g. the Switch display driver's
+ * UpdateDisplayDevices registering the monitor's source DPI, or window
+ * surface creation comparing it against a window's own DPI) sees a sane
+ * value instead of 0 -- see dlls/win32u/dce.c's create_window_surface(),
+ * which was hitting exactly that: dpi=96 (correctly hardcoded for a
+ * DPI-unaware window) vs monitor_dpi=0, tripping create_window_surface's
+ * mismatch check and wrapping the window in a pointless scaled_surface
+ * every frame. sysparams_init() still overwrites this with a real
+ * LogPixels value if one exists; its own "if (!system_dpi)" fallback to
+ * USER_DEFAULT_SCREEN_DPI simply becomes a no-op now that this can no
+ * longer be observed as 0. */
+static UINT system_dpi = USER_DEFAULT_SCREEN_DPI;
 static RECT work_area;
 static DWORD process_layout = ~0u;
 
