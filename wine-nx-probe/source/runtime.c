@@ -270,6 +270,45 @@ static void wine_nx_paint_trace_select(void)
              (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
 }
 
+/* Off by default -- default = current, real behavior; ON = the legacy
+ * behavior flush_window_surfaces() (dlls/win32u/dce.c) had for its
+ * entire life until the NtGetTickCount fix landed tonight, which made
+ * this A/B-able for the first time.
+ *
+ * flush_window_surfaces()'s idle=TRUE path was fixed earlier tonight to
+ * share the same 50ms debounce the idle=FALSE path always had, instead
+ * of skipping the debounce and always flushing unconditionally. That fix
+ * was correct on its own terms, but its actual behavior on hardware
+ * depended entirely on NtGetTickCount() -- while that clock was frozen,
+ * "now - last_flush" was always 0 < 50, so the debounce always skipped,
+ * meaning this function's flush loop was *structurally incapable* of
+ * running, ever. Fixing NtGetTickCount() (also tonight) made "now" a
+ * real, advancing value for the first time, and since gui_smoke's paint
+ * cycles are ~250ms apart -- well over 50ms -- the debounce now almost
+ * never blocks, so the flush loop runs on nearly every frame. Neither
+ * change caused this by itself; the two combined did, and only the
+ * second one revealed it.
+ *
+ * This toggle exists to answer whether that's a net win or a net loss
+ * without the ~240-470ms run-to-run noise this whole session has shown
+ * between separate test launches: it forces flush_window_surfaces() to
+ * unconditionally take the skip path every time, regardless of what the
+ * (correct, real) clock says -- reproducing tonight's old, accidental
+ * behavior exactly, in the same binary, so it can be A/B tested by
+ * flipping one file and relaunching, not by comparing across builds. */
+int wine_nx_flush_legacy_enabled;
+
+static void wine_nx_flush_legacy_select(void)
+{
+    const char *env = getenv( "WINE_NX_FLUSH_LEGACY" );
+    int file_flag = read_bool_file( RUNTIME_DIR "/flushlegacy.txt" );
+    wine_nx_flush_legacy_enabled = (env && env[0]) || file_flag;
+    log_line( "[NXTRACE] flush_window_surfaces legacy always-skip mode: %s (env=%s file=%s)",
+             wine_nx_flush_legacy_enabled ? "ON (idle=TRUE debounce forced to always skip, pre-clock-fix behavior)"
+                                          : "off (default: real 50ms debounce, current behavior)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
 #ifdef WINE_NX_DEKO3D_ONLY
 
 /* This build's entire purpose is to never make this call -- deko3d must be
@@ -1566,6 +1605,7 @@ int main( int argc, char **argv )
     log_file = fopen( RUNTIME_DIR WINE_NX_RUNTIME_LOG_NAME, "w" );
     wine_nx_syscall_trace_select();
     wine_nx_paint_trace_select();
+    wine_nx_flush_legacy_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );

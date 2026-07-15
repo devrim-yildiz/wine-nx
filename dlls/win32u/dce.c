@@ -63,6 +63,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(win);
  * span, leave it off for a clean fps measurement. */
 extern void wine_nx_runtime_trace( const char *msg );
 extern int wine_nx_paint_trace_enabled;
+/* wine-nx-probe/source/runtime.c -- A/B toggle for flush_window_surfaces()'s
+ * debounce, see the long comment on wine_nx_flush_legacy_select() there. */
+extern int wine_nx_flush_legacy_enabled;
 
 /* Update 2: switch_paint_trace() itself used to fflush() one line per
  * call (log_line(), unconditional fflush) -- exactly the same mistake
@@ -962,8 +965,28 @@ void flush_window_surfaces( BOOL idle )
     static DWORD last_flush;
     DWORD now;
     struct window_surface *surface;
+#ifdef __SWITCH__
+    static int logged_mode;
+    if (!logged_mode)
+    {
+        logged_mode = 1;
+        wine_nx_runtime_trace( wine_nx_flush_legacy_enabled
+                               ? "[NXFLUSH] flush_window_surfaces: legacy always-skip mode ACTIVE"
+                               : "[NXFLUSH] flush_window_surfaces: real 50ms debounce ACTIVE (current default)" );
+    }
+#endif
 
     pthread_mutex_lock( &surfaces_lock );
+#ifdef __SWITCH__
+    /* A/B toggle, off by default: forces the always-skip behavior this
+     * function had for its entire life until tonight's NtGetTickCount
+     * fix made the debounce below start actually evaluating for the
+     * first time -- see wine_nx_flush_legacy_select()'s comment in
+     * wine-nx-probe/source/runtime.c. Checked after the lock so the
+     * later unlock is always paired with a lock regardless of which
+     * path is taken. */
+    if (wine_nx_flush_legacy_enabled) goto done;
+#endif
     now = NtGetTickCount();
     /* idle used to skip this debounce entirely and unconditionally flush
      * every registered surface every time -- fine on a real desktop where
@@ -1544,6 +1567,9 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     struct dce *dce;
     HWND parent;
     DWORD window_style = get_window_long( hwnd, GWL_STYLE );
+#ifdef __SWITCH__
+    u64 t0, t1;
+#endif
 
     if (!hwnd) hwnd = get_desktop_window();
     else hwnd = get_full_window_handle( hwnd );
@@ -1552,6 +1578,9 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 
     if (!is_window(hwnd)) return 0;
 
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled) t0 = armGetSystemTick();
+#endif
     /* fixup flags */
 
     if (flags & (DCX_WINDOW | DCX_PARENTCLIP)) flags |= DCX_CACHE;
@@ -1589,6 +1618,14 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
             if (parent_style & WS_CLIPSIBLINGS) flags |= DCX_CLIPSIBLINGS;
         }
     }
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armGetSystemTick();
+        switch_paint_trace( "getdcex_flags_fixup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        t0 = armGetSystemTick();
+    }
+#endif
 
     /* find a suitable DCE */
 
@@ -1649,6 +1686,14 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
         }
         else update_vis_rgn = FALSE; /* updated automatically, via DCHook() */
     }
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armGetSystemTick();
+        switch_paint_trace( "getdcex_dce_lookup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        t0 = armGetSystemTick();
+    }
+#endif
 
     if (flags & (DCX_INTERSECTRGN | DCX_EXCLUDERGN))
     {
@@ -1671,8 +1716,29 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     if (!is_current_process_window( hwnd )) update_vis_rgn = TRUE;
 
     if (set_dce_flags( dce->hdc, DCHF_VALIDATEVISRGN )) update_vis_rgn = TRUE;  /* DC was dirty */
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armGetSystemTick();
+        switch_paint_trace( "getdcex_clip_setup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        t0 = armGetSystemTick();
+    }
+#endif
 
     if (update_vis_rgn) update_visible_region( dce );
+#ifdef __SWITCH__
+    if (wine_nx_paint_trace_enabled)
+    {
+        t1 = armGetSystemTick();
+        /* Should roughly match the already-known get_visible_region IPC
+         * cost (~14-15ms) when update_vis_rgn is TRUE -- this is the one
+         * piece of NtUserGetDCEx's ~30ms-beyond-the-IPC-call gap that was
+         * already accounted for. getdcex_flags_fixup/dce_lookup/clip_setup
+         * above are the three candidates for the rest. See README, "The
+         * ~14ms Per-Call IPC Floor". */
+        switch_paint_trace( "getdcex_vis_rgn", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    }
+#endif
 
     TRACE( "(%p,%p,0x%x): returning %p%s\n", hwnd, clip_rgn, flags, dce->hdc,
            update_vis_rgn ? " (updated)" : "" );
