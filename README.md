@@ -441,6 +441,82 @@ Diagnosis is solid -- both the `usleep` scan and the `get_update_region`
 next step for either optimization is hardware-in-the-loop testing, not
 more source reading.
 
+### Autonomous Session Follow-Ups (No Hardware Access)
+
+Two further autonomous rounds, each on a checkpoint branch
+(`autonomous-multitrack-checkpoint`), not merged to `main` pending
+hardware verification. Full per-change reasoning is in that branch's
+commit messages; summarized here.
+
+**Round 1** -- WM_ERASEBKGND (`erase`, ~47ms) split into
+`erase_get_dcex`/`erase_clipbox`/`erase_wm_erasebkgnd`/`erase_release_dc`
+sub-phases, same `switch_paint_trace()` gating as everything else.
+The Minus-button crash-to-Home-Menu bug got granular step-by-step
+logging through its whole exit sequence, plus a real (not just logged)
+attempted fix: swapping the final termination call from libc's `exit(0)`
+to `svcExitProcess()` -- the input-polling thread that handles Minus is
+a background thread, not the main thread, and libc's `exit()` runs
+atexit/destructor cleanup that could race whatever the main thread is
+doing to GPU/socket state at that exact moment; `svcExitProcess()` is
+the raw Horizon kernel primitive other homebrew reference examples rely
+on instead. The frozen-`GetTickCount` write-side fix was investigated
+and deliberately not attempted: `user_shared_data` is a fixed address
+(`0x7ffe0000`) real Wine maps read-only for ordinary processes, and
+writing to it without hardware to verify write access risks trading a
+frozen clock for a hard crash.
+
+**Round 2** -- three more ideas, chosen freely:
+
+1. **`NtGetTickCount()` fixed for real, on the read side instead of the
+   write side.** `dlls/ntdll/unix/sync.c`'s `NtGetTickCount()` (used
+   internally by code that calls it directly, e.g.
+   `flush_window_surfaces()`'s debounce fixed earlier tonight) now
+   computes elapsed time from `armGetSystemTick()`/`armTicksToNs()`
+   instead of reading the never-written `user_shared_data->TickCount` --
+   zero writes to any shared/system memory, same clock source already
+   proven reliable all night. **Scope is real but partial:** this does
+   *not* fix what a hosted PE application sees calling the Win32
+   `GetTickCount()`/`GetTickCount64()` APIs -- `dlls/kernel32/sync.c`
+   reads `user_shared_data` directly (the real-Windows fast-path design,
+   bypassing a syscall on purpose), and `kernel32.dll` is built by a
+   separate PE cross-compile pipeline this session never touched or
+   verified. Fixing the PE-visible APIs needs either that separate,
+   higher-blast-radius rebuild (kernel32 is the single most
+   fundamental import every PE program has) or writing the
+   possibly-read-only shared page -- both deliberately out of scope
+   here. Logs a rate-limited `[NXTICK]` sample once/second so real,
+   monotonically-increasing values are visible without reintroducing
+   per-call fflush cost.
+2. **The paint-trace tier's own instrumentation overhead, fixed at the
+   tool level.** `switch_paint_trace()` (`dce.c`) no longer
+   `fflush()`es one line per call -- it accumulates each phase's
+   sum/count/max in memory and flushes one combined `[NXPAINT][AVG]`
+   line per second, the same pattern `gui_smoke.c`'s own
+   `gui_timing.log` already uses. `winnx_drv.c`'s three timers
+   (`trace_samples`/`fb_lock_call`/`fb_unlock_call`) now route through
+   the same shared aggregator instead of their own raw calls, for one
+   unified view. The `[NXPAINT][CALLER]` return-address trace is
+   rate-limited to 5 samples instead of logging every frame forever,
+   since the address should be constant now that both bugs it was
+   built to find are fixed. This directly applies tonight's biggest
+   lesson (diagnostic overhead compounding with itself) to the
+   diagnostic tooling itself -- when `WINE_NX_PAINT_TRACE` is flipped
+   on for debugging, the numbers it reports should now be much closer
+   to real, since taking the measurement costs far less than it used
+   to.
+3. **Checked `fill_rect()`'s full-window `PatBlt` path for a
+   SetPixel-style bug -- ruled out, nothing changed.** Directly
+   informed by tonight's biggest confirmed win, so worth checking
+   rather than assuming: traced `WM_ERASEBKGND`'s default handling
+   (`fill_rect()`, `defwnd.c`) through `NtGdiPatBlt` into dibdrv's
+   `solid_rects_32()` (`dibdrv/primitives.c`). For the common solid-fill
+   case it uses `memset_32()` per scanline, not a per-pixel loop --
+   already efficient. A clean negative result, reported rather than
+   forced into a fix that wasn't needed.
+
+All three round-2 changes compile-verified only, on the same checkpoint
+branch, not hardware-tested.
+
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
 Found while debugging the animated-HUD demo's timing instrumentation (see

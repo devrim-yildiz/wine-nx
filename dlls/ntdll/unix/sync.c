@@ -37,6 +37,7 @@
 #include <sys/ioctl.h>
 #ifdef __SWITCH__
 # include "horizon_mman.h"
+# include <switch.h>
 #else
 # include <sys/mman.h>
 #endif
@@ -2633,13 +2634,83 @@ NTSTATUS WINAPI NtSetIntervalProfile( ULONG interval, KPROFILE_SOURCE source )
 }
 
 
+#ifdef __SWITCH__
+extern void wine_nx_runtime_trace( const char *msg );
+
+/* user_shared_data->TickCount is never written on this port: real Wine
+ * updates it from the wineserver's poll loop (set_current_time(),
+ * server/fd.c), which lives in server/ -- a tree this Switch build
+ * doesn't compile in at all (this port's entire wineserver role is
+ * played by dlls/ntdll/unix/horizon.c instead, which never references
+ * TickCount/user_shared_data/set_current_time anywhere). Confirmed
+ * readable (returns 0, not a crash) but user_shared_data is a fixed
+ * address (0x7ffe0000, virtual.c:373) that real Wine maps read-only for
+ * ordinary processes -- writing to it from here would risk a hard
+ * write-protection fault with no way to verify safety without hardware,
+ * so instead of writing that page, this read site is redirected to
+ * compute elapsed time from armGetSystemTick()/armTicksToNs(), the same
+ * clock source already proven reliable all night for every other timing
+ * measurement on this port. Epoch is just "whenever this was first
+ * called", not aligned to real boot time -- GetTickCount's actual
+ * contract only needs a monotonically increasing ms counter for
+ * computing deltas between two calls, not wall-clock alignment.
+ *
+ * SCOPE, READ CAREFULLY: this only fixes NtGetTickCount() below, the
+ * ntdll syscall used internally by code that calls it directly (e.g.
+ * flush_window_surfaces()'s debounce in dlls/win32u/dce.c, fixed
+ * earlier tonight). It does NOT fix what a hosted PE application sees
+ * when it calls the Win32 GetTickCount()/GetTickCount64() APIs --
+ * dlls/kernel32/sync.c's implementations of those read
+ * user_shared_data->TickCount directly (the real-Windows fast-path
+ * design, deliberately bypassing a syscall), not through this function,
+ * and kernel32.dll is built by a completely separate PE cross-compile
+ * pipeline this session never exercised or verified. Fixing the
+ * PE-visible GetTickCount needs either that separate rebuild (unverified
+ * risk to every PE program's most fundamental import) or writing
+ * user_shared_data itself (the write-permission risk already ruled out
+ * last round). Deliberately not attempted here -- see the final report
+ * for the honest scope of what this does and doesn't fix. */
+static ULONGLONG switch_get_tick_count64(void)
+{
+    static u64 epoch_ticks;
+    static u64 log_epoch_ms;
+    static unsigned int log_count;
+    u64 now, elapsed_ms;
+
+    now = armGetSystemTick();
+    if (!epoch_ticks) epoch_ticks = now;
+    elapsed_ms = armTicksToNs( now - epoch_ticks ) / 1000000ULL;
+
+    /* Rate-limited to roughly once/second (not per-call -- this can be
+     * called very frequently, and tonight already found what per-call
+     * fflush()ed logging does to a hot path) so the log shows real,
+     * monotonically-increasing values without becoming the same kind of
+     * observer-effect bug this session spent hours fixing elsewhere. */
+    if (!log_epoch_ms) log_epoch_ms = elapsed_ms;
+    if (elapsed_ms - log_epoch_ms >= 1000)
+    {
+        char buf[96];
+        snprintf( buf, sizeof(buf), "[NXTICK] NtGetTickCount64 sample #%u = %llums since first call",
+                 ++log_count, (unsigned long long)elapsed_ms );
+        wine_nx_runtime_trace( buf );
+        log_epoch_ms = elapsed_ms;
+    }
+
+    return elapsed_ms;
+}
+#endif
+
 /******************************************************************************
  *              NtGetTickCount (NTDLL.@)
  */
 ULONG WINAPI NtGetTickCount(void)
 {
+#ifdef __SWITCH__
+    return (ULONG)switch_get_tick_count64();
+#else
     /* note: we ignore TickCountMultiplier */
     return user_shared_data->TickCount.LowPart;
+#endif
 }
 
 

@@ -37,6 +37,10 @@ extern void  wine_nx_fb_present( void );
 extern int   wine_nx_touch_poll( int *x, int *y );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_paint_trace_enabled;
+/* dlls/win32u/dce.c -- now an in-memory, once-per-second aggregator
+ * rather than a per-call fflush(), same reasoning as everything else
+ * gated behind wine_nx_paint_trace_enabled. */
+extern void  switch_paint_trace( const char *phase, unsigned int ms );
 
 struct wine_nx_surface
 {
@@ -338,7 +342,7 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     if (wine_nx_paint_trace_enabled)
     {
         t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        nxdrv_trace( "[NXDRV][TIMING] trace_samples took %dms", (int)(t1 - t0), 0, 0, 0 );
+        switch_paint_trace( "trace_samples", (unsigned int)(t1 - t0) );
     }
 #endif
 
@@ -350,7 +354,7 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     if (wine_nx_paint_trace_enabled)
     {
         t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        nxdrv_trace( "[NXDRV][TIMING] fb_lock_call took %dms", (int)(t1 - t0), 0, 0, 0 );
+        switch_paint_trace( "fb_lock_call", (unsigned int)(t1 - t0) );
     }
 #endif
     nxdrv_trace_hot( "[NXDRV] fb_lock -> fb=%d fbw=%d fbh=%d stride=%d", fb ? 1 : 0, fbw, fbh, fbstride );
@@ -412,7 +416,7 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     if (wine_nx_paint_trace_enabled)
     {
         t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        nxdrv_trace( "[NXDRV][TIMING] fb_unlock_call took %dms", (int)(t1 - t0), 0, 0, 0 );
+        switch_paint_trace( "fb_unlock_call", (unsigned int)(t1 - t0) );
     }
 #endif
     return TRUE;

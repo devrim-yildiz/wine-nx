@@ -64,12 +64,84 @@ WINE_DEFAULT_DEBUG_CHANNEL(win);
 extern void wine_nx_runtime_trace( const char *msg );
 extern int wine_nx_paint_trace_enabled;
 
-static void switch_paint_trace( const char *phase, unsigned int ms )
+/* Update 2: switch_paint_trace() itself used to fflush() one line per
+ * call (log_line(), unconditional fflush) -- exactly the same mistake
+ * as the raw syscall trace, just at this tier's own call frequency.
+ * Aggregate in memory instead (name -> running sum/count/max) and flush
+ * ONE combined line per second, the same pattern gui_smoke.c's own
+ * gui_timing.log already uses for its phase averages (phase_stat_t /
+ * timing_maybe_flush). This changes what wine_nx_paint_trace_enabled=1
+ * looks like in the log (one "[NXPAINT][AVG] name=avg/max/n ..." line
+ * per second instead of one "[NXPAINT][TIMING] name took Nms" line per
+ * call) but not its off-by-default behavior -- still zero cost when
+ * disabled. Not thread-safety-hardened (no lock around the phase
+ * table): window_surface_flush()/wine_nx_surface_flush() are only ever
+ * called from the single render thread in every trace captured tonight,
+ * so a benign race here would at worst skew one sample, never crash --
+ * acceptable for a diagnostic-only structure that's off by default. */
+#define SWITCH_PAINT_TRACE_MAX_PHASES 24
+
+struct switch_paint_trace_phase
 {
-    char buf[128];
-    if (!wine_nx_paint_trace_enabled) return;
-    snprintf( buf, sizeof(buf), "[NXPAINT][TIMING] %s took %ums", phase, ms );
+    const char *name;
+    unsigned long long sum_ms;
+    unsigned int count;
+    unsigned int max_ms;
+};
+
+static struct switch_paint_trace_phase switch_paint_trace_phases[SWITCH_PAINT_TRACE_MAX_PHASES];
+static unsigned int switch_paint_trace_phase_count;
+static u64 switch_paint_trace_epoch_ms;
+
+static void switch_paint_trace_flush(void)
+{
+    char buf[900];
+    int len = 0;
+    unsigned int i;
+
+    len += snprintf( buf + len, sizeof(buf) - len, "[NXPAINT][AVG]" );
+    for (i = 0; i < switch_paint_trace_phase_count && len < (int)sizeof(buf) - 48; i++)
+    {
+        struct switch_paint_trace_phase *p = &switch_paint_trace_phases[i];
+        unsigned long long avg = p->count ? p->sum_ms / p->count : 0;
+
+        len += snprintf( buf + len, sizeof(buf) - len, " %s=%llums(max=%u,n=%u)",
+                         p->name, avg, p->max_ms, p->count );
+        p->sum_ms = 0;
+        p->count = 0;
+        p->max_ms = 0;
+    }
     wine_nx_runtime_trace( buf );
+}
+
+void switch_paint_trace( const char *phase, unsigned int ms )
+{
+    unsigned int i;
+    u64 now_ms;
+
+    if (!wine_nx_paint_trace_enabled) return;
+
+    for (i = 0; i < switch_paint_trace_phase_count; i++)
+        if (!strcmp( switch_paint_trace_phases[i].name, phase )) break;
+    if (i == switch_paint_trace_phase_count && i < SWITCH_PAINT_TRACE_MAX_PHASES)
+    {
+        switch_paint_trace_phases[i].name = phase;
+        switch_paint_trace_phase_count++;
+    }
+    if (i < SWITCH_PAINT_TRACE_MAX_PHASES)
+    {
+        switch_paint_trace_phases[i].sum_ms += ms;
+        switch_paint_trace_phases[i].count++;
+        if (ms > switch_paint_trace_phases[i].max_ms) switch_paint_trace_phases[i].max_ms = ms;
+    }
+
+    now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    if (!switch_paint_trace_epoch_ms) switch_paint_trace_epoch_ms = now_ms;
+    if (now_ms - switch_paint_trace_epoch_ms >= 1000)
+    {
+        switch_paint_trace_flush();
+        switch_paint_trace_epoch_ms = now_ms;
+    }
 }
 #endif
 
@@ -677,14 +749,26 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
          * NtUserReleaseDC()) didn't turn up a confirmed second caller for
          * why this fires ~2x/paint-cycle while BeginPaint/EndPaint's own
          * sub-phases don't -- see README, "Presentation Is Still Too Slow".
-         * Logging the actual return address settles it with certainty
-         * instead of more guessing; resolve with addr2line/nm against the
-         * matching build's .elf once a log comes back. Gated the same as
-         * switch_paint_trace() above, for the same fflush-cost reason. */
-        char buf[64];
-        snprintf( buf, sizeof(buf), "[NXPAINT][CALLER] window_surface_flush ret=%p",
-                 __builtin_return_address( 0 ) );
-        wine_nx_runtime_trace( buf );
+         * Logging the actual return address settled it with certainty
+         * instead of more guessing (resolved with addr2line/nm against
+         * the matching build's .elf); both callers found that way are
+         * now fixed (system_dpi init-order, idle-flush debounce), so this
+         * should be a single, constant address every call in a clean
+         * build. Rate-limited to the first few calls instead of the
+         * aggregator treatment above -- an address isn't a timing to
+         * average, but logging it every single frame forever is exactly
+         * the same per-call fflush() cost this whole tier exists to
+         * avoid, for a value that (if the fix held) never changes after
+         * the first few frames anyway. */
+        static unsigned int logged;
+        if (logged < 5)
+        {
+            char buf[64];
+            logged++;
+            snprintf( buf, sizeof(buf), "[NXPAINT][CALLER] window_surface_flush ret=%p (sample %u/5)",
+                     __builtin_return_address( 0 ), logged );
+            wine_nx_runtime_trace( buf );
+        }
     }
 #endif
 
