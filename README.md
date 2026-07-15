@@ -1,14 +1,40 @@
 # Wine-NX Switch
+`Status: experimental — GPU compositor proven on a demo target; full
+Notepad app still software-rendered and slow.`
 
-Wine-NX is a Nintendo Switch focused Wine bring-up. The goal is to run
-AArch64 Windows PE programs inside a Switch NRO, using libnx/Horizon services
-for process, memory, input, files, display, and eventually GPU presentation.
+**A native ARM64 Wine port running directly on Nintendo Switch homebrew —
+no Linux layer, no x86 translation, with real GPU-accelerated rendering.**
 
-This repository is no longer just a primitive Horizon probe. It is the working
-tree for the Switch Wine runtime, the in-process Horizon/Wine server work, the
-win32u Switch display driver, and the SD-card package builder used for hardware
-testing.
+Wine-NX runs AArch64 Windows PE programs inside a Switch `.nro`, talking
+straight to Horizon OS via libnx — no Switchroot L4T, no Box64, no second
+kernel underneath. Windows GDI content renders through a real GPU compositor
+(deko3d), hardware-confirmed at 60fps with shaders and 3D geometry.
 
+Originally started by [dantiicu](https://github.com/dantiicu/wine-nx) as an
+early Horizon/libnx Wine bring-up — the loader, initial win32u driver, and
+NTDLL substrate are his foundation. This fork continues that work.
+
+## What's new in this fork
+
+- **GPU-accelerated presentation, hardware-confirmed at 60fps** — real
+  Win32 GDI output rendered through deko3d (device/queue/swapchain, texture
+  upload, shader-driven 3D geometry), replacing the original software
+  framebuffer path.
+- **The Vulkan/NVK question, settled with evidence, not assumption** —
+  checked directly against the real toolchain: NVK is structurally
+  impossible on Horizon OS (no DRM subsystem). deko3d is the real path,
+  and it works.
+- **A platform-wide performance bug found and fixed** — a diagnostic
+  logging system was silently flushing to the SD card on every syscall,
+  costing every app on this port real frame time. Fixing it doubled
+  frame rate on the software-rendered GDI test target (2fps → 4fps) —
+  a separate, still-open investigation from the GPU compositor above.
+- **A full host-side development loop** — build and test the presentation/
+  input code on macOS or Linux with zero Switch hardware required.
+  
+The GPU compositor above runs against a test/demo target today, not yet
+the full Notepad app — see "Current Status" below for where the main
+Notepad milestone stands.
 ## Current Status
 
 As of the latest runtime work, the project can build and stage a Switch NRO
