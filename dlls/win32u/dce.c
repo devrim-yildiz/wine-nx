@@ -766,15 +766,26 @@ void register_window_surface( struct window_surface *old, struct window_surface 
  */
 void flush_window_surfaces( BOOL idle )
 {
-    static DWORD last_idle;
+    static DWORD last_flush;
     DWORD now;
     struct window_surface *surface;
 
     pthread_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
-    if (idle) last_idle = now;
-    /* if not idle, we only flush if there's evidence that the app never goes idle */
-    else if ((int)(now - last_idle) < 50) goto done;
+    /* idle used to skip this debounce entirely and unconditionally flush
+     * every registered surface every time -- fine on a real desktop where
+     * "queue just went idle" is a rare transition, but NtUserPeekMessage()'s
+     * empty-queue path (message.c) calls this with idle=TRUE on every
+     * single non-blocking poll that finds nothing pending. For a tight
+     * PeekMessageW loop like gui_smoke.c's, that's once per frame -- an
+     * extra full window_surface_flush() on top of the legitimate one
+     * EndPaint already does, every iteration, regardless of whether
+     * anything was actually dirty. Apply the same 50ms debounce this
+     * function already had for the idle=FALSE path to both paths instead,
+     * keyed off the last time a flush actually ran rather than off
+     * idle-ness specifically. */
+    if ((int)(now - last_flush) < 50) goto done;
+    last_flush = now;
 
     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
         window_surface_flush( surface );
