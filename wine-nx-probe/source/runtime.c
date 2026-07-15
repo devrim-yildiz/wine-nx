@@ -565,6 +565,29 @@ static void *wine_nx_hud_input_thread_fn( void *arg )
         }
         if (down & HidNpadButton_Minus)
         {
+            /* Documented bug tonight: this is supposed to exit cleanly to
+             * hbmenu and instead crashes to the system Home Menu. Every step
+             * below now logs individually (log_line() fflush()es every
+             * line, so whatever's written here survives even if the very
+             * next line is what actually kills the process) so the next
+             * hardware test shows exactly which step is last reached,
+             * without needing to reproduce it interactively first.
+             *
+             * Also trying a real, but unverified-without-hardware, change:
+             * calling svcExitProcess() directly instead of libc's exit(0).
+             * This runs on wine_nx_hud_input_thread_fn, a background
+             * pthread, not the main thread -- if libc's exit() (which runs
+             * atexit handlers and static destructors) touches deko3d/GPU or
+             * socket state concurrently with whatever the main thread is
+             * doing at that exact moment, that's a plausible source of a
+             * hard crash rather than a clean exit. svcExitProcess() is the
+             * raw Horizon kernel primitive other homebrew reference
+             * examples (deko_basic included, per the existing comment
+             * below) rely on for process teardown -- it skips libc's
+             * atexit/cleanup path entirely rather than racing it. If the
+             * log's last line is still "calling svcExitProcess" and it
+             * still crashes, that rules this theory out cleanly; if it
+             * exits clean, that's the fix. */
             wine_nx_runtime_trace( "[HUD] Minus pressed; exiting to hbmenu" );
 #ifndef WINE_NX_DEKO3D_ONLY
             /* Must hold the same mutex present()/lock() use: framebufferClose()
@@ -573,20 +596,39 @@ static void *wine_nx_hud_input_thread_fn( void *arg )
              * whether the render thread is mid-frame right now. Balance any
              * outstanding Begin with an End first, then Close while still
              * holding the lock so no new Begin can start underneath us. */
+            wine_nx_runtime_trace( "[EXIT] libnx build: locking wine_nx_fb_mutex to balance framebuffer" );
             pthread_mutex_lock( &wine_nx_fb_mutex );
             if (wine_nx_fb_ready)
             {
-                if (wine_nx_fb_pending_bits) framebufferEnd( &wine_nx_fb );
+                if (wine_nx_fb_pending_bits)
+                {
+                    wine_nx_runtime_trace( "[EXIT] calling framebufferEnd() to balance outstanding Begin" );
+                    framebufferEnd( &wine_nx_fb );
+                    wine_nx_runtime_trace( "[EXIT] framebufferEnd() returned" );
+                }
+                wine_nx_runtime_trace( "[EXIT] calling framebufferClose()" );
                 framebufferClose( &wine_nx_fb );
+                wine_nx_runtime_trace( "[EXIT] framebufferClose() returned" );
                 wine_nx_fb_ready = 0;
             }
             pthread_mutex_unlock( &wine_nx_fb_mutex );
+            wine_nx_runtime_trace( "[EXIT] libnx framebuffer balanced, mutex released" );
 #endif
             /* deko3d-only build: no libnx Framebuffer to balance/close, and no
              * reference example (deko_basic included) bothers with explicit
              * deko3d teardown before a plain process exit either -- Horizon
              * reclaims the device/queue/memory on process exit regardless. */
+            wine_nx_runtime_trace( "[EXIT] calling socketExit()" );
             socketExit();
+            wine_nx_runtime_trace( "[EXIT] socketExit() returned" );
+            wine_nx_runtime_trace( "[EXIT] calling svcExitProcess() (was: libc exit(0)) -- if this is the last "
+                                   "line you see, the crash is inside kernel-level process teardown itself, "
+                                   "not libc's atexit/cleanup path" );
+            svcExitProcess();
+            /* Unreachable -- svcExitProcess() does not return. Logged only
+             * in case it somehow does, since that would itself be worth
+             * knowing about. */
+            wine_nx_runtime_trace( "[EXIT] svcExitProcess() returned (unexpected!) -- falling back to exit(0)" );
             exit( 0 );
         }
 

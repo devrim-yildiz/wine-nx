@@ -1814,6 +1814,9 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
     BOOL need_erase = (flags & UPDATE_DELAYED_ERASE) != 0;
     HDC hdc = 0;
     RECT dummy;
+#ifdef __SWITCH__
+    u64 t0, t1;
+#endif
 
     if (!clip_rect) clip_rect = &dummy;
     if (hdc_ret || (flags & UPDATE_ERASE))
@@ -1821,20 +1824,64 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
         UINT dcx_flags = DCX_INTERSECTRGN | DCX_USESTYLE;
         if (is_iconic(hwnd)) dcx_flags |= DCX_WINDOW;
 
-        if ((hdc = NtUserGetDCEx( hwnd, client_rgn, dcx_flags )))
+#ifdef __SWITCH__
+        t0 = armGetSystemTick();
+#endif
+        hdc = NtUserGetDCEx( hwnd, client_rgn, dcx_flags );
+#ifdef __SWITCH__
+        t1 = armGetSystemTick();
+        /* NtUserGetDCEx's DCX_INTERSECTRGN forces update_visible_region(),
+         * which is the get_visible_region IPC call -- isolating this from
+         * the WM_ERASEBKGND dispatch below tells us how much of erase's
+         * ~47ms is "getting a DC" vs. "actually erasing". See README,
+         * "The ~14ms Per-Call IPC Floor". */
+        switch_paint_trace( "erase_get_dcex", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
+        if (hdc)
         {
+#ifdef __SWITCH__
+            t0 = armGetSystemTick();
+#endif
             INT type = NtGdiGetAppClipBox( hdc, clip_rect );
+#ifdef __SWITCH__
+            t1 = armGetSystemTick();
+            switch_paint_trace( "erase_clipbox", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
 
             if (flags & UPDATE_ERASE)
             {
                 /* don't erase if the clip box is empty */
                 if (type != NULLREGION)
                 {
+#ifdef __SWITCH__
+                    t0 = armGetSystemTick();
+#endif
                     need_erase = !send_message_timeout( hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0, SMTO_ABORTIFHUNG, 1000, FALSE );
+#ifdef __SWITCH__
+                    t1 = armGetSystemTick();
+                    /* This is the actual WM_ERASEBKGND dispatch: process_message()'s
+                     * get_window_thread() IPC lookup (another ~14ms-floor call, see
+                     * README) followed by call_window_proc() running whatever this
+                     * window's WM_ERASEBKGND handling actually does -- for
+                     * gui_smoke.c that's DefWindowProcW's default FillRect with the
+                     * class background brush, since the app doesn't handle
+                     * WM_ERASEBKGND itself. */
+                    switch_paint_trace( "erase_wm_erasebkgnd", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
                     if (need_erase && RtlGetLastWin32Error() == ERROR_TIMEOUT) ERR( "timeout.\n" );
                 }
             }
-            if (!hdc_ret) release_dc( hwnd, hdc, TRUE );
+            if (!hdc_ret)
+            {
+#ifdef __SWITCH__
+                t0 = armGetSystemTick();
+#endif
+                release_dc( hwnd, hdc, TRUE );
+#ifdef __SWITCH__
+                t1 = armGetSystemTick();
+                switch_paint_trace( "erase_release_dc", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+#endif
+            }
         }
 
         if (hdc_ret) *hdc_ret = hdc;
