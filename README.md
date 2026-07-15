@@ -360,6 +360,87 @@ byte-for-byte as before -- the opt-in `WINE_NX_DEKO3D` runtime flag inside
 it is kept parked, not removed, since it can never work for the
 `__appInit` reason above.
 
+### The ~14ms Per-Call IPC Floor: Diagnosed, Not Yet Optimized
+
+Both the message-dispatch investigation and the paint sub-phase tracing
+above independently found the same thing: every `wine_server_call()`
+round-trip through `horizon.c`'s in-process pipe transport costs roughly
+14-15ms, regardless of request type -- including trivial ones. With
+`window_surface_flush()`'s span alone issuing several of these
+sequentially per frame (`redraw_window`, up to three `get_update_region`
+calls, one `get_visible_region`), this floor adds up to a real, measurable
+slice of `paint_avg`. Investigated three questions about it (30 minutes,
+no hardware access this round) without landing any code changes -- every
+lever found needs a hardware round-trip to verify safely, which this
+window didn't have.
+
+**Is it an avoidable sleep? No -- checked exhaustively.** Every
+`usleep`/`nanosleep`/`svcSleepThread` call in `dlls/ntdll/unix/horizon.c`
+and `dlls/ntdll/unix/server.c` was found and individually confirmed
+unrelated to this path: `server.c:1582`'s `usleep` is inside
+`server_connect()`, the desktop-Wine socket-based wineserver connection
+routine this port never invokes (`horizon.c` plays that role in-process
+instead); `horizon.c:6461`'s `usleep(50000)` is
+`horizon_sock_poller_thread`, a completely separate WinSock
+(`WSAEventSelect`) background poller with no relationship to window
+messages; the two `svcSleepThread(1s)` calls nearby are unrelated idle
+loops. The actual transport (`horizon_pipe_write_r`/`horizon_pipe_read_r`,
+`horizon.c:2302-2383`) is a plain `pthread_mutex` +
+`pthread_cond_wait`/`signal` ring buffer (`HORIZON_PIPE_BUFFER_SIZE` =
+64KB, far larger than the small request/reply structs and single-rect
+region data these specific calls carry, so no multi-round-trip
+buffer-full blocking either) -- no polling interval, no artificial delay
+anywhere in the chain. The floor is consistent with genuine Horizon OS
+thread-wake/scheduling latency between the calling thread and
+`horizon_server_thread`, not an application-level bug. That means it
+isn't fixable by deleting code -- the only real levers are fewer
+round-trips (batching) or skipping round-trips outright (caching).
+
+**A concrete, real redundancy exists, but it's stock Wine, not a Switch
+bug -- not touched.** `get_update_region` fires roughly 3x more often
+than `redraw_window`/`get_visible_region` per paint cycle. Traced to
+`update_now()` (`dce.c:2061-2082`): its redraw loop calls
+`get_update_flags()` (a `get_update_region` variant with
+`UPDATE_NOREGION`) *before* dispatching `WM_PAINT`, `BeginPaint()`'s own
+`send_ncpaint()` calls `get_update_region()` again once `WM_PAINT` is
+actually handled, and the loop calls `get_update_flags()` a third time
+afterward to check whether there's still more to repaint. All three
+calls are unmodified upstream Wine control flow (not Switch-specific
+code), designed to correctly handle multi-child/partial-repaint
+scenarios this single-window smoke test doesn't exercise. Skipping any
+of them without hardware verification risks silently breaking repaint
+correctness for more complex real apps (Notepad, multi-window UIs) in
+ways that wouldn't show up in this test -- exactly the kind of
+regression that ships unnoticed and is hard to debug later. Scoped, not
+fixed.
+
+**What a batched request would need** (`redraw_window` +
+`get_update_region` + `get_visible_region` -> one round-trip): a new
+`HORIZON_REQ_*` request type in `horizon.c` whose server-side handler
+internally calls the same three existing handler functions back-to-back
+under one held lock (avoiding three separate acquire/release/wake
+cycles), returning a combined reply struct. Client side, a new wrapper
+in `dce.c` replacing the three `SERVER_START_REQ` blocks currently
+spread across `redraw_window_rects()`, `get_update_region()`, and
+`NtUserGetDCEx()`'s `update_visible_region()` call. A real wire-protocol
+change touching every window-paint path on this port -- worth doing, not
+something to land without hardware confirming the combined reply is
+parsed correctly by all three original call sites' worth of logic.
+
+**What safe caching would need** (skip `get_visible_region` when nothing
+visibility-relevant changed since the last call): a cache keyed on
+window handle, invalidated on every `WM_WINDOWPOSCHANGED`,
+`WM_WINDOWPOSCHANGING`, parent/z-order change, and monitor change --
+missing even one invalidation trigger produces a *silent* stale-region
+bug (drawing clipped to an old visible rect, or not drawing into a
+newly-visible area) that a quick visual check on hardware might not
+catch. Same verdict: scoped, not built.
+
+Diagnosis is solid -- both the `usleep` scan and the `get_update_region`
+3x trace are grounded directly in source, not inference. The concrete
+next step for either optimization is hardware-in-the-loop testing, not
+more source reading.
+
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
 Found while debugging the animated-HUD demo's timing instrumentation (see
