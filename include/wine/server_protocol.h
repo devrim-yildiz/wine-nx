@@ -3909,6 +3909,38 @@ struct get_update_region_reply
     /* VARARG(region,rectangles); */
     char __pad_20[4];
 };
+
+
+
+/* Combined get_update_region + get_visible_region, used only by
+ * NtUserBeginPaint's specific call sequence (dlls/win32u/dce.c,
+ * switch_prefetch_paint_regions) to collapse two sequential IPC round trips
+ * into one. Not used by get_update_region()/update_visible_region()'s other
+ * call sites. See dlls/ntdll/unix/horizon.c,
+ * horizon_server_handle_get_paint_regions. */
+struct get_paint_regions_request
+{
+    struct request_header __header;
+    user_handle_t  window;
+    user_handle_t  from_child;
+    unsigned int   update_flags;
+    unsigned int   visible_flags;
+    char __pad_28[4];
+};
+struct get_paint_regions_reply
+{
+    struct reply_header __header;
+    user_handle_t  child;
+    unsigned int   update_flags;
+    data_size_t    update_total_size;
+    user_handle_t  top_win;
+    struct rectangle top_rect;
+    struct rectangle win_rect;
+    unsigned int   paint_flags;
+    data_size_t    visible_total_size;
+    /* VARARG(update_region,rectangles); */
+    /* VARARG(visible_region,rectangles); */
+};
 #define UPDATE_NONCLIENT       0x001
 #define UPDATE_ERASE           0x002
 #define UPDATE_PAINT           0x004
@@ -6575,6 +6607,7 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_fsync_free_shm_idx,
+    REQ_get_paint_regions,
     REQ_NB_REQUESTS
 };
 
@@ -6748,6 +6781,7 @@ union generic_request
     struct get_window_region_request get_window_region_request;
     struct set_window_region_request set_window_region_request;
     struct get_update_region_request get_update_region_request;
+    struct get_paint_regions_request get_paint_regions_request;
     struct update_window_zorder_request update_window_zorder_request;
     struct redraw_window_request redraw_window_request;
     struct set_window_property_request set_window_property_request;
@@ -7063,6 +7097,7 @@ union generic_reply
     struct get_window_region_reply get_window_region_reply;
     struct set_window_region_reply set_window_region_reply;
     struct get_update_region_reply get_update_region_reply;
+    struct get_paint_regions_reply get_paint_regions_reply;
     struct update_window_zorder_reply update_window_zorder_reply;
     struct redraw_window_reply redraw_window_reply;
     struct set_window_property_reply set_window_property_reply;

@@ -309,6 +309,38 @@ static void wine_nx_flush_legacy_select(void)
              (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
 }
 
+/* Off by default -- this is a real protocol change (a new combined
+ * get_paint_regions server request, dlls/ntdll/unix/horizon.c), not a
+ * diagnostic, so wrong here means silent visual corruption, not a crash.
+ *
+ * NtUserBeginPaint always issues get_update_region followed by
+ * get_visible_region, each its own ~14-15ms IPC round trip (see README,
+ * "The ~14ms Per-Call IPC Floor"). horizon_server_handle_get_paint_regions
+ * computes both under one lock pass with no cross-dependency between them,
+ * so ON fetches both in a single round trip via
+ * switch_prefetch_paint_regions() (dlls/win32u/dce.c) instead of two
+ * separate calls -- saving one full round trip per paint cycle in the
+ * common case (no WM_NCPAINT churn between the two fetches). When ON,
+ * dce.c still validates the prefetch (same hwnd, matching DCX_WINDOW bit)
+ * before using it, and falls back to the exact old sequential calls
+ * whenever that validation fails -- so even with this toggle on, a mismatch
+ * costs no more than OFF does; it just doesn't save the round trip that
+ * particular time. This toggle exists to A/B the combined path against the
+ * old sequential one in the same binary/session, the same way
+ * WINE_NX_FLUSH_LEGACY does for flush_window_surfaces(). */
+int wine_nx_batch_paint_regions_enabled;
+
+static void wine_nx_batch_paint_regions_select(void)
+{
+    const char *env = getenv( "WINE_NX_BATCH_PAINT_REGIONS" );
+    int file_flag = read_bool_file( RUNTIME_DIR "/batchpaint.txt" );
+    wine_nx_batch_paint_regions_enabled = (env && env[0]) || file_flag;
+    log_line( "[NXTRACE] combined get_paint_regions mode: %s (env=%s file=%s)",
+             wine_nx_batch_paint_regions_enabled ? "ON (one combined IPC round trip for BeginPaint)"
+                                                 : "off (default: separate get_update_region + get_visible_region calls)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
 #ifdef WINE_NX_DEKO3D_ONLY
 
 /* This build's entire purpose is to never make this call -- deko3d must be
@@ -1606,6 +1638,7 @@ int main( int argc, char **argv )
     wine_nx_syscall_trace_select();
     wine_nx_paint_trace_select();
     wine_nx_flush_legacy_select();
+    wine_nx_batch_paint_regions_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );

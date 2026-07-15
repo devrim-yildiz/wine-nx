@@ -284,6 +284,13 @@ struct horizon_fd_queue
 #define HORIZON_REQ_ALLOC_USER_HANDLE 280
 #define HORIZON_REQ_FREE_USER_HANDLE 281
 #define HORIZON_REQ_SET_CURSOR 282
+/* Combined get_update_region + get_visible_region request, added to collapse
+ * NtUserBeginPaint's two unconditional back-to-back IPC round trips into one.
+ * 310 is appended after REQ_NB_REQUESTS's prior value (309) in server_protocol.h's
+ * enum request -- verified via a standalone host compile, not guessed -- so it
+ * cannot collide with any existing, already-numbered request type. See README,
+ * "The ~14ms Per-Call IPC Floor". */
+#define HORIZON_REQ_GET_PAINT_REGIONS 310
 #define HORIZON_STATUS_SUCCESS 0
 #define HORIZON_STATUS_OBJECT_NAME_EXISTS 0x40000000u
 #define HORIZON_STATUS_ALERTED 0x00000101u
@@ -1394,6 +1401,35 @@ struct horizon_get_update_region_reply
     unsigned int flags;
     unsigned int total_size;
     char pad[4];
+};
+
+/* Combined get_update_region + get_visible_region, one round trip instead of
+ * two. Reply is exactly 64 bytes (HORIZON_SERVER_FIXED_MESSAGE_SIZE) with no
+ * padding slack left -- confirmed by field-summing before writing this, not
+ * assumed. Vardata is the update rect (0 or 16 bytes, sized by
+ * update_total_size) immediately followed by the visible rect (0 or 16
+ * bytes, sized by visible_total_size); each part mirrors exactly what the
+ * two original single-purpose handlers would have returned on their own. */
+struct horizon_get_paint_regions_request
+{
+    struct horizon_server_request_header header;
+    unsigned int window;
+    unsigned int from_child;
+    unsigned int update_flags;
+    unsigned int visible_flags;
+};
+
+struct horizon_get_paint_regions_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int child;
+    unsigned int update_flags;
+    unsigned int update_total_size;
+    unsigned int top_win;
+    struct horizon_rectangle top_rect;
+    struct horizon_rectangle win_rect;
+    unsigned int paint_flags;
+    unsigned int visible_total_size;
 };
 
 struct horizon_get_message_request
@@ -5740,6 +5776,147 @@ static int horizon_server_handle_get_update_region( struct horizon_server_connec
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), data, data_size );
 }
 
+/* Combined get_update_region + get_visible_region handler for
+ * NtUserBeginPaint's specific call sequence (see dlls/win32u/dce.c,
+ * switch_prefetch_paint_regions, gated behind WINE_NX_BATCH_PAINT_REGIONS).
+ * The two halves below are a deliberately literal transcription of
+ * horizon_server_handle_get_update_region and horizon_server_handle_get_visible_region
+ * -- same branch structure, same field names renamed to update_* / visible_*,
+ * same pre-existing asymmetry where the "!target" shortcut branch does not
+ * clear has_update_rect/needs_erase/needs_nonclient (only the "else if
+ * (target)" branch does) -- preserved intentionally rather than "fixed",
+ * since this handler's job is to combine the two round trips, not change
+ * either one's semantics. Confirmed via horizon_server_handle_get_visible_region
+ * that the visible-region half has no dependency on the update-region half's
+ * result, so both can be computed under one lock pass with no ordering
+ * requirement between them. */
+static int horizon_server_handle_get_paint_regions( struct horizon_server_connection *connection,
+                                                     const unsigned char *message )
+{
+    const struct horizon_get_paint_regions_request *request = (const void *)message;
+    struct horizon_get_paint_regions_reply reply;
+    struct horizon_rectangle update_rect, visible_rect;
+    struct horizon_rectangle window_rect, client_rect, top_surface;
+    unsigned char combined_data[2 * sizeof(struct horizon_rectangle)];
+    unsigned int update_data_size = 0, visible_data_size = 0;
+    struct horizon_user_window *window, *from_child = NULL, *target = NULL;
+    struct horizon_user_window *top, *top_parent;
+    unsigned int update_flags = 0;
+    int past_from;
+
+    memset( &reply, 0, sizeof(reply) );
+    memset( &update_rect, 0, sizeof(update_rect) );
+    memset( &visible_rect, 0, sizeof(visible_rect) );
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(window = horizon_server_find_window_locked( request->window )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else if (request->from_child &&
+             !(from_child = horizon_server_find_window_locked( request->from_child )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        /* -- update-region half -- */
+        past_from = !from_child;
+        update_flags = horizon_server_find_window_update_locked( window, from_child, request->update_flags,
+                                                                  &past_from, &target );
+        if (from_child && !past_from)
+            reply.header.error = HORIZON_STATUS_INVALID_PARAMETER;
+        else if (!target && !(request->update_flags & HORIZON_UPDATE_NOREGION) &&
+                 !from_child && window->has_update_rect)
+        {
+            target = window;
+            reply.child = window->handle;
+            update_rect = window->update_rect;
+            reply.update_total_size = sizeof(update_rect);
+            if (!request->header.reply_size || request->header.reply_size >= sizeof(update_rect))
+                update_data_size = sizeof(update_rect);
+            else
+                reply.header.error = HORIZON_STATUS_BUFFER_OVERFLOW;
+        }
+        else if (target)
+        {
+            reply.child = target->handle;
+            reply.update_flags = update_flags;
+            if (target->has_update_rect)
+            {
+                update_rect = target->update_rect;
+                reply.update_total_size = sizeof(update_rect);
+                if (!(request->update_flags & HORIZON_UPDATE_NOREGION))
+                    update_data_size = sizeof(update_rect);
+            }
+            if (!(request->update_flags & HORIZON_UPDATE_NOREGION))
+            {
+                if (update_flags & (HORIZON_UPDATE_PAINT | HORIZON_UPDATE_INTERNALPAINT))
+                {
+                    target->has_update_rect = 0;
+                    target->has_internal_paint = 0;
+                    target->needs_erase = 0;
+                    target->needs_nonclient = 0;
+                }
+                else
+                {
+                    if (update_flags & HORIZON_UPDATE_ERASE) target->needs_erase = 0;
+                    if (update_flags & HORIZON_UPDATE_NONCLIENT) target->needs_nonclient = 0;
+                }
+            }
+        }
+
+        /* -- visible-region half, only when the update half didn't already fail -- */
+        if (!reply.header.error)
+        {
+            struct horizon_rectangle top_parent_window_rect, top_parent_client_rect;
+
+            top = horizon_server_get_surface_window_locked( window );
+            horizon_server_window_screen_rects_locked( window, &window_rect, &client_rect );
+
+            top_surface = top->surface_rect;
+            if (top->parent && (top_parent = horizon_server_find_window_locked( top->parent )))
+            {
+                horizon_server_window_screen_rects_locked( top_parent, &top_parent_window_rect,
+                                                            &top_parent_client_rect );
+                horizon_server_offset_rect( &top_surface, top_parent_client_rect.left,
+                                            top_parent_client_rect.top );
+            }
+
+            reply.top_win = top->handle;
+            reply.top_rect = top_surface;
+            reply.win_rect = (request->visible_flags & HORIZON_DCX_WINDOW) ? window_rect : client_rect;
+            reply.paint_flags = window->paint_flags;
+
+            visible_rect = horizon_server_intersect_rect( reply.win_rect, top_surface );
+            if (!horizon_server_rect_empty( &visible_rect ))
+            {
+                if (!request->header.reply_size ||
+                    request->header.reply_size >= update_data_size + sizeof(visible_rect))
+                    visible_data_size = sizeof(visible_rect);
+                else
+                    reply.header.error = HORIZON_STATUS_BUFFER_OVERFLOW;
+            }
+            reply.visible_total_size = horizon_server_rect_empty( &visible_rect ) ? 0 : sizeof(visible_rect);
+        }
+
+        if (!reply.header.error)
+        {
+            unsigned int off = 0;
+            if (update_data_size) { memcpy( combined_data + off, &update_rect, update_data_size ); off += update_data_size; }
+            if (visible_data_size) { memcpy( combined_data + off, &visible_rect, visible_data_size ); off += visible_data_size; }
+            reply.header.reply_size = off;
+        }
+
+        horizon_trace( "[HZPAINT] get_paint_regions hwnd=%08x from=%08x child=%08x uflags=%x top=%08x "
+                       "vflags=%x paint=%x usize=%u vsize=%u err=%08x\n",
+                       request->window, request->from_child, reply.child, reply.update_flags,
+                       reply.top_win, request->visible_flags, reply.paint_flags,
+                       reply.update_total_size, reply.visible_total_size, reply.header.error );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply),
+                                       reply.header.error ? NULL : combined_data,
+                                       reply.header.error ? 0 : reply.header.reply_size );
+}
+
 static int horizon_server_handle_get_message( struct horizon_server_connection *connection,
                                               const unsigned char *message )
 {
@@ -8030,6 +8207,9 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_GET_UPDATE_REGION:
             status = horizon_server_handle_get_update_region( connection, message );
+            break;
+        case HORIZON_REQ_GET_PAINT_REGIONS:
+            status = horizon_server_handle_get_paint_regions( connection, message );
             break;
         case HORIZON_REQ_UPDATE_WINDOW_ZORDER:
             status = horizon_server_handle_update_window_zorder( connection, message );

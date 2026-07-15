@@ -66,6 +66,13 @@ extern int wine_nx_paint_trace_enabled;
 /* wine-nx-probe/source/runtime.c -- A/B toggle for flush_window_surfaces()'s
  * debounce, see the long comment on wine_nx_flush_legacy_select() there. */
 extern int wine_nx_flush_legacy_enabled;
+/* wine-nx-probe/source/runtime.c -- A/B toggle for the combined
+ * get_paint_regions request, see switch_prefetch_paint_regions() below and
+ * the long comment on wine_nx_batch_paint_regions_select() there. Off by
+ * default: this collapses two of NtUserBeginPaint's IPC round trips into
+ * one, which is a real protocol change (wrong here = silent visual
+ * corruption, not a crash), not a diagnostic. */
+extern int wine_nx_batch_paint_regions_enabled;
 
 /* Update 2: switch_paint_trace() itself used to fflush() one line per
  * call (log_line(), unconditional fflush) -- exactly the same mistake
@@ -1065,6 +1072,38 @@ int force_present_to_surface( const RECT *win_rect )
     return win_rect->right < 0 && win_rect->bottom < 0;
 }
 
+#ifdef __SWITCH__
+/* Thread-local stash used by switch_prefetch_paint_regions() (defined
+ * further down, next to get_update_region()) to hand a prefetched
+ * get_visible_region reply to update_visible_region() below. See the design
+ * comment on switch_prefetch_paint_regions() for the full rationale and the
+ * validation this is subject to before being trusted. */
+struct switch_paint_regions_prefetch
+{
+    int      valid;
+    HWND     hwnd;
+    UINT     flags;        /* visible_flags this was fetched with; only DCX_WINDOW is ever compared */
+    HRGN     vis_rgn;
+    HWND     top_win;
+    RECT     win_rect;
+    RECT     top_rect;
+    DWORD    paint_flags;
+};
+static __thread struct switch_paint_regions_prefetch switch_paint_regions_prefetch;
+
+static void switch_paint_regions_prefetch_clear(void)
+{
+    /* A prefetched vis_rgn that never gets consumed (WM_NCPAINT invalidation,
+     * update_vis_rgn ending up FALSE, or an early BeginPaint bail) is a real
+     * GDI region handle that must be freed here -- otherwise every such
+     * frame leaks one HRGN, same class of bug as never calling ReleaseDC. */
+    if (switch_paint_regions_prefetch.valid && switch_paint_regions_prefetch.vis_rgn)
+        NtGdiDeleteObjectApp( switch_paint_regions_prefetch.vis_rgn );
+    switch_paint_regions_prefetch.valid = 0;
+    switch_paint_regions_prefetch.vis_rgn = 0;
+}
+#endif
+
 /***********************************************************************
  *           update_visible_region
  *
@@ -1088,6 +1127,54 @@ static void update_visible_region( struct dce *dce )
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
 
+#ifdef __SWITCH__
+    /* See the design comment above switch_prefetch_paint_regions(). Only
+     * consume the prefetch if it's for this exact hwnd and the one flag
+     * bit the server's reply actually depends on (DCX_WINDOW) matches --
+     * any mismatch means fall through to the normal IPC call below, which
+     * is always correct regardless of why the prefetch didn't apply. */
+    if (wine_nx_batch_paint_regions_enabled && switch_paint_regions_prefetch.valid &&
+        switch_paint_regions_prefetch.hwnd == dce->hwnd &&
+        !((switch_paint_regions_prefetch.flags ^ flags) & DCX_WINDOW))
+    {
+        vis_rgn     = switch_paint_regions_prefetch.vis_rgn;
+        top_win     = switch_paint_regions_prefetch.top_win;
+        win_rect    = switch_paint_regions_prefetch.win_rect;
+        top_rect    = switch_paint_regions_prefetch.top_rect;
+        paint_flags = switch_paint_regions_prefetch.paint_flags;
+        status = STATUS_SUCCESS;
+        switch_paint_regions_prefetch.valid = 0;
+
+        if (wine_nx_paint_trace_enabled)
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                char buf[128];
+                snprintf( buf, sizeof(buf), "[NXBATCH] consumed hwnd=%x", (int)(ULONG_PTR)dce->hwnd );
+                wine_nx_runtime_trace( buf );
+                logged++;
+            }
+        }
+    }
+    else
+    {
+        if (wine_nx_batch_paint_regions_enabled && switch_paint_regions_prefetch.valid &&
+            wine_nx_paint_trace_enabled)
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                char buf[160];
+                snprintf( buf, sizeof(buf), "[NXBATCH] miss hwnd=%x prefetch_hwnd=%x flags=%x prefetch_flags=%x",
+                         (int)(ULONG_PTR)dce->hwnd, (int)(ULONG_PTR)switch_paint_regions_prefetch.hwnd,
+                         (unsigned int)flags, (unsigned int)switch_paint_regions_prefetch.flags );
+                wine_nx_runtime_trace( buf );
+                logged++;
+            }
+        }
+        switch_paint_regions_prefetch_clear();
+#endif
     /* fetch the visible region from the server */
     do
     {
@@ -1117,6 +1204,9 @@ static void update_visible_region( struct dce *dce )
         SERVER_END_REQ;
         free( data );
     } while (status == STATUS_BUFFER_OVERFLOW);
+#ifdef __SWITCH__
+    }
+#endif
 
     if (status || !vis_rgn) return;
 
@@ -1788,6 +1878,144 @@ HWND WINAPI NtUserWindowFromDC( HDC hdc )
     return hwnd;
 }
 
+#ifdef __SWITCH__
+/* Batched get_update_region + get_visible_region for NtUserBeginPaint's
+ * specific call sequence. Background: BeginPaint always issues
+ * get_update_region (via send_ncpaint) immediately followed by
+ * get_visible_region (via send_erase -> NtUserGetDCEx -> update_visible_region),
+ * and each is its own ~14-15ms IPC round trip (see README, "The ~14ms
+ * Per-Call IPC Floor") -- confirmed real, unavoidable Horizon OS thread-wake
+ * latency, not a deletable inefficiency. horizon_server_handle_get_paint_regions
+ * (dlls/ntdll/unix/horizon.c) computes both under one lock pass with no
+ * cross-dependency, so both can be fetched in a single round trip.
+ *
+ * The catch: send_ncpaint() can dispatch WM_NCPAINT to the app *between*
+ * the two fetches (when UPDATE_NONCLIENT is set), and an app's WM_NCPAINT
+ * handler can change window geometry -- so a visible-region reply fetched
+ * before that dispatch could be stale by the time NtUserGetDCEx would
+ * normally have fetched it. This is handled by fetching optimistically and
+ * validating before use, never by assuming the optimistic fetch is safe:
+ *   1. switch_prefetch_paint_regions() replaces get_update_region()'s own
+ *      IPC call inside send_ncpaint(), fetching both halves in one request
+ *      and stashing the visible-region half in switch_paint_regions_prefetch
+ *      (thread-local -- BeginPaint's window is only ever touched by its
+ *      owning thread, so no cross-thread locking is needed for this).
+ *   2. If send_ncpaint() goes on to actually dispatch WM_NCPAINT, it clears
+ *      the stash first (switch_paint_regions_prefetch_clear()) -- app code
+ *      is about to run, so the prefetched visible-region data must not be
+ *      trusted anymore.
+ *   3. update_visible_region() (below get_update_region in this file) checks
+ *      the stash before issuing its own get_visible_region call. It only
+ *      consumes the stash if the hwnd matches AND the one flag bit the
+ *      server's reply actually depends on (DCX_WINDOW -- confirmed by
+ *      reading horizon_server_handle_get_visible_region and the combined
+ *      handler: paint_flags/top_win/top_rect never depend on flags at all,
+ *      win_rect depends only on DCX_WINDOW) still matches what was
+ *      prefetched. Any mismatch, or an empty stash, falls through to the
+ *      normal, always-correct IPC call -- so every fallback path costs
+ *      exactly what today's unbatched code costs, never more, and the
+ *      match is a positive proof of freshness, not an assumption.
+ * Net effect: the common steady-state case (no WM_NCPAINT churn, which is
+ * what continuous redraw looks like) saves one full round trip per paint
+ * cycle; any case that doesn't hold falls back to today's exact behavior.
+ * Gated off by default behind wine_nx_batch_paint_regions_enabled
+ * (WINE_NX_BATCH_PAINT_REGIONS env var / sdmc:/switch/wine/batchpaint.txt).
+ */
+static HRGN switch_build_region_from_bytes( const void *bytes, size_t byte_size )
+{
+    RGNDATA *data;
+    HRGN hrgn;
+
+    if (!(data = malloc( sizeof(*data) + byte_size ))) return 0;
+    data->rdh.dwSize   = sizeof(data->rdh);
+    data->rdh.iType    = RDH_RECTANGLES;
+    data->rdh.nCount   = byte_size / sizeof(RECT);
+    data->rdh.nRgnSize = byte_size;
+    if (byte_size) memcpy( data->Buffer, bytes, byte_size );
+    hrgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
+    free( data );
+    return hrgn;
+}
+
+static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
+{
+    HRGN hrgn = 0;
+    NTSTATUS status;
+    RGNDATA *combined;
+    size_t size = 512;
+    UINT visible_flags = DCX_INTERSECTRGN | DCX_USESTYLE;
+
+    if (is_iconic( hwnd )) visible_flags |= DCX_WINDOW;
+    switch_paint_regions_prefetch_clear();
+
+    do
+    {
+        if (!(combined = malloc( sizeof(*combined) + size - 1 )))
+        {
+            RtlSetLastWin32Error( ERROR_OUTOFMEMORY );
+            return 0;
+        }
+
+        SERVER_START_REQ( get_paint_regions )
+        {
+            req->window        = wine_server_user_handle( hwnd );
+            req->from_child    = wine_server_user_handle( child ? *child : 0 );
+            req->update_flags  = *flags;
+            req->visible_flags = visible_flags;
+            wine_server_set_reply( req, combined->Buffer, size );
+            if (!(status = wine_server_call( req )))
+            {
+                size_t update_size = reply->update_total_size;
+                size_t visible_size = reply->visible_total_size;
+
+                hrgn = switch_build_region_from_bytes( combined->Buffer, update_size );
+                if (child) *child = wine_server_ptr_handle( reply->child );
+                *flags = reply->update_flags;
+
+                /* Always build a region object here, even for visible_size==0
+                 * (window fully offscreen/occluded) -- update_visible_region()'s
+                 * "if (status || !vis_rgn) return;" treats a NULL vis_rgn as a
+                 * fetch failure, not "valid empty region", and the unbatched
+                 * get_visible_region path always builds one regardless of size
+                 * too (see its own NtGdiExtCreateRegion call below). */
+                switch_paint_regions_prefetch.vis_rgn =
+                    switch_build_region_from_bytes( combined->Buffer + update_size, visible_size );
+                switch_paint_regions_prefetch.valid       = 1;
+                switch_paint_regions_prefetch.hwnd        = hwnd;
+                switch_paint_regions_prefetch.flags       = visible_flags;
+                switch_paint_regions_prefetch.top_win     = wine_server_ptr_handle( reply->top_win );
+                switch_paint_regions_prefetch.win_rect    = wine_server_get_rect( reply->win_rect );
+                switch_paint_regions_prefetch.top_rect    = wine_server_get_rect( reply->top_rect );
+                switch_paint_regions_prefetch.paint_flags = reply->paint_flags;
+
+                if (wine_nx_paint_trace_enabled)
+                {
+                    static unsigned int logged;
+                    if (logged < 5)
+                    {
+                        char buf[192];
+                        snprintf( buf, sizeof(buf),
+                                 "[NXBATCH] prefetch hwnd=%x usize=%u vsize=%u top=%x win=%d,%d-%d,%d",
+                                 (int)(ULONG_PTR)hwnd, (unsigned int)update_size, (unsigned int)visible_size,
+                                 (int)(ULONG_PTR)switch_paint_regions_prefetch.top_win,
+                                 switch_paint_regions_prefetch.win_rect.left, switch_paint_regions_prefetch.win_rect.top,
+                                 switch_paint_regions_prefetch.win_rect.right, switch_paint_regions_prefetch.win_rect.bottom );
+                        wine_nx_runtime_trace( buf );
+                        logged++;
+                    }
+                }
+            }
+            else size = reply->update_total_size + reply->visible_total_size;
+        }
+        SERVER_END_REQ;
+        free( combined );
+    } while (status == STATUS_BUFFER_OVERFLOW);
+
+    if (status) RtlSetLastWin32Error( RtlNtStatusToDosError(status) );
+    return hrgn;
+}
+#endif
+
 /***********************************************************************
  *           get_update_region
  *
@@ -1890,9 +2118,18 @@ static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
  */
 static HRGN send_ncpaint( HWND hwnd, HWND *child, UINT *flags )
 {
-    HRGN whole_rgn = get_update_region( hwnd, flags, child );
+    HRGN whole_rgn;
     HRGN client_rgn = 0;
     DWORD style;
+
+#ifdef __SWITCH__
+    if (wine_nx_batch_paint_regions_enabled)
+        whole_rgn = switch_prefetch_paint_regions( hwnd, flags, child );
+    else
+        whole_rgn = get_update_region( hwnd, flags, child );
+#else
+    whole_rgn = get_update_region( hwnd, flags, child );
+#endif
 
     if (child) hwnd = *child;
 
@@ -1942,6 +2179,26 @@ static HRGN send_ncpaint( HWND hwnd, HWND *child, UINT *flags )
                 if (style & WS_VSCROLL)
                     set_standard_scroll_painted( hwnd, SB_VERT, FALSE );
 
+#ifdef __SWITCH__
+                /* App code is about to run and may change window geometry --
+                 * any visible-region data already prefetched for this
+                 * BeginPaint call can no longer be trusted. See the design
+                 * comment above switch_prefetch_paint_regions(). */
+                if (wine_nx_batch_paint_regions_enabled && switch_paint_regions_prefetch.valid &&
+                    wine_nx_paint_trace_enabled)
+                {
+                    static unsigned int logged;
+                    if (logged < 5)
+                    {
+                        char buf[128];
+                        snprintf( buf, sizeof(buf), "[NXBATCH] invalidated hwnd=%x reason=WM_NCPAINT",
+                                 (int)(ULONG_PTR)hwnd );
+                        wine_nx_runtime_trace( buf );
+                        logged++;
+                    }
+                }
+                switch_paint_regions_prefetch_clear();
+#endif
                 send_notify_message( hwnd, WM_NCPAINT, (WPARAM)whole_rgn, 0, FALSE );
             }
             if (whole_rgn > (HRGN)1) NtGdiDeleteObjectApp( whole_rgn );
@@ -2117,9 +2374,25 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     NtUserHideCaret( hwnd );
 
 #ifdef __SWITCH__
+    {
+        static int logged_mode;
+        if (!logged_mode)
+        {
+            logged_mode = 1;
+            wine_nx_runtime_trace( wine_nx_batch_paint_regions_enabled
+                                   ? "[NXBATCH] NtUserBeginPaint: combined get_paint_regions mode ACTIVE"
+                                   : "[NXBATCH] NtUserBeginPaint: legacy sequential get_update_region+get_visible_region mode ACTIVE (current default)" );
+        }
+    }
     t0 = armGetSystemTick();
 #endif
-    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags )))
+    {
+#ifdef __SWITCH__
+        switch_paint_regions_prefetch_clear();
+#endif
+        return 0;
+    }
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
     switch_paint_trace( "ncpaint", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
@@ -2132,6 +2405,11 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
     switch_paint_trace( "erase", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    /* Defensive: if update_vis_rgn ended up FALSE inside NtUserGetDCEx (e.g.
+     * a cached DCE was reused without needing a visible-region refresh), the
+     * prefetch above was never consumed. Clear it here so it can never be
+     * picked up by some later, unrelated call for the same hwnd. */
+    switch_paint_regions_prefetch_clear();
 #endif
 
     TRACE( "hdc = %p box = (%s), fErase = %d\n", hdc, wine_dbgstr_rect(&rect), erase );

@@ -517,6 +517,64 @@ frozen clock for a hard crash.
 All three round-2 changes compile-verified only, on the same checkpoint
 branch, not hardware-tested.
 
+### Batched `get_paint_regions` Request: Landed, Hardware-Confirmed, Didn't Fix fps
+
+The batched request scoped out above ("What a batched request would need")
+was implemented and hardware-tested. `get_update_region` and
+`get_visible_region` -- the two calls `NtUserBeginPaint` always issues
+back-to-back (`redraw_window` was deliberately left out; it's decoupled
+from `BeginPaint` via `InvalidateRect`'s separate API entry point, so
+forcibly coupling it would be architecturally wrong for the general Win32
+contract) -- are now optionally fetched in one round trip via a new
+`get_paint_regions` server request (protocol ID 310,
+`horizon_server_handle_get_paint_regions()` in `horizon.c`). Off by
+default behind `WINE_NX_BATCH_PAINT_REGIONS`
+(env var / `sdmc:/switch/wine/batchpaint.txt`), same file-fallback pattern
+as every other toggle here.
+
+The real correctness risk -- `send_ncpaint()` can dispatch `WM_NCPAINT` to
+the app *between* the two fetches, and an app's handler can change window
+geometry, so a visible-region reply fetched before that dispatch could be
+stale -- is handled by fetching optimistically and validating before use,
+never by assuming the optimistic fetch is safe: the visible-region half is
+stashed thread-locally and only consumed if the window handle and the one
+flag bit the server's reply actually depends on (`DCX_WINDOW`) still match
+when `update_visible_region()` goes to use it; any mismatch, or an actual
+`WM_NCPAINT` dispatch, falls through to the exact old sequential call, so
+every fallback path costs no more than not having this change at all.
+
+**Hardware-confirmed working correctly**: 129 `get_paint_regions` calls
+against only 5 leftover `get_visible_region` calls in one full test run --
+a ~96% hit rate, zero `[NXBATCH] miss` (validation mismatches), no visual
+corruption, clean run to the (separately tracked, unrelated) Minus-button
+exit issue.
+
+**Confirmed this does NOT fix the 5fps problem.** `presents/sec` stayed at
+5 and `gui_timing.log`'s `paint_avg` was statistically unchanged
+(~200-210ms steady state, same as before batching) despite eliminating a
+real ~14-15ms round trip on ~96% of frames. Why: summing the sub-phases
+that are actually traced inside the `NtUserBeginPaint`/`NtUserEndPaint`
+span (`ncpaint` + `erase` + `present_dirty`) comes to roughly 121ms in the
+same log where `paint_avg` reads ~200-210ms -- an **unidentified
+~80-90ms/frame gap** that was never accounted for by any trace this
+session, and that dwarfs the ~14ms this change removed. The IPC floor was
+real and is now measurably smaller, but it was never the dominant term in
+`paint_avg`; something else, roughly 6x the size of what this change
+touched, still is.
+
+**Next step, not yet started:** find where that ~80-90ms actually lives.
+Two concrete things to check before adding more Wine-side tracing: (1)
+verify exactly where `gui_smoke.c`'s own `paint_avg` timer starts and
+stops -- if its boundary wraps more than just the `BeginPaint`/`EndPaint`
+call pair (e.g. the actual drawing calls in between, which live outside
+`dce.c` and have never been instrumented), the gap may simply be
+unmeasured drawing cost, not hidden IPC; (2) check whether `presents/sec`
+is being externally capped (a vsync wait or frame limiter somewhere in the
+present path) rather than being bound by how long painting itself takes --
+if presentation is rate-limited independently of `paint_avg`, shaving
+`paint_avg` further won't move fps until that cap is found and accounted
+for either.
+
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
 Found while debugging the animated-HUD demo's timing instrumentation (see
