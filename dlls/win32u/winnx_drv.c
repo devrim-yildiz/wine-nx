@@ -79,6 +79,14 @@ static void nxdrv_trace_hot( const char *fmt, int a, int b, int c, int d )
 {
     static unsigned int count;
 
+    /* This was rate-limited to 120 calls but never gated behind
+     * wine_nx_paint_trace_enabled -- present_full/flush dirty/fb_lock/touch
+     * all paid real unconditional fflush() cost for the first 120 frames of
+     * every single run regardless of trace settings, same bug class as
+     * everything else in this file. Check the flag first (not just the
+     * count) so a run with tracing left off never burns any of the budget,
+     * and turning tracing on later still gets a full 120 real samples. */
+    if (!wine_nx_paint_trace_enabled) return;
     if (count++ >= 120) return;
     nxdrv_trace( fmt, a, b, c, d );
 }
