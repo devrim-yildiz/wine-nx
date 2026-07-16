@@ -290,6 +290,30 @@ static unsigned int send_request( const struct __server_request_info *req )
 {
     int request_fd = ntdll_get_thread_data()->request_fd;
 
+#ifdef __SWITCH__
+    /* Client-side half of the client-send/server-wake trace -- see the
+     * long comment on wine_nx_trace_client_send_tick in
+     * dlls/ntdll/unix/horizon.c (including why this uses GCC __atomic_*
+     * builtins instead of C11 stdatomic.h -- this project builds
+     * -std=gnu99). Release store: paired with the server thread's
+     * acquire exchange, so there's a real happens-before edge between
+     * this write and that read, not just "probably fine on this
+     * hardware". Timestamped here, before the write() call below, rather
+     * than inside horizon_pipe_write_r() -- that function is the generic
+     * transport for every horizon pipe in the process (sockets included),
+     * not just this specific request/reply channel, and this needs to
+     * measure only the channel actually in question. */
+    {
+        extern uint64_t wine_nx_trace_client_send_tick;
+        /* Weak: this object library links into several smoke-test binaries
+         * that don't link runtime.c and so never define this -- confirmed
+         * by a real link error, not assumed. */
+        extern int wine_nx_paint_trace_enabled __attribute__((weak));
+        if (&wine_nx_paint_trace_enabled && wine_nx_paint_trace_enabled)
+            __atomic_store_n( &wine_nx_trace_client_send_tick, armGetSystemTick(), __ATOMIC_RELEASE );
+    }
+#endif
+
     if (!req->u.req.request_header.request_size)
     {
         data_size_t to_write = sizeof(req->u.req);

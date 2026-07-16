@@ -2398,6 +2398,90 @@ static int horizon_pipe_close_r( struct _reent *r, void *fdptr )
     return 0;
 }
 
+/* Set (release-store) by send_request() in dlls/ntdll/unix/server.c right
+ * before it writes a request into this pipe -- the client-side "I'm
+ * sending now" moment. Read-and-cleared (acquire, atomic exchange) by
+ * horizon_server_thread() below the instant it wakes from blocking on the
+ * request pipe -- the server-side "I just woke up" moment. The delta is
+ * the real OS-scheduler wake latency this session has been treating as an
+ * unmeasured black box.
+ *
+ * Proper synchronization, not a plain global: this is written on one
+ * thread and read on another with no other synchronization tying the two
+ * accesses together -- the first genuinely cross-thread shared state this
+ * session has added (the redraw_window cache and switch_paint_state_
+ * generation earlier tonight were both single-threaded, read and written
+ * only by the UI message-loop thread; their bugs were logic errors, not
+ * races). A plain global here would be a real, new risk category, not
+ * stylistic pedantry.
+ *
+ * GCC/Clang __atomic_* builtins, not C11 <stdatomic.h>: this whole
+ * project builds with -std=gnu99 (cmake/switch-devkitA64.cmake via every
+ * add_executable's target_compile_options), so stdatomic.h's macros
+ * (atomic_exchange_explicit, memory_order_acq_rel, ...) aren't available
+ * -- confirmed by a real compile error, not assumed. The __atomic_*
+ * builtins are compiler intrinsics, not gated by C standard version, and
+ * are what glibc's own <stdatomic.h> wraps on this target anyway -- same
+ * synchronization guarantees, no build-flag change needed. Plain
+ * uint64_t rather than _Atomic-qualified: every access to this variable
+ * goes through an __atomic_* builtin by discipline (never a plain
+ * read/write), which is the standard, GCC-documented way to get atomic
+ * access on a pre-C11 type. */
+uint64_t wine_nx_trace_client_send_tick;
+
+/* wine-nx-probe/source/runtime.c -- same flag every other hot-path trace
+ * in this port is gated behind. Already on in every config this session
+ * has tested against, so this activates with no config change needed.
+ * Weak: horizon.c links into several smoke-test binaries
+ * (wine-nx-pe-real-report, wine-nx-deko3d-smoke, ...) that don't link
+ * runtime.c and so never define this -- confirmed by a real link error,
+ * not assumed. Checked with an address test below before every read,
+ * same as this file's existing weak wine_nx_runtime_trace() checks. */
+extern int wine_nx_paint_trace_enabled __attribute__((weak));
+
+/* In-memory aggregator (sum/count/max, flushed once/second), the exact
+ * same shape as switch_paint_trace()'s own design (dlls/win32u/dce.c) --
+ * deliberately, not by coincidence. This session already found "the
+ * diagnostic logging itself is the bottleneck" twice (unconditional
+ * per-call fflush in raw syscall tracing, then again in paint-phase
+ * tracing) -- an unguarded printf/log call on literally every IPC request
+ * would be a near-certain third instance of the same bug, corrupting the
+ * exact measurement this trace exists to take. Accumulated in memory,
+ * flushed to the log once per second via the existing gated
+ * wine_nx_runtime_trace() path, same as every other hot-path measurement
+ * in this codebase. */
+static uint64_t wine_nx_wake_latency_sum_ns;
+static unsigned int wine_nx_wake_latency_count;
+static uint64_t wine_nx_wake_latency_max_ns;
+static uint64_t wine_nx_wake_latency_epoch_ms;
+
+static void wine_nx_wake_latency_record( uint64_t delta_ns )
+{
+    uint64_t now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+
+    wine_nx_wake_latency_sum_ns += delta_ns;
+    wine_nx_wake_latency_count++;
+    if (delta_ns > wine_nx_wake_latency_max_ns) wine_nx_wake_latency_max_ns = delta_ns;
+
+    if (!wine_nx_wake_latency_epoch_ms) wine_nx_wake_latency_epoch_ms = now_ms;
+    if (now_ms - wine_nx_wake_latency_epoch_ms >= 1000)
+    {
+        char buf[128];
+        unsigned long long avg_us = wine_nx_wake_latency_count
+            ? wine_nx_wake_latency_sum_ns / wine_nx_wake_latency_count / 1000ULL : 0;
+
+        snprintf( buf, sizeof(buf), "[NXWAKE] server thread wake latency: avg=%lluus max=%lluus n=%u",
+                 avg_us, (unsigned long long)(wine_nx_wake_latency_max_ns / 1000ULL),
+                 wine_nx_wake_latency_count );
+        horizon_trace( "%s\n", buf );
+
+        wine_nx_wake_latency_sum_ns = 0;
+        wine_nx_wake_latency_count = 0;
+        wine_nx_wake_latency_max_ns = 0;
+        wine_nx_wake_latency_epoch_ms = now_ms;
+    }
+}
+
 static ssize_t horizon_pipe_write_r( struct _reent *r, void *fdptr, const char *ptr, size_t len )
 {
     struct horizon_pipe_file *file = *(struct horizon_pipe_file **)fdptr;
@@ -5622,13 +5706,30 @@ static int horizon_server_handle_redraw_window( struct horizon_server_connection
                 if (child_win->parent == window->handle) { reply.has_children = 1; break; }
         }
 
-        horizon_trace( "[HZPAINT] redraw hwnd=%08x flags=%x count=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d "
-                       "search_child=%08x search_flags=%x search_has_children=%u err=%08x\n",
-                       request->window, request->flags, count, window->has_update_rect,
-                       window->has_internal_paint, window->needs_erase, window->needs_nonclient,
-                       window->update_rect.left, window->update_rect.top,
-                       window->update_rect.right, window->update_rect.bottom,
-                       reply.child, reply.flags, reply.has_children, status );
+        /* horizon_trace() does a real fopen(append)+vfprintf+fclose on the
+         * SD card EVERY call -- worse than the fflush()-on-an-already-open-
+         * handle pattern found and fixed six times on the client side
+         * earlier tonight, this is a full filesystem open/close cycle, on
+         * the server thread, while holding horizon_server_objects_mutex,
+         * on literally every redraw_window call this whole session has
+         * been trying to speed up. Invisible to every client-side phase
+         * timer built tonight, since it happens entirely inside the "IPC
+         * call took Xms" black box. Rate-limited to the same 5-sample
+         * convention used everywhere else this session. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] redraw hwnd=%08x flags=%x count=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d "
+                               "search_child=%08x search_flags=%x search_has_children=%u err=%08x\n",
+                               request->window, request->flags, count, window->has_update_rect,
+                               window->has_internal_paint, window->needs_erase, window->needs_nonclient,
+                               window->update_rect.left, window->update_rect.top,
+                               window->update_rect.right, window->update_rect.bottom,
+                               reply.child, reply.flags, reply.has_children, status );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
     reply.header.error = status;
@@ -6002,11 +6103,22 @@ static int horizon_server_handle_get_paint_regions( struct horizon_server_connec
             reply.header.reply_size = off;
         }
 
-        horizon_trace( "[HZPAINT] get_paint_regions hwnd=%08x from=%08x child=%08x uflags=%x top=%08x "
-                       "vflags=%x paint=%x usize=%u vsize=%u err=%08x\n",
-                       request->window, request->from_child, reply.child, reply.update_flags,
-                       reply.top_win, request->visible_flags, reply.paint_flags,
-                       reply.update_total_size, reply.visible_total_size, reply.header.error );
+        /* Same unconditional fopen/write/fclose issue as redraw_window's
+         * own trace above -- this one is worse, since get_paint_regions is
+         * the single most expensive IPC call this whole session has been
+         * chasing (~21-22ms average). Same fix. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] get_paint_regions hwnd=%08x from=%08x child=%08x uflags=%x top=%08x "
+                               "vflags=%x paint=%x usize=%u vsize=%u err=%08x\n",
+                               request->window, request->from_child, reply.child, reply.update_flags,
+                               reply.top_win, request->visible_flags, reply.paint_flags,
+                               reply.update_total_size, reply.visible_total_size, reply.header.error );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -6066,10 +6178,21 @@ static int horizon_server_handle_get_update_flags_ex( struct horizon_server_conn
                 if (child->parent == window->handle) { reply.has_children = 1; break; }
         }
 
-        horizon_trace( "[HZPAINT] get_update_flags_ex hwnd=%08x from=%08x child=%08x flags=%x "
-                       "has_children=%u err=%08x\n",
-                       request->window, request->from_child, reply.child, reply.flags,
-                       reply.has_children, reply.header.error );
+        /* Same unconditional fopen/write/fclose issue as redraw_window's
+         * own trace above. Same fix. This handler backs the
+         * update_now()-skip fast path from earlier this session, so it
+         * fires once per frame whenever that cache misses. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] get_update_flags_ex hwnd=%08x from=%08x child=%08x flags=%x "
+                               "has_children=%u err=%08x\n",
+                               request->window, request->from_child, reply.child, reply.flags,
+                               reply.has_children, reply.header.error );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -6143,10 +6266,19 @@ static int horizon_server_handle_redraw_window_updatenow( struct horizon_server_
         for (child = horizon_windows; child; child = child->next)
             if (child->parent == window->handle) { reply.has_children = 1; break; }
 
-        horizon_trace( "[HZPAINT] redraw_updatenow hwnd=%08x redraw_flags=%x search_flags=%x "
-                       "child=%08x flags=%x has_children=%u\n",
-                       request->window, request->redraw_flags, request->search_flags,
-                       reply.child, reply.flags, reply.has_children );
+        /* Same unconditional fopen/write/fclose issue as redraw_window's
+         * own trace above. Same fix. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] redraw_updatenow hwnd=%08x redraw_flags=%x search_flags=%x "
+                               "child=%08x flags=%x has_children=%u\n",
+                               request->window, request->redraw_flags, request->search_flags,
+                               reply.child, reply.flags, reply.has_children );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -8206,6 +8338,16 @@ static void *horizon_server_thread( void *param )
         unsigned char *request_data = NULL;
         int status = 0;
         int ret = horizon_read_exact( connection->request_fd, message, sizeof(message) );
+
+        if (ret > 0 && &wine_nx_paint_trace_enabled && wine_nx_paint_trace_enabled)
+        {
+            /* The server-side half of the client-send/server-wake trace --
+             * see the comment on wine_nx_trace_client_send_tick above.
+             * Atomic exchange: read-and-clear in one operation, no separate
+             * check-then-clear window for another iteration to race. */
+            u64 send_tick = __atomic_exchange_n( &wine_nx_trace_client_send_tick, 0, __ATOMIC_ACQ_REL );
+            if (send_tick) wine_nx_wake_latency_record( armTicksToNs( armGetSystemTick() - send_tick ) );
+        }
 
         if (ret <= 0) break;
         if (header->request_size)
