@@ -386,29 +386,52 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
      * iterations of bounds-checking and BGRX->RGBA bit-swizzling with no
      * batching -- a real candidate the deko3d GPU-sync timing (all
      * near-zero) and the redraw_window/get_update_region/get_visible_region
-     * IPC timing (~10% of paint_avg) didn't explain. */
+     * IPC timing (~10% of paint_avg) didn't explain.
+     *
+     * EXPERIMENTAL follow-up: the per-pixel "if (u<0||u>=sw||dx<0||dx>=fbw)
+     * continue" bounds check above was being re-evaluated for every one of
+     * up to 921,600 pixels (a full 1280x720 window), but its result is
+     * fully determined by sw/fbw/screen_origin.x (and sh/fbh/screen_origin.y
+     * for the row check) -- none of which change across the blit, or even
+     * across frames for a window that never moves. Hoisting the clamp out
+     * of both loops (computed once, not 921,600 times) produces the exact
+     * same set of written pixels -- this is a pure arithmetic restructuring
+     * of which (sx,sy) pairs get iterated, not a behavior change -- just
+     * without the wasted per-pixel branches. Unverified how much of
+     * surface_funcs_flush's ~7-8ms this actually accounts for; that's what
+     * the next hardware run is for. */
 #ifdef __SWITCH__
     t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
 #endif
-    for (sy = blit.top; sy < blit.bottom; sy++)
     {
-        int v = sy;
-        int dy = nx_surface->screen_origin.y + sy;
-        const DWORD *src;
-        DWORD *dst;
+        int sx_min = blit.left;
+        int sx_max = blit.right;
+        int sy_min = blit.top;
+        int sy_max = blit.bottom;
 
-        if (v < 0 || v >= sh || dy < 0 || dy >= fbh) continue;
-        src = (const DWORD *)color_bits + (size_t)v * sw;
-        dst = fb + (size_t)dy * fbstride;
-        for (sx = blit.left; sx < blit.right; sx++)
+        if (sx_min < 0) sx_min = 0;
+        if (sx_min < -nx_surface->screen_origin.x) sx_min = -nx_surface->screen_origin.x;
+        if (sx_max > sw) sx_max = sw;
+        if (sx_max > fbw - nx_surface->screen_origin.x) sx_max = fbw - nx_surface->screen_origin.x;
+
+        if (sy_min < 0) sy_min = 0;
+        if (sy_min < -nx_surface->screen_origin.y) sy_min = -nx_surface->screen_origin.y;
+        if (sy_max > sh) sy_max = sh;
+        if (sy_max > fbh - nx_surface->screen_origin.y) sy_max = fbh - nx_surface->screen_origin.y;
+
+        for (sy = sy_min; sy < sy_max; sy++)
         {
-            int u = sx;
-            int dx = nx_surface->screen_origin.x + sx;
-            DWORD p;
-            if (u < 0 || u >= sw || dx < 0 || dx >= fbw) continue;
-            p = src[u];
-            /* BGRX (0x00RRGGBB) -> RGBA8888 (R,G,B,A bytes), opaque */
-            dst[dx] = 0xff000000u | (p & 0x0000ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
+            int dy = nx_surface->screen_origin.y + sy;
+            const DWORD *src = (const DWORD *)color_bits + (size_t)sy * sw;
+            DWORD *dst = fb + (size_t)dy * fbstride;
+
+            for (sx = sx_min; sx < sx_max; sx++)
+            {
+                int dx = nx_surface->screen_origin.x + sx;
+                DWORD p = src[sx];
+                /* BGRX (0x00RRGGBB) -> RGBA8888 (R,G,B,A bytes), opaque */
+                dst[dx] = 0xff000000u | (p & 0x0000ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
+            }
         }
     }
 #ifdef __SWITCH__
