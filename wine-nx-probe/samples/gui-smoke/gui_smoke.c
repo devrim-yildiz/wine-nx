@@ -591,8 +591,19 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show )
         t1 = now_ms();
         timing_stat_add( &g_stat_paint, t1 - t0 );
 
+        /* Was Sleep(10) -- an unconditional pacing delay added on top of
+         * whatever painting already took, regardless of load. That's not a
+         * frame-rate cap tied to vsync or any real constraint, just an
+         * arbitrary constant from early in this demo's development, and at
+         * ~100ms/frame it was costing ~10% of every frame for no reason.
+         * Cut to Sleep(1) -- still yields the thread every iteration
+         * instead of busy-spinning, but doesn't manufacture an artificial
+         * floor. This is a test-harness tuning change, not a Wine-NX port
+         * fix -- it doesn't reflect any change in the port's own paint
+         * pipeline cost, just how much this specific demo was leaving on
+         * the table by choice. */
         t0 = now_ms();
-        Sleep( 10 );
+        Sleep( 1 );
         t1 = now_ms();
         timing_stat_add( &g_stat_sleep, t1 - t0 );
 
