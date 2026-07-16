@@ -298,6 +298,14 @@ struct horizon_fd_queue
  * right after get_paint_regions's 310 -- verified via the same standalone
  * host-compile check, not guessed. */
 #define HORIZON_REQ_GET_UPDATE_FLAGS_EX 311
+/* Combined redraw_window + get_update_flags_ex(from_child=0), added to
+ * collapse switch_update_now()'s (dlls/win32u/dce.c) very first search call
+ * into the redraw_window call that always immediately precedes it with no
+ * intervening app-code dispatch, for the common RDW_UPDATENOW/no-explicit-
+ * rect case (UpdateWindow()'s actual call shape). 312 is appended right
+ * after get_update_flags_ex's 311 -- verified via the same standalone
+ * host-compile check used for 310 and 311, not guessed. */
+#define HORIZON_REQ_REDRAW_WINDOW_UPDATENOW 312
 #define HORIZON_STATUS_SUCCESS 0
 #define HORIZON_STATUS_OBJECT_NAME_EXISTS 0x40000000u
 #define HORIZON_STATUS_ALERTED 0x00000101u
@@ -1452,6 +1460,25 @@ struct horizon_get_update_flags_ex_request
 };
 
 struct horizon_get_update_flags_ex_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int child;
+    unsigned int flags;
+    unsigned int has_children;
+};
+
+/* See HORIZON_REQ_REDRAW_WINDOW_UPDATENOW above. No rect/region data --
+ * this only ever handles the no-explicit-rect redraw_window call shape,
+ * same as horizon_redraw_window_request's count==0 case. */
+struct horizon_redraw_window_updatenow_request
+{
+    struct horizon_server_request_header header;
+    unsigned int window;
+    unsigned int redraw_flags;
+    unsigned int search_flags;
+};
+
+struct horizon_redraw_window_updatenow_reply
 {
     struct horizon_server_reply_header header;
     unsigned int child;
@@ -6005,6 +6032,83 @@ static int horizon_server_handle_get_update_flags_ex( struct horizon_server_conn
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
+/* Combined redraw_window(count==0) + get_update_flags_ex(from_child=0) --
+ * see HORIZON_REQ_REDRAW_WINDOW_UPDATENOW above. Runs the exact same
+ * mark-dirty logic as horizon_server_handle_redraw_window's count==0
+ * branch (verified against that function directly, not re-derived),
+ * immediately followed by the exact same from_child=0 search as
+ * horizon_server_handle_get_update_flags_ex, all under one lock
+ * acquisition -- collapsing what would otherwise be two separate IPC round
+ * trips (and two separate lock/unlock cycles) into one. */
+static int horizon_server_handle_redraw_window_updatenow( struct horizon_server_connection *connection,
+                                                           const unsigned char *message )
+{
+    const struct horizon_redraw_window_updatenow_request *request = (const void *)message;
+    struct horizon_redraw_window_updatenow_reply reply;
+    struct horizon_user_window *window, *target = NULL, *child;
+    unsigned int update_flags = 0;
+    int past_from;
+
+    memset( &reply, 0, sizeof(reply) );
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(window = horizon_server_find_window_locked( request->window )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        /* --- redraw_window's count==0 mark-dirty step --- */
+        if (request->redraw_flags & HORIZON_RDW_VALIDATE)
+        {
+            window->has_update_rect = 0;
+            window->has_internal_paint = 0;
+            window->needs_erase = 0;
+            window->needs_nonclient = 0;
+        }
+        if (request->redraw_flags & HORIZON_RDW_NOINTERNALPAINT)
+            window->has_internal_paint = 0;
+        if (request->redraw_flags & HORIZON_RDW_INTERNALPAINT)
+            window->has_internal_paint = 1;
+        if (request->redraw_flags & HORIZON_RDW_ERASE)
+            window->needs_erase = 1;
+
+        if (request->redraw_flags & HORIZON_RDW_INVALIDATE)
+        {
+            struct horizon_rectangle win_screen, client_screen, dirty;
+
+            horizon_server_window_screen_rects_locked( window, &win_screen, &client_screen );
+            dirty = (request->redraw_flags & HORIZON_RDW_FRAME) ? win_screen : client_screen;
+            if (!horizon_server_rect_empty( &dirty ))
+            {
+                horizon_server_mark_window_update_locked( window, dirty,
+                                                          !!(request->redraw_flags & HORIZON_RDW_ERASE) );
+                if (request->redraw_flags & HORIZON_RDW_FRAME) window->needs_nonclient = 1;
+                horizon_server_redraw_children_locked( window, dirty, request->redraw_flags );
+            }
+        }
+
+        /* --- get_update_flags_ex's from_child=0 search step --- */
+        past_from = 1;
+        update_flags = horizon_server_find_window_update_locked( window, NULL, request->search_flags,
+                                                                  &past_from, &target );
+        if (target)
+        {
+            reply.child = target->handle;
+            reply.flags = update_flags;
+        }
+
+        for (child = horizon_windows; child; child = child->next)
+            if (child->parent == window->handle) { reply.has_children = 1; break; }
+
+        horizon_trace( "[HZPAINT] redraw_updatenow hwnd=%08x redraw_flags=%x search_flags=%x "
+                       "child=%08x flags=%x has_children=%u\n",
+                       request->window, request->redraw_flags, request->search_flags,
+                       reply.child, reply.flags, reply.has_children );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
 static int horizon_server_handle_get_message( struct horizon_server_connection *connection,
                                               const unsigned char *message )
 {
@@ -8301,6 +8405,9 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_GET_UPDATE_FLAGS_EX:
             status = horizon_server_handle_get_update_flags_ex( connection, message );
+            break;
+        case HORIZON_REQ_REDRAW_WINDOW_UPDATENOW:
+            status = horizon_server_handle_redraw_window_updatenow( connection, message );
             break;
         case HORIZON_REQ_UPDATE_WINDOW_ZORDER:
             status = horizon_server_handle_update_window_zorder( connection, message );

@@ -82,6 +82,14 @@ extern int wine_nx_skip_redundant_update_check_enabled;
  * NtUserSetParent call (attempted, not just successful). See the long
  * comment on switch_update_now() below for why this exists. */
 extern LONG switch_window_tree_generation;
+/* wine-nx-probe/source/runtime.c -- A/B toggle for
+ * switch_redraw_window_updatenow(), see the long comment there. Off by
+ * default, same correctness-risk-change reasoning as
+ * wine_nx_batch_paint_regions_enabled above -- this is a real protocol
+ * change to NtUserRedrawWindow's own control flow, not a diagnostic. Only
+ * takes effect when wine_nx_skip_redundant_update_check_enabled is also on,
+ * since it depends on switch_update_now() existing. */
+extern int wine_nx_batch_redraw_updatenow_enabled;
 
 /* Update 2: switch_paint_trace() itself used to fflush() one line per
  * call (log_line(), unconditional fflush) -- exactly the same mistake
@@ -2645,27 +2653,33 @@ static BOOL switch_get_update_flags_ex( HWND hwnd, HWND *child, UINT *flags, BOO
  * isn't actually a correctness gap -- just noting it as the one scenario
  * that makes the counter earn its keep beyond the single-threaded case,
  * since Wine's per-window UI threading model makes it exotic in practice. */
-static void switch_update_now( HWND hwnd, UINT rdw_flags )
+/* Shared loop body for switch_update_now(), factored out so
+ * switch_redraw_window_updatenow() (below) can feed it an already-fetched
+ * first iteration (from the combined redraw_window+get_update_flags_ex
+ * call) instead of making switch_update_now()'s usual first fetch itself.
+ * have_first == FALSE reproduces switch_update_now()'s original for(;;)
+ * loop byte-for-byte (the "if (!have_first)" branch runs every iteration,
+ * exactly like the loop always did); have_first == TRUE skips only the one
+ * fetch that the caller already did, then rejoins the identical logic from
+ * "if (!flags) break" onward. */
+static void switch_update_now_loop( HWND hwnd, UINT rdw_flags, HWND child, UINT flags,
+                                    BOOL has_children, LONG gen_before, BOOL have_first )
 {
-    HWND child = 0;
-
-    if (hwnd == get_desktop_window())
-    {
-        erase_now( hwnd, rdw_flags | RDW_NOCHILDREN );
-        return;
-    }
-
     for (;;)
     {
-        UINT flags = UPDATE_PAINT | UPDATE_INTERNALPAINT;
-        BOOL has_children = TRUE;   /* fail-safe: never skip unless proven empty below */
-        LONG gen_before;
+        if (!have_first)
+        {
+            flags = UPDATE_PAINT | UPDATE_INTERNALPAINT;
+            has_children = TRUE;   /* fail-safe: never skip unless proven empty below */
 
-        if (rdw_flags & RDW_NOCHILDREN) flags |= UPDATE_NOCHILDREN;
-        else if (rdw_flags & RDW_ALLCHILDREN) flags |= UPDATE_ALLCHILDREN;
+            if (rdw_flags & RDW_NOCHILDREN) flags |= UPDATE_NOCHILDREN;
+            else if (rdw_flags & RDW_ALLCHILDREN) flags |= UPDATE_ALLCHILDREN;
 
-        gen_before = switch_window_tree_generation;
-        if (!switch_get_update_flags_ex( hwnd, &child, &flags, &has_children )) break;
+            gen_before = switch_window_tree_generation;
+            if (!switch_get_update_flags_ex( hwnd, &child, &flags, &has_children )) break;
+        }
+        have_first = FALSE;
+
         if (!flags) break;
 
         send_message( child, WM_PAINT, 0, 0 );
@@ -2702,6 +2716,59 @@ static void switch_update_now( HWND hwnd, UINT rdw_flags )
             }
         }
     }
+}
+
+static void switch_update_now( HWND hwnd, UINT rdw_flags )
+{
+    if (hwnd == get_desktop_window())
+    {
+        erase_now( hwnd, rdw_flags | RDW_NOCHILDREN );
+        return;
+    }
+
+    switch_update_now_loop( hwnd, rdw_flags, 0, 0, FALSE, 0, FALSE );
+}
+
+/* Combined redraw_window(count==0) + switch_update_now()'s first search,
+ * gated behind wine_nx_batch_redraw_updatenow_enabled (off by default).
+ * Only called from NtUserRedrawWindow's no-rect/no-region, RDW_UPDATENOW
+ * branch -- exactly UpdateWindow()'s real call shape, and the one case
+ * where redraw_window_rects()'s call and switch_update_now()'s first
+ * switch_get_update_flags_ex() call are adjacent with no intervening
+ * app-code dispatch (confirmed by reading NtUserRedrawWindow directly, not
+ * assumed). Handles the entire redraw+search+dispatch job itself; the
+ * caller should skip both its own redraw_window_rects() call and its later
+ * switch_update_now() call when this returns. */
+static void switch_redraw_window_updatenow( HWND hwnd, UINT rdw_flags )
+{
+    HWND child = 0;
+    UINT search_flags = UPDATE_PAINT | UPDATE_INTERNALPAINT;
+    BOOL has_children = TRUE;
+    LONG gen_before;
+    BOOL ok;
+
+    if (rdw_flags & RDW_NOCHILDREN) search_flags |= UPDATE_NOCHILDREN;
+    else if (rdw_flags & RDW_ALLCHILDREN) search_flags |= UPDATE_ALLCHILDREN;
+
+    gen_before = switch_window_tree_generation;
+
+    SERVER_START_REQ( redraw_window_updatenow )
+    {
+        req->window       = wine_server_user_handle( hwnd );
+        req->redraw_flags = rdw_flags;
+        req->search_flags = search_flags | UPDATE_NOREGION;
+        if ((ok = !wine_server_call_err( req )))
+        {
+            child        = wine_server_ptr_handle( reply->child );
+            search_flags = reply->flags;
+            has_children = reply->has_children != 0;
+        }
+    }
+    SERVER_END_REQ;
+
+    if (!ok) return;  /* matches redraw_window_rects()/switch_update_now() both silently no-op'ing on IPC failure */
+
+    switch_update_now_loop( hwnd, rdw_flags, child, search_flags, has_children, gen_before, TRUE );
 }
 #endif
 
@@ -2740,6 +2807,9 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
 {
     static const RECT empty;
     BOOL ret;
+#ifdef __SWITCH__
+    BOOL combined_done = FALSE;
+#endif
 
     if (TRACE_ON(win))
     {
@@ -2770,6 +2840,23 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
     }
     else if (!hrgn)
     {
+#ifdef __SWITCH__
+        /* UpdateWindow()'s exact call shape: no explicit rect/region. Combine
+         * the redraw with switch_update_now()'s first search into one round
+         * trip instead of two -- see switch_redraw_window_updatenow() above.
+         * hwnd != 0 && hwnd != desktop matches the exact condition under
+         * which switch_update_now() itself would not take its early-return
+         * desktop branch, so behavior stays equivalent either way. */
+        if (wine_nx_batch_redraw_updatenow_enabled && (flags & RDW_UPDATENOW) &&
+            wine_nx_skip_redundant_update_check_enabled &&
+            hwnd && hwnd != get_desktop_window())
+        {
+            switch_redraw_window_updatenow( hwnd, flags );
+            combined_done = TRUE;
+            ret = TRUE;
+        }
+        else
+#endif
         ret = redraw_window_rects( hwnd, flags, NULL, 0 );
     }
     else  /* need to build a list of the region rectangles */
@@ -2792,7 +2879,8 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
     if (flags & RDW_UPDATENOW)
     {
 #ifdef __SWITCH__
-        if (wine_nx_skip_redundant_update_check_enabled) switch_update_now( hwnd, flags );
+        if (combined_done) {}  /* switch_redraw_window_updatenow() already did the full job above */
+        else if (wine_nx_skip_redundant_update_check_enabled) switch_update_now( hwnd, flags );
         else update_now( hwnd, flags );
 #else
         update_now( hwnd, flags );

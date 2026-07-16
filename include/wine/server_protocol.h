@@ -3967,6 +3967,31 @@ struct get_update_flags_ex_reply
     unsigned int   has_children;
     char __pad_20[4];
 };
+
+/* Combined redraw_window + get_update_flags_ex(from_child=0), used only by
+ * switch_update_now()'s (dlls/win32u/dce.c) very first search of a call --
+ * the one case where NtUserRedrawWindow's own redraw_window call and
+ * switch_update_now's first get_update_flags_ex call are adjacent with no
+ * intervening app-code dispatch (RDW_UPDATENOW, no explicit rect/region --
+ * UpdateWindow()'s actual call shape), collapsing two sequential IPC round
+ * trips into one. Only handles the no-rect-data case (rect=NULL, hrgn=NULL);
+ * any explicit rect/region falls back to the separate redraw_window call.
+ * See dlls/ntdll/unix/horizon.c, horizon_server_handle_redraw_window_updatenow. */
+struct redraw_window_updatenow_request
+{
+    struct request_header __header;
+    user_handle_t  window;
+    unsigned int   redraw_flags;   /* RDW_* flags for the mark-dirty step */
+    unsigned int   search_flags;   /* UPDATE_* flags for the update-flags search step */
+};
+struct redraw_window_updatenow_reply
+{
+    struct reply_header __header;
+    user_handle_t  child;
+    unsigned int   flags;
+    unsigned int   has_children;
+    char __pad_20[4];
+};
 #define UPDATE_NONCLIENT       0x001
 #define UPDATE_ERASE           0x002
 #define UPDATE_PAINT           0x004
@@ -6635,6 +6660,7 @@ enum request
     REQ_fsync_free_shm_idx,
     REQ_get_paint_regions,
     REQ_get_update_flags_ex,
+    REQ_redraw_window_updatenow,
     REQ_NB_REQUESTS
 };
 
@@ -6810,6 +6836,7 @@ union generic_request
     struct get_update_region_request get_update_region_request;
     struct get_paint_regions_request get_paint_regions_request;
     struct get_update_flags_ex_request get_update_flags_ex_request;
+    struct redraw_window_updatenow_request redraw_window_updatenow_request;
     struct update_window_zorder_request update_window_zorder_request;
     struct redraw_window_request redraw_window_request;
     struct set_window_property_request set_window_property_request;
@@ -7127,6 +7154,7 @@ union generic_reply
     struct get_update_region_reply get_update_region_reply;
     struct get_paint_regions_reply get_paint_regions_reply;
     struct get_update_flags_ex_reply get_update_flags_ex_reply;
+    struct redraw_window_updatenow_reply redraw_window_updatenow_reply;
     struct update_window_zorder_reply update_window_zorder_reply;
     struct redraw_window_reply redraw_window_reply;
     struct set_window_property_reply set_window_property_reply;
