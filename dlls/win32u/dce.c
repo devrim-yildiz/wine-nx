@@ -98,7 +98,17 @@ extern LONG switch_window_tree_generation;
  * called from the single render thread in every trace captured tonight,
  * so a benign race here would at worst skew one sample, never crash --
  * acceptable for a diagnostic-only structure that's off by default. */
-#define SWITCH_PAINT_TRACE_MAX_PHASES 24
+/* Exactly 24 distinct phase names are already in use across dce.c/
+ * winnx_drv.c as of this session (confirmed by grepping every
+ * switch_paint_trace() call site, not assumed) -- meaning the array was
+ * already at its exact limit, not merely close to it. switch_paint_trace()'s
+ * own registration check (below) silently drops any phase past the cap:
+ * no error, no truncation warning, the sample just never accumulates.
+ * Same class of silent-data-loss bug as everything else chased this
+ * session, just found by counting instead of by a hardware log showing
+ * a phase missing. Raised with real headroom, not just enough to fit
+ * today's count. */
+#define SWITCH_PAINT_TRACE_MAX_PHASES 40
 
 struct switch_paint_trace_phase
 {
@@ -114,12 +124,18 @@ static u64 switch_paint_trace_epoch_ms;
 
 static void switch_paint_trace_flush(void)
 {
-    char buf[900];
+    /* Sized for SWITCH_PAINT_TRACE_MAX_PHASES (40) entries at the longest
+     * real phase name currently in use plus its "=NNNms(max=NNN,n=NN)"
+     * suffix, with headroom -- the previous 900-byte size was tuned for
+     * a smaller phase count and would silently truncate the printed line
+     * (not the underlying data, just what actually reaches the log) once
+     * enough phases were in use, same bug class as the array cap above. */
+    char buf[2048];
     int len = 0;
     unsigned int i;
 
     len += snprintf( buf + len, sizeof(buf) - len, "[NXPAINT][AVG]" );
-    for (i = 0; i < switch_paint_trace_phase_count && len < (int)sizeof(buf) - 48; i++)
+    for (i = 0; i < switch_paint_trace_phase_count && len < (int)sizeof(buf) - 64; i++)
     {
         struct switch_paint_trace_phase *p = &switch_paint_trace_phases[i];
         unsigned long long avg = p->count ? p->sum_ms / p->count : 0;
