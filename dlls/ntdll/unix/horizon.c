@@ -6360,13 +6360,31 @@ static int horizon_server_handle_get_message( struct horizon_server_connection *
     if (!reply.win) return horizon_server_write_status( connection->reply_fd, HORIZON_STATUS_PENDING );
     if (reply.type == HORIZON_MSG_HARDWARE)
     {
-        horizon_trace( "[HZINPUT] get_message id=%u hwnd=%08x msg=%x x=%d y=%d\n",
-                       hardware.hw_id, reply.win, reply.msg, reply.x, reply.y );
+        /* Gated by the !reply.win early-return above, so this and the
+         * WM_PAINT trace below don't fire on every idle GetMessage/
+         * PeekMessage poll -- only when a real message is actually
+         * returned. Still rate-limited: every real touch/mouse message
+         * during interactive testing would otherwise hit this, same
+         * audit as the four hot paint-path call sites above. */
+        static unsigned int logged;
+        if (logged < 5)
+        {
+            horizon_trace( "[HZINPUT] get_message id=%u hwnd=%08x msg=%x x=%d y=%d\n",
+                           hardware.hw_id, reply.win, reply.msg, reply.x, reply.y );
+            logged++;
+        }
         return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply),
                                            reply_data, reply_data_size );
     }
-    horizon_trace( "[HZPAINT] get_message WM_PAINT hwnd=%08x flags=%x range=%x-%x\n",
-                   reply.win, request->flags, request->get_first, request->get_last );
+    {
+        static unsigned int logged;
+        if (logged < 5)
+        {
+            horizon_trace( "[HZPAINT] get_message WM_PAINT hwnd=%08x flags=%x range=%x-%x\n",
+                           reply.win, request->flags, request->get_first, request->get_last );
+            logged++;
+        }
+    }
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
@@ -7573,20 +7591,45 @@ static int horizon_server_handle_set_async_direct_result( struct horizon_server_
 }
 
 #ifdef __SWITCH__
+/* Was fopen(append)+vfprintf+fclose on every single call, unconditionally,
+ * across all ~50 call sites in this file -- a full filesystem open/close
+ * cycle every time, not just the fflush()-on-an-already-open-handle cost
+ * this whole session has already treated as the (accepted, cheap-enough)
+ * baseline everywhere else. This was the third instance of "diagnostic
+ * logging has hidden I/O cost" found tonight (after unconditional syscall
+ * tracing, then unconditional paint-phase tracing), and by far the most
+ * expensive one: it single-handedly accounted for the bulk of what this
+ * whole session had been calling an "architectural floor" in
+ * redraw_window/get_paint_regions, a claim that's now retracted -- see
+ * the git history for the hardware numbers.
+ *
+ * Fixed at the source rather than by rate-limiting all ~50 call sites
+ * individually: opens the log file once (lazily, on first use) and keeps
+ * the handle open for the life of the process, matching the same
+ * open-once-fflush-per-line convention wine-nx-probe/source/runtime.c's
+ * log_line() already uses. Removes the expensive open/close cycle
+ * everywhere at once; the four confirmed-hottest call sites (redraw_
+ * window, get_paint_regions, get_update_flags_ex, redraw_window_
+ * updatenow) additionally keep their own rate-limiting on top, since even
+ * a cheap fflush() per call adds up at hundreds of calls/second -- same
+ * two-layer treatment (remove the expensive part at the source, then
+ * rate-limit the truly hot call sites) already used for switch_paint_
+ * trace() and nxdrv_trace_hot() elsewhere in this port. */
 void horizon_trace( const char *fmt, ... )
 {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static FILE *f;
     __builtin_va_list args;
-    FILE *f;
 
     pthread_mutex_lock( &lock );
-    if ((f = fopen( "sdmc:/switch/wine/horizon-trace.log", "a" )))
+    if (!f) f = fopen( "sdmc:/switch/wine/horizon-trace.log", "a" );
+    if (f)
     {
         __builtin_va_start( args, fmt );
         vfprintf( f, fmt, args );
         __builtin_va_end( args );
         fputc( '\n', f );
-        fclose( f );
+        fflush( f );
     }
     pthread_mutex_unlock( &lock );
 }
