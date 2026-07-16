@@ -51,9 +51,22 @@ extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 static void nx_trace_winproc( const char *stage, const struct win_proc_params *params,
                               NTSTATUS status, ULONG ret_len )
 {
+    /* wine_nx_runtime_trace() fflush()es unconditionally, every call -- for
+     * any app that dispatches WM_PAINT the normal way (BeginPaint/EndPaint,
+     * e.g. gui_smoke.c), this fires twice per paint cycle (init + return,
+     * both call sites below) with no rate limit at all. Same bug class
+     * chased repeatedly last session in dce.c/winnx_drv.c/dibdrv/dc.c/
+     * runtime_deko3d.c, found here while sweeping the rest of the paint hot
+     * path for anything the earlier fixes missed. Doesn't affect
+     * direct_blit.c's own numbers (it barely dispatches WM_PAINT at all
+     * in steady state), but is a real, unaddressed cost for the general
+     * BeginPaint/WM_PAINT path most real apps use. Capped at 40 samples,
+     * matching the convention already used in dibdrv/dc.c. */
+    static int logged;
     char buf[224];
 
     if (!&wine_nx_runtime_trace || params->msg != WM_PAINT) return;
+    if (logged++ >= 40) return;
     snprintf( buf, sizeof(buf),
               "[NXWINPROC] %s hwnd=%p func=%p procA=%p procW=%p ansi=%u dst=%u status=%08x ret=%u",
               stage, params->hwnd, params->func, params->procA, params->procW,
