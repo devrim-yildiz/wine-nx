@@ -2957,13 +2957,24 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
     else if (!hrgn)
     {
 #ifdef __SWITCH__
-        /* UpdateWindow()'s exact call shape: no explicit rect/region. Combine
-         * the redraw with switch_update_now()'s first search into one round
-         * trip instead of two -- see switch_redraw_window_updatenow() above.
-         * hwnd != 0 && hwnd != desktop matches the exact condition under
-         * which switch_update_now() itself would not take its early-return
-         * desktop branch, so behavior stays equivalent either way. */
-        if (wine_nx_batch_redraw_updatenow_enabled && (flags & RDW_UPDATENOW) &&
+        /* Genuine same-call combine: RDW_INVALIDATE and RDW_UPDATENOW both
+         * set on ONE NtUserRedrawWindow call (e.g. an app calling
+         * RedrawWindow() directly instead of InvalidateRect()+UpdateWindow()).
+         * Bug fixed here: this used to check RDW_UPDATENOW alone, which
+         * ALSO matches UpdateWindow()'s own call (RDW_UPDATENOW only, no
+         * RDW_INVALIDATE) -- meaning it unconditionally intercepted every
+         * UpdateWindow() call, set combined_done, and skipped
+         * switch_update_now() entirely, so the redraw_window-reply cache
+         * below (switch_update_now(), populated by InvalidateRect()'s own
+         * earlier redraw_window_rects() call) never got a chance to run.
+         * Confirmed on hardware: redraw_window and redraw_window_updatenow
+         * both fired once per frame, same 2-round-trip cost as before this
+         * "fix" existed. Requiring RDW_INVALIDATE here restores the
+         * fall-through below for UpdateWindow()'s own call, which is where
+         * the real saving happens now. hwnd != 0 && hwnd != desktop matches
+         * the exact condition under which switch_update_now() itself would
+         * not take its early-return desktop branch. */
+        if (wine_nx_batch_redraw_updatenow_enabled && (flags & RDW_UPDATENOW) && (flags & RDW_INVALIDATE) &&
             wine_nx_skip_redundant_update_check_enabled &&
             hwnd && hwnd != get_desktop_window())
         {
@@ -2973,6 +2984,12 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
         }
         else
 #endif
+        /* UpdateWindow()'s own call (RDW_UPDATENOW, no RDW_INVALIDATE) hits
+         * this too -- redraw_window_rects()'s own early-return guard
+         * ("nothing to do" when none of RDW_INVALIDATE/VALIDATE/
+         * INTERNALPAINT/NOINTERNALPAINT are set) makes that a cheap no-op,
+         * not a wasted IPC call, leaving switch_update_now() below free to
+         * check its cache. */
         ret = redraw_window_rects( hwnd, flags, NULL, 0 );
     }
     else  /* need to build a list of the region rectangles */
