@@ -2017,19 +2017,32 @@ HWND WINAPI NtUserWindowFromDC( HDC hdc )
  * Gated off by default behind wine_nx_batch_paint_regions_enabled
  * (WINE_NX_BATCH_PAINT_REGIONS env var / sdmc:/switch/wine/batchpaint.txt).
  */
+/* Same experimental malloc-elimination as switch_prefetch_static_buf below
+ * (see its comment) -- this is switch_prefetch_paint_regions()'s other two
+ * allocations, one per region, both on the same per-frame hot path. Two
+ * sequential, non-overlapping call sites only (both inside
+ * switch_prefetch_paint_regions() itself: update region first, then
+ * visible region), never nested or concurrent, so one shared static
+ * buffer reused across both calls is safe. */
+#define SWITCH_BUILD_REGION_STATIC_BUF_SIZE 512
+static __thread unsigned char switch_build_region_static_buf[sizeof(RGNDATA) + SWITCH_BUILD_REGION_STATIC_BUF_SIZE];
+
 static HRGN switch_build_region_from_bytes( const void *bytes, size_t byte_size )
 {
     RGNDATA *data;
     HRGN hrgn;
+    int data_is_static = byte_size <= SWITCH_BUILD_REGION_STATIC_BUF_SIZE;
 
-    if (!(data = malloc( sizeof(*data) + byte_size ))) return 0;
+    if (data_is_static) data = (RGNDATA *)switch_build_region_static_buf;
+    else if (!(data = malloc( sizeof(*data) + byte_size ))) return 0;
+
     data->rdh.dwSize   = sizeof(data->rdh);
     data->rdh.iType    = RDH_RECTANGLES;
     data->rdh.nCount   = byte_size / sizeof(RECT);
     data->rdh.nRgnSize = byte_size;
     if (byte_size) memcpy( data->Buffer, bytes, byte_size );
     hrgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
-    free( data );
+    if (!data_is_static) free( data );
     return hrgn;
 }
 
