@@ -185,6 +185,10 @@ void wine_nx_hud_draw( void *bits, int fb_w, int fb_h, int stride );
  * declared here so backend selection can reuse the exact same file-based
  * config pattern instead of inventing a second one. */
 static int read_bool_file( const char *path );
+/* Defined alongside read_bool_file below; see the long comment there. */
+static int wine_nx_resolve_bool_toggle( const char *env_name, const char *config_key,
+                                        const char *legacy_path, const char **source_out );
+static int wine_nx_config_get_bool( const char *key );
 
 /* Backend selection: additive and opt-in, same spirit as WINE_NX_HOST_SIM
  * gating the win32u display driver choice in dlls/win32u/driver.c. Default
@@ -211,16 +215,13 @@ static int wine_nx_fb_use_deko3d;
 
 static void wine_nx_fb_backend_select(void)
 {
-    const char *env;
-    int file_flag;
+    const char *source;
     if (wine_nx_fb_backend_checked) return;
     wine_nx_fb_backend_checked = 1;
-    env = getenv( "WINE_NX_DEKO3D" );
-    file_flag = read_bool_file( RUNTIME_DIR "/deko3d.txt" );
-    wine_nx_fb_use_deko3d = (env && env[0]) || file_flag;
-    log_line( "[NXFB] backend: %s (env=%s file=%s)",
-             wine_nx_fb_use_deko3d ? "deko3d" : "libnx framebuffer (default)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+    wine_nx_fb_use_deko3d = wine_nx_resolve_bool_toggle( "WINE_NX_DEKO3D", "deko3d",
+                                                          RUNTIME_DIR "/deko3d.txt", &source );
+    log_line( "[NXFB] backend: %s (source=%s)",
+             wine_nx_fb_use_deko3d ? "deko3d" : "libnx framebuffer (default)", source );
 }
 
 /* Off by default. The raw per-syscall [SYSCALL] entry/exit trace in
@@ -237,12 +238,11 @@ int wine_nx_syscall_trace_enabled;
 
 static void wine_nx_syscall_trace_select(void)
 {
-    const char *env = getenv( "WINE_NX_SYSCALL_TRACE" );
-    int file_flag = read_bool_file( RUNTIME_DIR "/systrace.txt" );
-    wine_nx_syscall_trace_enabled = (env && env[0]) || file_flag;
-    log_line( "[NXTRACE] raw syscall trace: %s (env=%s file=%s)",
-             wine_nx_syscall_trace_enabled ? "ON" : "off (default)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+    const char *source;
+    wine_nx_syscall_trace_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_SYSCALL_TRACE", "systrace",
+                                                                  RUNTIME_DIR "/systrace.txt", &source );
+    log_line( "[NXTRACE] raw syscall trace: %s (source=%s)",
+             wine_nx_syscall_trace_enabled ? "ON" : "off (default)", source );
 }
 
 /* Off by default, same reasoning and same pattern as
@@ -262,12 +262,11 @@ int wine_nx_paint_trace_enabled;
 
 static void wine_nx_paint_trace_select(void)
 {
-    const char *env = getenv( "WINE_NX_PAINT_TRACE" );
-    int file_flag = read_bool_file( RUNTIME_DIR "/painttrace.txt" );
-    wine_nx_paint_trace_enabled = (env && env[0]) || file_flag;
-    log_line( "[NXTRACE] paint sub-phase trace: %s (env=%s file=%s)",
-             wine_nx_paint_trace_enabled ? "ON" : "off (default)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+    const char *source;
+    wine_nx_paint_trace_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_PAINT_TRACE", "painttrace",
+                                                                RUNTIME_DIR "/painttrace.txt", &source );
+    log_line( "[NXTRACE] paint sub-phase trace: %s (source=%s)",
+             wine_nx_paint_trace_enabled ? "ON" : "off (default)", source );
 }
 
 /* Off by default -- default = current, real behavior; ON = the legacy
@@ -300,13 +299,12 @@ int wine_nx_flush_legacy_enabled;
 
 static void wine_nx_flush_legacy_select(void)
 {
-    const char *env = getenv( "WINE_NX_FLUSH_LEGACY" );
-    int file_flag = read_bool_file( RUNTIME_DIR "/flushlegacy.txt" );
-    wine_nx_flush_legacy_enabled = (env && env[0]) || file_flag;
-    log_line( "[NXTRACE] flush_window_surfaces legacy always-skip mode: %s (env=%s file=%s)",
+    const char *source;
+    wine_nx_flush_legacy_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_FLUSH_LEGACY", "flushlegacy",
+                                                                 RUNTIME_DIR "/flushlegacy.txt", &source );
+    log_line( "[NXTRACE] flush_window_surfaces legacy always-skip mode: %s (source=%s)",
              wine_nx_flush_legacy_enabled ? "ON (idle=TRUE debounce forced to always skip, pre-clock-fix behavior)"
-                                          : "off (default: real 50ms debounce, current behavior)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+                                          : "off (default: real 50ms debounce, current behavior)", source );
 }
 
 /* Off by default -- this is a real protocol change (a new combined
@@ -332,13 +330,13 @@ int wine_nx_batch_paint_regions_enabled;
 
 static void wine_nx_batch_paint_regions_select(void)
 {
-    const char *env = getenv( "WINE_NX_BATCH_PAINT_REGIONS" );
-    int file_flag = read_bool_file( RUNTIME_DIR "/batchpaint.txt" );
-    wine_nx_batch_paint_regions_enabled = (env && env[0]) || file_flag;
-    log_line( "[NXTRACE] combined get_paint_regions mode: %s (env=%s file=%s)",
+    const char *source;
+    wine_nx_batch_paint_regions_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_BATCH_PAINT_REGIONS", "batchpaint",
+                                                                        RUNTIME_DIR "/batchpaint.txt", &source );
+    log_line( "[NXTRACE] combined get_paint_regions mode: %s (source=%s)",
              wine_nx_batch_paint_regions_enabled ? "ON (one combined IPC round trip for BeginPaint)"
                                                  : "off (default: separate get_update_region + get_visible_region calls)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+             source );
 }
 
 /* Off by default -- same correctness-risk-change reasoning as
@@ -363,13 +361,13 @@ int wine_nx_skip_redundant_update_check_enabled;
 
 static void wine_nx_skip_redundant_update_check_select(void)
 {
-    const char *env = getenv( "WINE_NX_SKIP_REDUNDANT_UPDATE_CHECK" );
-    int file_flag = read_bool_file( RUNTIME_DIR "/skipupdatecheck.txt" );
-    wine_nx_skip_redundant_update_check_enabled = (env && env[0]) || file_flag;
-    log_line( "[NXTRACE] update_now redundant-check skip: %s (env=%s file=%s)",
+    const char *source;
+    wine_nx_skip_redundant_update_check_enabled = wine_nx_resolve_bool_toggle(
+        "WINE_NX_SKIP_REDUNDANT_UPDATE_CHECK", "skipupdatecheck", RUNTIME_DIR "/skipupdatecheck.txt", &source );
+    log_line( "[NXTRACE] update_now redundant-check skip: %s (source=%s)",
              wine_nx_skip_redundant_update_check_enabled ? "ON (skips proven-empty follow-up get_update_region calls)"
                                                          : "off (default: update_now()'s original always-double-check behavior)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+             source );
 }
 
 /* Off by default -- see the long comment on FLUSH_PERIOD in
@@ -389,13 +387,39 @@ int wine_nx_fast_flush_period_enabled;
 
 static void wine_nx_fast_flush_period_select(void)
 {
-    const char *env = getenv( "WINE_NX_FAST_FLUSH_PERIOD" );
-    int file_flag = read_bool_file( RUNTIME_DIR "/fastflushperiod.txt" );
-    wine_nx_fast_flush_period_enabled = (env && env[0]) || file_flag;
-    log_line( "[NXTRACE] dibdrv FLUSH_PERIOD: %s (env=%s file=%s)",
+    const char *source;
+    wine_nx_fast_flush_period_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_FAST_FLUSH_PERIOD", "fastflushperiod",
+                                                                      RUNTIME_DIR "/fastflushperiod.txt", &source );
+    log_line( "[NXTRACE] dibdrv FLUSH_PERIOD: %s (source=%s)",
              wine_nx_fast_flush_period_enabled ? "16ms (~60Hz-matched, EXPERIMENTAL, untested on hardware)"
-                                               : "50ms (default: real Wine's original value)",
-             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+                                               : "50ms (default: real Wine's original value)", source );
+}
+
+/* Off by default -- same correctness-risk-change reasoning as
+ * wine_nx_batch_paint_regions_enabled above, applied to
+ * switch_redraw_window_updatenow() (dlls/win32u/dce.c): merges
+ * NtUserRedrawWindow's own redraw_window call with switch_update_now()'s
+ * first get_update_flags_ex search into one round trip, for the specific
+ * no-rect/RDW_UPDATENOW call shape UpdateWindow() actually uses. Only takes
+ * effect when wine_nx_skip_redundant_update_check_enabled is also on, since
+ * it depends on switch_update_now() existing. Genuinely untested on
+ * hardware -- unlike the other toggles here, this one touches
+ * NtUserRedrawWindow's own control flow (gated off by default, additive,
+ * falls back to the exact original two-call path when off), not just a
+ * diagnostic or a purely-additive protocol used from one call site. No
+ * dedicated .txt file for this one -- config.txt only, per the "stop adding
+ * one file per toggle" cleanup above. */
+int wine_nx_batch_redraw_updatenow_enabled;
+
+static void wine_nx_batch_redraw_updatenow_select(void)
+{
+    const char *env = getenv( "WINE_NX_BATCH_REDRAW_UPDATENOW" );
+    if (env && env[0]) wine_nx_batch_redraw_updatenow_enabled = 1;
+    else wine_nx_batch_redraw_updatenow_enabled = wine_nx_config_get_bool( "batchredrawupdatenow" );
+    log_line( "[NXTRACE] combined redraw_window+get_update_flags_ex mode: %s (source=%s)",
+             wine_nx_batch_redraw_updatenow_enabled ? "ON (one combined IPC round trip for UpdateWindow's first search)"
+                                                    : "off (default: separate redraw_window + get_update_flags_ex calls)",
+             (env && env[0]) ? "env" : (wine_nx_batch_redraw_updatenow_enabled ? "config.txt" : "default") );
 }
 
 #ifdef WINE_NX_DEKO3D_ONLY
@@ -1025,6 +1049,108 @@ static int read_bool_file( const char *path )
            !strcasecmp( line, "yes" ) || !strcasecmp( line, "run" );
 }
 
+/* One consolidated config file (sdmc:/switch/wine/config.txt) instead of a
+ * separate standalone .txt per toggle -- every new A/B flag this project
+ * has added has meant one more file on the SD card to remember, sync, and
+ * keep straight; this puts all of them (and args.txt/target.txt/
+ * run-entry.txt's data) in one place going forward. Format: one KEY=VALUE
+ * per line, or a bare KEY (implies true); '#' starts a comment; blank lines
+ * ignored. Case-insensitive keys. Still falls back to the original
+ * standalone-file convention per key (lowest priority, after env var and
+ * this file) so nothing already on anyone's SD card breaks -- but every
+ * *new* toggle from here on should only ever gain a config.txt key, never
+ * another dedicated file. */
+#define WINE_NX_CONFIG_MAX_ENTRIES 32
+static struct
+{
+    char key[32];
+    char value[64];
+} wine_nx_config_entries[WINE_NX_CONFIG_MAX_ENTRIES];
+static int wine_nx_config_entry_count;
+static int wine_nx_config_loaded;
+
+static void wine_nx_config_load(void)
+{
+    FILE *file;
+    char line[128];
+
+    if (wine_nx_config_loaded) return;
+    wine_nx_config_loaded = 1;
+
+    if (!(file = fopen( RUNTIME_DIR "/config.txt", "r" ))) return;
+
+    while (fgets( line, sizeof(line), file ) && wine_nx_config_entry_count < WINE_NX_CONFIG_MAX_ENTRIES)
+    {
+        char *key, *value, *eq, *end;
+
+        trim_line( line );
+        key = line;
+        while (*key == ' ' || *key == '\t') key++;
+        if (!key[0] || key[0] == '#') continue;
+
+        if ((eq = strchr( key, '=' )))
+        {
+            *eq = 0;
+            value = eq + 1;
+            while (*value == ' ' || *value == '\t') value++;
+        }
+        else value = key + strlen( key );  /* no '=' -> bare key, empty value (implies true) */
+
+        end = key + strlen( key );
+        while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        if (!key[0]) continue;
+
+        snprintf( wine_nx_config_entries[wine_nx_config_entry_count].key,
+                 sizeof(wine_nx_config_entries[0].key), "%s", key );
+        snprintf( wine_nx_config_entries[wine_nx_config_entry_count].value,
+                 sizeof(wine_nx_config_entries[0].value), "%s", value );
+        wine_nx_config_entry_count++;
+    }
+    fclose( file );
+}
+
+static const char *wine_nx_config_get( const char *key )
+{
+    int i;
+
+    wine_nx_config_load();
+    for (i = 0; i < wine_nx_config_entry_count; i++)
+        if (!strcasecmp( wine_nx_config_entries[i].key, key )) return wine_nx_config_entries[i].value;
+    return NULL;
+}
+
+static int wine_nx_config_get_bool( const char *key )
+{
+    const char *value = wine_nx_config_get( key );
+
+    if (!value) return 0;
+    if (!value[0]) return 1;  /* bare key, no '=' -> true */
+    return !strcmp( value, "1" ) || !strcasecmp( value, "true" ) ||
+           !strcasecmp( value, "yes" ) || !strcasecmp( value, "run" );
+}
+
+/* Shared 3-tier resolution every boolean runtime toggle in this file uses:
+ * env var (highest priority, useful for host-sim/quick dev testing) ->
+ * config.txt key -> legacy standalone .txt file (lowest priority, kept only
+ * for backward compatibility) -> default off. *source_out is set to a short
+ * label for the log line, so it's always clear which of the three actually
+ * engaged (or that none did). */
+static int wine_nx_resolve_bool_toggle( const char *env_name, const char *config_key,
+                                        const char *legacy_path, const char **source_out )
+{
+    const char *env = getenv( env_name );
+
+    if (env && env[0]) { *source_out = "env"; return 1; }
+    if (wine_nx_config_get( config_key ))
+    {
+        *source_out = "config.txt";
+        return wine_nx_config_get_bool( config_key );
+    }
+    if (read_bool_file( legacy_path )) { *source_out = "legacy .txt file"; return 1; }
+    *source_out = "default";
+    return 0;
+}
+
 static unsigned int close_handle_object( HANDLE handle )
 {
     unsigned int status;
@@ -1187,12 +1313,20 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\",
               current_dir );
 
-    /* Read args.txt next to the target NRO (sdmc:/switch/wine/args.txt).
-     * Format expected: "<argv[0]> <args...>" — a full Win32 command line.
-     * If present, use it verbatim as CommandLine so curl etc. see args via
-     * GetCommandLineA/W. Otherwise fall back to the dos_path alone. */
+    /* Args come from config.txt's "args" key first, falling back to the
+     * standalone args.txt next to the target NRO (sdmc:/switch/wine/args.txt)
+     * for backward compatibility. Format expected either way: "<argv[0]>
+     * <args...>" — a full Win32 command line. If present, use it verbatim
+     * as CommandLine so curl etc. see args via GetCommandLineA/W. Otherwise
+     * fall back to the dos_path alone. */
     cmdline_str = dos_path;
-    if (read_first_line( RUNTIME_DIR "/args.txt", args_buf, sizeof(args_buf) ) && args_buf[0])
+    args_buf[0] = 0;
+    {
+        const char *config_args = wine_nx_config_get( "args" );
+        if (config_args && config_args[0]) snprintf( args_buf, sizeof(args_buf), "%s", config_args );
+        else read_first_line( RUNTIME_DIR "/args.txt", args_buf, sizeof(args_buf) );
+    }
+    if (args_buf[0])
     {
         snprintf( cmdline, sizeof(cmdline), "%s", args_buf );
         cmdline_str = cmdline;
@@ -1200,7 +1334,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     }
     else
     {
-        log_line( "[ARGS] no args.txt; CommandLine='%s'", cmdline_str );
+        log_line( "[ARGS] no args configured; CommandLine='%s'", cmdline_str );
     }
 
     chars = strlen( current_dir ) + 1;
@@ -1698,10 +1832,17 @@ int main( int argc, char **argv )
     wine_nx_batch_paint_regions_select();
     wine_nx_skip_redundant_update_check_select();
     wine_nx_fast_flush_period_select();
+    wine_nx_batch_redraw_updatenow_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
-    else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
-    autorun = read_bool_file( RUNTIME_DIR "/run-entry.txt" );
+    else
+    {
+        const char *config_target = wine_nx_config_get( "target" );
+        if (config_target && config_target[0]) snprintf( target, sizeof(target), "%s", config_target );
+        else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
+    }
+    autorun = wine_nx_config_get( "run-entry" ) ? wine_nx_config_get_bool( "run-entry" )
+                                                : read_bool_file( RUNTIME_DIR "/run-entry.txt" );
 
     log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
     log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
