@@ -41,6 +41,9 @@ static const DWORD bit_fields_555[3] = {0x7c00, 0x03e0, 0x001f};
 
 #ifdef __SWITCH__
 extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+/* wine-nx-probe/source/runtime.c -- see the long comment on
+ * FLUSH_PERIOD below and wine_nx_fast_flush_period_select() there. */
+extern int wine_nx_fast_flush_period_enabled;
 
 static void nxwin_trace( const char *fmt, ... )
 {
@@ -540,7 +543,34 @@ const struct gdi_dc_funcs dib_driver =
  * can paint to the same window.
  */
 
+#ifdef __SWITCH__
+/* Real Wine's original 50ms value was presumably tuned for desktop/X11-
+ * scale compositing costs. On this port, with the fflush-contamination
+ * bugs found and fixed elsewhere this session, window_surface_flush's
+ * actual cost (measured via surface_funcs_flush) settled to ~7ms in
+ * steady state on real hardware -- not the ~42-52ms it looked like before
+ * those fixes. A flush this cheap can plausibly afford to fire roughly 3x
+ * more often without meaningfully increasing total CPU cost, letting
+ * dibdrv's own automatic trigger present fresher frames sooner instead of
+ * accumulating up to 50ms of unflushed drawing every time. 16ms matches
+ * the ~60Hz cadence WINE_NX_FB_MIN_PRESENT_INTERVAL_MS already uses
+ * elsewhere in this project for the same kind of reasoning.
+ *
+ * Genuinely uncertain without hardware, stated plainly rather than
+ * assumed correct: this reasoning is built entirely on the STEADY-STATE
+ * flush cost; it does not account for whether presenting more often has
+ * costs this session hasn't measured (e.g. GPU-side back-pressure that
+ * scales with present frequency, or increased contention on g_dk_mutex
+ * from wine_nx_drv_ProcessEvents's own present() calls now finding fresh
+ * dirty content more often). Could make fps worse, not better, if either
+ * of those turns out to matter. Toggle-gated so it can be A/B tested
+ * against the original 50ms value in one binary/session, off by default,
+ * same discipline as every correctness/performance-risk change in this
+ * project. */
+#define FLUSH_PERIOD (wine_nx_fast_flush_period_enabled ? 16 : 50)
+#else
 #define FLUSH_PERIOD 50  /* time in ms since drawing started for forcing a surface flush */
+#endif
 
 struct windrv_physdev
 {

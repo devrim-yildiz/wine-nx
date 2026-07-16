@@ -372,6 +372,32 @@ static void wine_nx_skip_redundant_update_check_select(void)
              (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
 }
 
+/* Off by default -- see the long comment on FLUSH_PERIOD in
+ * dlls/win32u/dibdrv/dc.c. Real Wine's dibdrv forces a surface flush
+ * whenever a window has been continuously dirty for longer than
+ * FLUSH_PERIOD; this port's actual flush cost measured far cheaper
+ * (~7ms steady-state) than the original 50ms value suggests it should
+ * need to be, once the fflush-contamination bugs found elsewhere this
+ * session were fixed. ON tries a ~60Hz-matched 16ms period instead,
+ * letting frames present sooner without (in theory) meaningfully raising
+ * total CPU cost, since each flush is now cheap. Genuinely untested on
+ * hardware -- this is a bet that presenting more often doesn't have
+ * costs this session hasn't measured (GPU-side back-pressure, mutex
+ * contention from more frequent present() calls). A/B this against the
+ * default 50ms in one binary/session, same as every other toggle here. */
+int wine_nx_fast_flush_period_enabled;
+
+static void wine_nx_fast_flush_period_select(void)
+{
+    const char *env = getenv( "WINE_NX_FAST_FLUSH_PERIOD" );
+    int file_flag = read_bool_file( RUNTIME_DIR "/fastflushperiod.txt" );
+    wine_nx_fast_flush_period_enabled = (env && env[0]) || file_flag;
+    log_line( "[NXTRACE] dibdrv FLUSH_PERIOD: %s (env=%s file=%s)",
+             wine_nx_fast_flush_period_enabled ? "16ms (~60Hz-matched, EXPERIMENTAL, untested on hardware)"
+                                               : "50ms (default: real Wine's original value)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
 #ifdef WINE_NX_DEKO3D_ONLY
 
 /* This build's entire purpose is to never make this call -- deko3d must be
@@ -1671,6 +1697,7 @@ int main( int argc, char **argv )
     wine_nx_flush_legacy_select();
     wine_nx_batch_paint_regions_select();
     wine_nx_skip_redundant_update_check_select();
+    wine_nx_fast_flush_period_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
