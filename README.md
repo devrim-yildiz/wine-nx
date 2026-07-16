@@ -24,11 +24,15 @@ NTDLL substrate are his foundation. This fork continues that work.
   checked directly against the real toolchain: NVK is structurally
   impossible on Horizon OS (no DRM subsystem). deko3d is the real path,
   and it works.
-- **A platform-wide performance bug found and fixed** — a diagnostic
-  logging system was silently flushing to the SD card on every syscall,
-  costing every app on this port real frame time. Fixing it doubled
-  frame rate on the software-rendered GDI test target (2fps → 4fps) —
-  a separate, still-open investigation from the GPU compositor above.
+- **A recurring platform-wide performance bug, found and fixed six times
+  over** — an unconditional SD-card `fflush()` hiding inside diagnostic
+  logging, syscall tracing, and even GDI's own dispatch layer, each
+  instance costing every app on this port real frame time. Chasing it
+  down (plus a provably-safe redundant-IPC-call skip in `update_now()`)
+  took the software-rendered GDI test target from 2fps at the start of
+  this investigation to a hardware-confirmed 8fps today — still
+  CPU-bound, not GPU-bound (deko3d itself holds 60fps in isolation, see
+  below).
 - **A full host-side development loop** — build and test the presentation/
   input code on macOS or Linux with zero Switch hardware required.
   
@@ -612,6 +616,116 @@ if presentation is rate-limited independently of `paint_avg`, shaving
 `paint_avg` further won't move fps until that cap is found and accounted
 for either.
 
+### Is 5-6fps a `gui_smoke.c`-Specific Ceiling, or the Whole Port?
+
+A minimal Win32 PE app (`samples/direct-blit/direct_blit.c`,
+`WINE_NX_APP=blit`) was built specifically to answer this -- one that
+never calls `InvalidateRect`/`UpdateWindow`/`BeginPaint`/`EndPaint` in its
+steady-state loop, relying entirely on `GetDC()` called once (cached)
+plus a direct `StretchDIBits()` per frame, deliberately bypassing the
+entire GDI paint-message IPC chain `gui_smoke.c` exercises.
+
+Two things resolved this cleanly:
+
+1. **This port has no OpenGL/D3D driver at all** -- confirmed directly
+   against source (`dlls/win32u/driver.c`'s `nulldrv_OpenGLInit()` returns
+   `STATUS_NOT_IMPLEMENTED` unconditionally, never overridden). Vulkan/
+   vkd3d/DXVK are separately ruled out (see "Deko3d Bring-Up Smoke Test"
+   above -- no DRM subsystem for NVK to attach to). A real GPU-rendering
+   Win32 app can't be built as a minimal test case here; that would mean
+   writing a new WGL driver backend from scratch.
+2. **`deko3d_smoke.c`** (a standalone libnx test, not a Wine PE app at
+   all) already proves the raw GPU render+present path itself holds
+   **60-62fps** on this exact hardware -- so whatever's limiting
+   `gui_smoke.c` isn't the hardware or the presentation mechanism.
+
+`direct_blit.c`'s own numbers confirmed the port-wide-ceiling theory,
+though not for the reason first assumed: with no `BeginPaint`/`EndPaint`
+at all, painting instead falls entirely on real Wine's own `dibdrv`
+`FLUSH_PERIOD` mechanism (`dlls/win32u/dibdrv/dc.c` -- a surface flush
+forced whenever a window's been continuously dirty longer than 50ms,
+upstream code, not Switch-specific), triggered synchronously inside the
+drawing call itself. fps landed in the same 5-7 range `gui_smoke.c` hits,
+for an entirely different-looking reason.
+
+### A Recurring Bug: Unconditional fflush() Hiding in Diagnostic Code
+
+Chasing two ~2.7-second stalls in `direct_blit.c`'s own hardware log
+(`fb_lock_call` hit 262ms/200ms against a normal ~7-9ms; `surface_funcs_flush`
+hit 542ms against a normal ~42-52ms, while the GPU-side `dkFenceWait`'s own
+self-reported duration stayed 0ms throughout) led to the same bug, found
+and fixed six separate times across this investigation: a diagnostic
+trace call with **no rate limit at all**, unconditionally `fflush()`ing
+to the SD card on every call. Once in `trace_surface_samples()` (first 40
+frames of every run), once in `winnx_drv.c`'s per-pixel-loop trace (every
+frame, forever), three times in `wine_nx_deko3d_trace()`'s per-present
+calls (`fenceWait`/`dkQueueAcquireImage`/`submit+signal+present`, all
+three unrate-limited), once in `dibdrv/dc.c`'s `windrv_StretchDIBits`/
+`windrv_PutImage` (up to 5 unconditional calls per single `StretchDIBits`
+call -- confirmed via hardware log that both fire for the same logical
+call), and once more in `message.c`'s `nx_trace_winproc()` (fires on
+every `WM_PAINT` dispatch). All six rate-limited to a fixed sample count
+(40 or 5, matching whichever convention already existed in that file),
+same pattern each time.
+
+Hardware-confirmed: the two 2.7-second stalls are gone (`NtGetTickCount64`
+samples now land within ~30-40ms of the expected 1000ms interval for a
+full 19-second run, versus multi-second gaps before), `presents/sec`
+climbed from a chaotic 5-7 (dipping to 1 during the stalls) to a stable
+8-9, and `surface_funcs_flush`'s steady-state average dropped from
+~42-52ms to ~7ms -- most of what looked like real CPU-side
+pixel-conversion cost turned out to be this same bug, not genuine
+conversion work.
+
+### `update_now()`'s Redundant Round Trip: Skipped, Provably Safe
+
+`update_now()`'s loop always calls `get_update_flags()` twice per
+`WM_PAINT` dispatch -- `UpdateWindow()`'s own `RDW_ALLCHILDREN` forces
+this even for a window with zero children, where the second call is
+provably guaranteed to find nothing (confirmed against
+`horizon_server_find_window_update_locked`'s exact recursion, not
+assumed). A new `get_update_flags_ex` protocol (ID 311) folds a
+`has_children` bit into the existing round trip at zero extra cost, and a
+`switch_window_tree_generation` counter (bumped on every
+`NtUserCreateWindowEx`/`NtUserSetParent` call, attempted or not) lets the
+skip be proven safe rather than assumed: the window must have had zero
+children before dispatch *and* nothing must have created or reparented a
+window during the synchronous `WM_PAINT` handling. Either condition
+failing falls through to the exact calls `update_now()` would have made.
+Gated behind `WINE_NX_SKIP_REDUNDANT_UPDATE_CHECK`, off by default.
+
+Hardware-confirmed: exactly one `get_update_flags_ex` call per frame
+instead of two, zero fallbacks logged across a full test run.
+
+### Where fps Actually Landed: 5-6 -> 8, IPC Round Trips 5 -> 3
+
+Combining the fflush-per-call fix, the `update_now()` skip, and the
+`windrv_StretchDIBits`/`PutImage` fix together on hardware:
+
+- **IPC round trips per paint cycle: 3, down from the original 5** --
+  `redraw_window` + `get_update_flags_ex` + `get_paint_regions`, one
+  each, confirmed via a perfect 1:1:1 call-count ratio across a full test
+  run.
+- **`blit_avg`: ~19-20ms -> ~2ms** (~90% reduction) -- a bigger win than
+  the `windrv_StretchDIBits` fix was scoped for, since `BitBlt`'s dibdrv
+  implementation turned out to route through the same `PutImage` dispatch
+  internally.
+- **`presents/sec`: stable 8**, up from the 5-6 baseline this entire
+  investigation started from.
+- **`paint_avg` settled at ~113-116ms**, down from ~198-241ms -- the
+  sub-phase breakdown is now small and coherent (`ncpaint`~21ms,
+  `erase`~24ms, `surface_funcs_flush`~7ms, `present_dirty`~9ms), no more
+  dominant unexplained gap.
+
+A fifth change (an A/B toggle lowering `dibdrv`'s `FLUSH_PERIOD` from
+50ms to 16ms, on the theory that a now-cheap ~7ms flush could afford to
+fire more often) was hardware-tested as a clean, honest null result --
+both `gui_smoke.c` and `direct_blit.c`'s natural paint cadence
+(60-125ms between frames) already exceeds both threshold values, so the
+flush was already firing on essentially every frame either way. Left in,
+off by default (`WINE_NX_FAST_FLUSH_PERIOD` / `sdmc:/switch/wine/fastflushperiod.txt`),
+in case a faster workload ever reaches the regime where it'd matter.
+
 ### GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)
 
 Found while debugging the animated-HUD demo's timing instrumentation (see
@@ -896,13 +1010,16 @@ longer matters since the separate binary is the real path forward and
 already works.
 
 **Current bottleneck on the deko3d binary: presentation is CPU-bound, not
-GPU-bound.** With deko3d confirmed fast (sub-ms GPU-sync) and the
-fflush/SetPixel fix above landed, the GUI smoke test runs at a
-hardware-confirmed 4fps (up from 2fps), still dominated by `paint_avg`
-(~270-300ms/frame). Remaining known contributors: ~25% from three
-synchronous IPC round-trips per paint (`redraw_window`/`get_update_region`/
-`get_visible_region`), the rest not yet identified -- see "Presentation Is
-Still Too Slow" above for the current state of that investigation.
+GPU-bound.** With deko3d confirmed fast (sub-ms GPU-sync, and
+`deko3d_smoke.c` separately holding 60-62fps in isolation) and a
+recurring unconditional-fflush bug fixed in six separate locations plus a
+provably-safe redundant-IPC-call skip landed, the GUI smoke test runs at
+a hardware-confirmed **8fps** (up from 2fps at the start of this
+investigation), with IPC round trips per paint cycle down to 3 (from the
+original 5) and `blit_avg` down ~90% (~19-20ms -> ~2ms). Still CPU-bound:
+`paint_avg` settled at ~113-116ms, with `ncpaint`/`erase`/`surface_funcs_flush`/
+`present_dirty` now a small, coherent, fully-accounted-for breakdown --
+see "Where fps Actually Landed" above for the full trail.
 
 Real Mesa **OpenGL ES** (not Vulkan) is also confirmed available in the same
 toolchain (`switch-mesa`/EGL/GLES, via a Switch-native `libdrm_nouveau`
