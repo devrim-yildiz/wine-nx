@@ -391,22 +391,6 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 /***********************************************************************
  *           server_call_unlocked
  */
-#ifdef __SWITCH__
-/* Bumped once per completed server call, regardless of request type.
- * Deliberately maximally conservative rather than paint-specific: any
- * cache keyed on "nothing else called into the server since I last
- * checked" (see switch_update_now()'s redraw_window-reply reuse,
- * dlls/win32u/dce.c) can just compare this value before and after instead
- * of tracking every individual request type that could matter -- wrong in
- * the safe direction only (an unrelated call invalidates a cache that
- * would have still been valid, costing a round trip that could have been
- * saved; never the other way around). Not atomic: this port's UI/message-
- * loop threading model makes cross-thread races here a pre-existing
- * exotic case, same reasoning already applied to switch_window_tree_
- * generation in dlls/win32u/window.c. */
-unsigned int wine_server_call_generation;
-#endif
-
 unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
@@ -423,7 +407,6 @@ unsigned int server_call_unlocked( void *req_ptr )
     if (!(ret = send_request( req )))
         ret = wait_reply( req );
 #ifdef __SWITCH__
-    wine_server_call_generation++;
     t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
     dt = t1 - t0;
     /* Log the three specific suspects unconditionally (even at 0ms, so
