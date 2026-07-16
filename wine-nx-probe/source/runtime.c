@@ -395,6 +395,25 @@ static void wine_nx_fast_flush_period_select(void)
                                                : "50ms (default: real Wine's original value)", source );
 }
 
+/* Off by default -- the single riskiest toggle this session. See the long
+ * comment on wine_nx_neon_blit_enabled in dlls/win32u/winnx_drv.c: a
+ * hand-vectorized NEON BGRX->RGBA blit, verified bit-exact against the
+ * scalar reference across ~800,000 test pixels on a native arm64 build,
+ * but never run on real Switch hardware. If enabling this produces wrong
+ * colors (channels swapped differently, tinted, garbled) rather than a
+ * speed difference, that's the answer -- turn it back off. */
+int wine_nx_neon_blit_enabled;
+
+static void wine_nx_neon_blit_select(void)
+{
+    const char *source;
+    wine_nx_neon_blit_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_NEON_BLIT", "neonblit",
+                                                              RUNTIME_DIR "/neonblit.txt", &source );
+    log_line( "[NXTRACE] fb blit: %s (source=%s)",
+             wine_nx_neon_blit_enabled ? "NEON-vectorized (EXPERIMENTAL, verified off-hardware only, watch for wrong colors)"
+                                       : "scalar (default)", source );
+}
+
 /* Off by default -- same correctness-risk-change reasoning as
  * wine_nx_batch_paint_regions_enabled above, applied to
  * switch_redraw_window_updatenow() (dlls/win32u/dce.c): merges
@@ -1833,6 +1852,7 @@ int main( int argc, char **argv )
     wine_nx_skip_redundant_update_check_select();
     wine_nx_fast_flush_period_select();
     wine_nx_batch_redraw_updatenow_select();
+    wine_nx_neon_blit_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else

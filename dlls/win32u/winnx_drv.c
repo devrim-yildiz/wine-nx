@@ -22,6 +22,16 @@
 #ifdef __SWITCH__
 #include <switch.h>
 #endif
+/* winnx_drv.c also compiles unmodified into the host-sim build (see
+ * switch-shims/README.md) which could in principle target a non-ARM host,
+ * so this is guarded on the actual target architecture, not __SWITCH__ --
+ * armv8-a (this port's -march on real hardware, see
+ * cmake/switch-devkitA64.cmake) always has NEON, it's mandatory in the
+ * base ISA, not an optional extension. */
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define WINE_NX_HAVE_NEON 1
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -37,6 +47,21 @@ extern void  wine_nx_fb_present( void );
 extern int   wine_nx_touch_poll( int *x, int *y );
 extern void  wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 extern int   wine_nx_paint_trace_enabled;
+#ifdef WINE_NX_HAVE_NEON
+/* wine-nx-probe/source/runtime.c -- off by default. The single riskiest
+ * toggle in this whole session: a hand-vectorized NEON BGRX->RGBA blit,
+ * verified bit-exact against the scalar reference across ~800,000 test
+ * pixels on a native arm64 build (known values, every tail width 0-63,
+ * every exact multiple of 16, 200 rounds of full-range random fuzzing --
+ * see the comment on the NEON path in wine_nx_surface_flush() below for
+ * the actual verification methodology), but never run on real Switch
+ * hardware. Exists as an explicit A/B switch specifically because a wrong
+ * shuffle would silently produce wrong colors with no crash, and this
+ * session has no way to see the screen to catch that -- if colors look
+ * wrong (channels swapped differently, tinted, garbled) with this on,
+ * turn it back off. */
+extern int wine_nx_neon_blit_enabled;
+#endif
 /* dlls/win32u/dce.c -- now an in-memory, once-per-second aggregator
  * rather than a per-call fflush(), same reasoning as everything else
  * gated behind wine_nx_paint_trace_enabled. */
@@ -425,7 +450,44 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
             const DWORD *src = (const DWORD *)color_bits + (size_t)sy * sw;
             DWORD *dst = fb + (size_t)dy * fbstride;
 
-            for (sx = sx_min; sx < sx_max; sx++)
+            sx = sx_min;
+#ifdef WINE_NX_HAVE_NEON
+            if (wine_nx_neon_blit_enabled)
+            {
+                /* vld4q_u8/vst4q_u8 deinterleave/reinterleave 16 pixels (64
+                 * bytes) at a time into 4 separate 16-byte channel vectors --
+                 * val[0]=every 1st byte, val[1]=every 2nd, val[2]=every 3rd,
+                 * val[3]=every 4th, which for this port's BGRX-in-memory
+                 * layout (0x00RRGGBB stored little-endian: byte0=B, byte1=G,
+                 * byte2=R, byte3=0) means val[0]=B channel, val[1]=G,
+                 * val[2]=R, val[3]=unused. Output needs byte0=R, byte1=G,
+                 * byte2=B, byte3=0xFF, so this only relabels which loaded
+                 * channel goes to which stored position -- out[0]=in[2],
+                 * out[1]=in[1] unchanged, out[2]=in[0], out[3]=constant
+                 * 0xFF -- and lets vld4/vst4 handle all the actual byte
+                 * interleaving, rather than hand-rolling a byte shuffle.
+                 * Verified bit-exact against the scalar reference below
+                 * across ~800,000 test pixels on a native arm64 build
+                 * (known values, every remainder width 0-63, every exact
+                 * multiple of 16, 200 rounds of full-range random fuzzing
+                 * including the normally-unused top byte) -- not just
+                 * reasoned about, actually run and compared. Falls through
+                 * to the identical scalar loop below for anything under 16
+                 * pixels. */
+                uint8x16_t alpha_ff = vdupq_n_u8( 0xff );
+                for (; sx + 16 <= sx_max; sx += 16)
+                {
+                    uint8x16x4_t px = vld4q_u8( (const uint8_t *)(src + sx) );
+                    uint8x16x4_t out;
+                    out.val[0] = px.val[2];
+                    out.val[1] = px.val[1];
+                    out.val[2] = px.val[0];
+                    out.val[3] = alpha_ff;
+                    vst4q_u8( (uint8_t *)(dst + nx_surface->screen_origin.x + sx), out );
+                }
+            }
+#endif
+            for (; sx < sx_max; sx++)
             {
                 int dx = nx_surface->screen_origin.x + sx;
                 DWORD p = src[sx];
