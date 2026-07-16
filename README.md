@@ -7,8 +7,15 @@ no Linux layer, no x86 translation, with real GPU-accelerated rendering.**
 
 Wine-NX runs AArch64 Windows PE programs inside a Switch `.nro`, talking
 straight to Horizon OS via libnx — no Switchroot L4T, no Box64, no second
-kernel underneath. Windows GDI content renders through a real GPU compositor
-(deko3d), hardware-confirmed at 60fps with shaders and 3D geometry.
+kernel underneath. Windows GDI content is composited and presented through a
+real GPU pipeline (deko3d) instead of a linear CPU framebuffer. Two different
+numbers matter here, and they measure different things: the compositor
+itself is hardware-confirmed at **60fps** in an isolated smoke test (device/
+queue/present, real shaders and 3D geometry, no Wine involved); the full
+Win32 GUI pipeline that feeds it — message loop, GDI drawing, Wine's
+client/server IPC, all upstream of the compositor — is a separate,
+still-CPU-bound layer currently at a hardware-confirmed **8fps** end to end.
+See "What's new in this fork" below for both.
 
 Originally started by [dantiicu](https://github.com/dantiicu/wine-nx) as an
 early Horizon/libnx Wine bring-up — the loader, initial win32u driver, and
@@ -16,29 +23,35 @@ NTDLL substrate are his foundation. This fork continues that work.
 
 ## What's new in this fork
 
-- **GPU-accelerated presentation, hardware-confirmed at 60fps** — real
-  Win32 GDI output rendered through deko3d (device/queue/swapchain, texture
-  upload, shader-driven 3D geometry), replacing the original software
-  framebuffer path.
+- **A real GPU compositor (deko3d), hardware-confirmed at 60fps in
+  isolation** — device/queue/swapchain, texture upload, shader-driven 3D
+  geometry, replacing the original software framebuffer path. This is the
+  presentation *mechanism*, proven fast on its own; it's not yet what
+  limits real GDI app framerate today (see the next bullet).
 - **The Vulkan/NVK question, settled with evidence, not assumption** —
-  checked directly against the real toolchain: NVK is structurally
-  impossible on Horizon OS (no DRM subsystem). deko3d is the real path,
-  and it works.
-- **A recurring platform-wide performance bug, found and fixed six times
-  over** — an unconditional SD-card `fflush()` hiding inside diagnostic
-  logging, syscall tracing, and even GDI's own dispatch layer, each
-  instance costing every app on this port real frame time. Chasing it
-  down (plus a provably-safe redundant-IPC-call skip in `update_now()`)
-  took the software-rendered GDI test target from 2fps at the start of
-  this investigation to a hardware-confirmed 8fps today — still
-  CPU-bound, not GPU-bound (deko3d itself holds 60fps in isolation, see
-  below).
+  checked directly against the real toolchain: Mesa's NVK driver (the only
+  Vulkan implementation anywhere in that toolchain) depends on Linux's
+  `nouveau` DRM kernel driver, which Horizon OS doesn't have — Switch
+  homebrew talks to the GPU through Horizon's own `nvhost`/`nvmap` IPC
+  instead. NVK specifically can't run here; deko3d is the real, working
+  path.
+- **The same class of performance bug, independently found in six
+  different subsystems** — diagnostic logging, syscall tracing, and GDI's
+  own dispatch layer each turned out to unconditionally `fflush()` to the
+  SD card on every call, silently taxing every app on this port. Fixing
+  all six (plus a provably-safe redundant-IPC-call skip in `update_now()`)
+  took the software-rendered GDI test target — the actual Win32 message
+  loop feeding the compositor above, not the compositor itself — from
+  2fps at the start of this investigation to a hardware-confirmed **8fps**
+  today, still CPU-bound rather than GPU-bound. These numbers are pulled
+  directly from on-device trace logs, not eyeballed off a screen.
 - **A full host-side development loop** — build and test the presentation/
   input code on macOS or Linux with zero Switch hardware required.
-  
+
 The GPU compositor above runs against a test/demo target today, not yet
 the full Notepad app — see "Current Status" below for where the main
 Notepad milestone stands.
+
 ## Current Status
 
 As of the latest runtime work, the project can build and stage a Switch NRO
@@ -323,8 +336,15 @@ DIB/window surfaces into GPU textures, composite them, and present once per
 frame. **The Vulkan/NVK question is resolved:** checked directly against the
 devkitpro/devkita64 toolchain image (the same one `build-switch.sh` builds
 with) -- there is no Vulkan, NVK, or any Vulkan-capable driver anywhere in
-it, and there structurally can't be one under Horizon OS, since NVK is built
-on Linux's `nouveau` DRM kernel driver and Horizon isn't Linux. Real Mesa
+it, and NVK specifically cannot run under Horizon OS: it's built on Linux's
+`nouveau` DRM kernel driver (GEM/TTM buffer management, the Linux DRM/KMS
+uAPI), and Horizon has no DRM subsystem at all -- Switch homebrew talks to
+the GPU through Horizon's own `nvhost`/`nvmap` IPC services instead. That
+rules out NVK, the only Vulkan implementation that exists for this
+hardware today; it isn't a claim that no Vulkan driver could ever be
+written against `nvhost`/`nvmap` directly. The only way to run NVK itself
+here would be booting a real Linux kernel on the console (Switchroot/L4T),
+a completely different target than "Switch homebrew via libnx." Real Mesa
 **OpenGL ES** is available instead (a Switch-native `libdrm_nouveau` shim
 under the same old, pre-NVK Mesa), and **deko3d** (Switch homebrew's own
 low-level GPU API) is available too -- both bind to the same
@@ -630,8 +650,9 @@ Two things resolved this cleanly:
 1. **This port has no OpenGL/D3D driver at all** -- confirmed directly
    against source (`dlls/win32u/driver.c`'s `nulldrv_OpenGLInit()` returns
    `STATUS_NOT_IMPLEMENTED` unconditionally, never overridden). Vulkan/
-   vkd3d/DXVK are separately ruled out (see "Deko3d Bring-Up Smoke Test"
-   above -- no DRM subsystem for NVK to attach to). A real GPU-rendering
+   vkd3d/DXVK are separately ruled out too, since all three need NVK and
+   NVK can't run on Horizon OS (see "Presentation Is Still Too Slow" above
+   for the full DRM-dependency finding). A real GPU-rendering
    Win32 app can't be built as a minimal test case here; that would mean
    writing a new WGL driver backend from scratch.
 2. **`deko3d_smoke.c`** (a standalone libnx test, not a Wine PE app at
@@ -771,7 +792,9 @@ Known rough areas:
 - popup/menu z-order and invalidation still need more compositor logic;
 - touch input needs better capture, focus, drag, and double-click behavior;
 - no controller/keyboard text-input path yet;
-- no real GPU acceleration yet;
+- GPU-accelerated presentation exists (deko3d, see "What's new in this
+  fork" above) but no GPU-accelerated *rendering* for apps that need
+  OpenGL/Direct3D content — this port has no WGL/D3D driver at all;
 - Notepad works as a milestone, not as proof that arbitrary GUI apps are ready.
 
 ### Wine Subsystem Gaps
@@ -988,6 +1011,7 @@ Smoke targets:
 ```text
 wine-nx-probe/samples/gui-smoke
 wine-nx-probe/samples/curl-arm64
+wine-nx-probe/samples/direct-blit
 wine-nx-probe/source/deko3d_smoke.c
 ```
 
@@ -995,46 +1019,44 @@ wine-nx-probe/source/deko3d_smoke.c
 
 1. Presentation performance
 
-Replace or bypass the expensive linear framebuffer path. **NVK confirmed
-not available** for Switch homebrew (verified directly against the
-devkitpro/devkita64 toolchain image, not assumed), and **deko3d's core
-pipeline is hardware-confirmed working**, both in isolation (device/queue/
-swapchain/present, texture upload, and real shader-driven geometry, all at
+Real GPU compositing is no longer the open question here -- **deko3d is
+hardware-confirmed working**, both in isolation (device/queue/swapchain/
+present, texture upload, and real shader-driven geometry, all at
 60-62fps -- see "Deko3d Bring-Up Smoke Test" above) and as the actual
 compositor backend for the full Wine GUI stack, via the separate
-`wine-nx-runtime-deko3d` binary (see "Presentation Is Still Too Slow" above) --
-`wine_nx_fb_lock/unlock/present` wired to deko3d inside the original
-`wine-nx-runtime` binary is still architecturally blocked for the
-`__appInit`/`nwindowGetDefault()` reason documented there, but that no
-longer matters since the separate binary is the real path forward and
-already works.
+`wine-nx-runtime-deko3d` binary (see "Presentation Is Still Too Slow"
+above). `wine_nx_fb_lock/unlock/present` wired to deko3d inside the
+original `wine-nx-runtime` binary is still architecturally blocked for
+the `__appInit`/`nwindowGetDefault()` reason documented there, but that
+no longer matters: the separate binary is the real path forward, already
+works, and is what every fps number below was measured against.
 
-**Current bottleneck on the deko3d binary: presentation is CPU-bound, not
-GPU-bound.** With deko3d confirmed fast (sub-ms GPU-sync, and
-`deko3d_smoke.c` separately holding 60-62fps in isolation) and a
-recurring unconditional-fflush bug fixed in six separate locations plus a
-provably-safe redundant-IPC-call skip landed, the GUI smoke test runs at
-a hardware-confirmed **8fps** (up from 2fps at the start of this
-investigation), with IPC round trips per paint cycle down to 3 (from the
-original 5) and `blit_avg` down ~90% (~19-20ms -> ~2ms). Still CPU-bound:
-`paint_avg` settled at ~113-116ms, with `ncpaint`/`erase`/`surface_funcs_flush`/
-`present_dirty` now a small, coherent, fully-accounted-for breakdown --
-see "Where fps Actually Landed" above for the full trail.
+**Current bottleneck: the CPU-bound Win32/GDI/IPC pipeline feeding the
+compositor, not the compositor itself.** With deko3d confirmed fast
+(sub-ms GPU-sync, 60-62fps in isolation) and a recurring
+unconditional-fflush bug independently found and fixed in six separate
+locations, plus a provably-safe redundant-IPC-call skip landed, the GUI
+smoke test runs at a hardware-confirmed **8fps** end to end (up from
+2fps at the start of this investigation), with IPC round trips per paint
+cycle down to 3 (from the original 5) and `blit_avg` down ~90%
+(~19-20ms -> ~2ms). Still CPU-bound: `paint_avg` settled at
+~113-116ms, with `ncpaint`/`erase`/`surface_funcs_flush`/`present_dirty`
+now a small, coherent, fully-accounted-for breakdown -- see "Where fps
+Actually Landed" above for the full trail. Closing more of that gap (the
+~14ms-per-call IPC transport floor, and `update_visible_region()`'s own
+client-side cost inside the `NtUserGetDCEx` gap -- both scoped but not
+yet fixed, see "The ~14ms Per-Call IPC Floor" and "Two More Threads"
+above) is the concrete next step, not further compositor work.
 
 Real Mesa **OpenGL ES** (not Vulkan) is also confirmed available in the same
 toolchain (`switch-mesa`/EGL/GLES, via a Switch-native `libdrm_nouveau`
 shim) -- meaning Wine's existing `wined3d` OpenGL backend is a more
-realistic long-term path to real D3D acceleration on this platform than
-DXVK/vkd3d, which need Vulkan and therefore aren't viable here. Neither has
-been prototyped yet; this is still a scoping conclusion, not built code.
-Since it would hit the exact same `vi`-bootstrap conflict as deko3d if
-wired the same way, it's not a workaround for the blocker above either.
-
-With GPU compositing blocked for this binary shape, the more realistic
-near-term path is the simpler fallback already scoped:
-
-- direct block-linear dirty conversion;
-- persistent software backing store plus one present per frame.
+realistic long-term path to real D3D-content acceleration on this
+platform than DXVK/vkd3d, which need Vulkan and therefore aren't viable
+here (NVK is the only Vulkan implementation that exists for this
+hardware, and it can't run on Horizon OS -- see "The Vulkan/NVK
+question" above). Neither OpenGL ES nor a WGL driver has been
+prototyped yet; this is still a scoping conclusion, not built code.
 
 2. Input polish
 
