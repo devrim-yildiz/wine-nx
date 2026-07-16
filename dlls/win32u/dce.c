@@ -2960,7 +2960,29 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
     }
 
     /* process pending expose events before painting */
+#ifdef __SWITCH__
+    /* Not yet known whether this costs anything real on this port --
+     * process_driver_events() (message.c) can make its own set_queue_mask
+     * server call here depending on shared-queue state (queue_shm's
+     * wake_mask/changed_mask and access_time), and that call isn't wrapped
+     * by any existing phase timer (redraw_window/get_paint_regions cover
+     * the two calls this session already knows about; this one was never
+     * measured). Timed here to find out on the next hardware run instead
+     * of guessing from source alone. */
+    if (flags & RDW_UPDATENOW)
+    {
+        u64 cfe_t0 = 0, cfe_t1;
+        if (wine_nx_paint_trace_enabled) cfe_t0 = armGetSystemTick();
+        check_for_events( QS_PAINT );
+        if (wine_nx_paint_trace_enabled)
+        {
+            cfe_t1 = armGetSystemTick();
+            switch_paint_trace( "check_for_events", (unsigned int)(armTicksToNs( cfe_t1 - cfe_t0 ) / 1000000ULL) );
+        }
+    }
+#else
     if (flags & RDW_UPDATENOW) check_for_events( QS_PAINT );
+#endif
 
     if (rect && !hrgn)
     {
