@@ -2040,12 +2040,24 @@ static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
 
         SERVER_START_REQ( get_paint_regions )
         {
+#ifdef __SWITCH__
+            u64 ipc_t0 = 0, ipc_t1;
+            if (wine_nx_paint_trace_enabled) ipc_t0 = armGetSystemTick();
+#endif
             req->window        = wine_server_user_handle( hwnd );
             req->from_child    = wine_server_user_handle( child ? *child : 0 );
             req->update_flags  = *flags;
             req->visible_flags = visible_flags;
             wine_server_set_reply( req, combined->Buffer, size );
-            if (!(status = wine_server_call( req )))
+            status = wine_server_call( req );
+#ifdef __SWITCH__
+            if (wine_nx_paint_trace_enabled)
+            {
+                ipc_t1 = armGetSystemTick();
+                switch_paint_trace( "ncpaint_ipc", (unsigned int)(armTicksToNs( ipc_t1 - ipc_t0 ) / 1000000ULL) );
+            }
+#endif
+            if (!status)
             {
                 size_t update_size = reply->update_total_size;
                 size_t visible_size = reply->visible_total_size;
@@ -2726,7 +2738,28 @@ static void switch_update_now_loop( HWND hwnd, UINT rdw_flags, HWND child, UINT 
 
         if (!flags) break;
 
+#ifdef __SWITCH__
+        /* Wraps the *entire* synchronous WM_PAINT dispatch -- BeginPaint's
+         * IPC/prefetch consumption, the app's own drawing calls in between,
+         * and EndPaint's flush, all at once. Compare against the sum of
+         * ncpaint+erase+surface_funcs_flush+present_dirty (+ the app's own
+         * blit_avg/shapes_avg, measured separately in gui_smoke.c) to find
+         * out how much of paint_avg is genuinely untraced: SendMessage/
+         * DispatchMessage's own dispatch machinery, vs. the app's drawing
+         * code, vs. something this session hasn't instrumented yet. */
+        {
+            u64 wm_t0 = 0, wm_t1;
+            if (wine_nx_paint_trace_enabled) wm_t0 = armGetSystemTick();
+            send_message( child, WM_PAINT, 0, 0 );
+            if (wine_nx_paint_trace_enabled)
+            {
+                wm_t1 = armGetSystemTick();
+                switch_paint_trace( "wm_paint_dispatch", (unsigned int)(armTicksToNs( wm_t1 - wm_t0 ) / 1000000ULL) );
+            }
+        }
+#else
         send_message( child, WM_PAINT, 0, 0 );
+#endif
         if (rdw_flags & RDW_NOCHILDREN) break;
 
         if (!has_children && gen_before == switch_window_tree_generation)
