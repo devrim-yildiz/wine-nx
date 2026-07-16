@@ -76,6 +76,8 @@ static void nxwin_trace_surface_sample( const char *tag, struct window_surface *
 
 static int nxwin_text_trace_count;
 static int nxwin_patblt_trace_count;
+static int nxwin_putimage_trace_count;
+static int nxwin_stretchdibits_trace_count;
 #endif
 
 static void calc_shift_and_len(DWORD mask, int *shift, int *len)
@@ -955,10 +957,25 @@ static DWORD windrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
     dev = GET_NEXT_PHYSDEV( dev, pPutImage );
     ret = dev->funcs->pPutImage( dev, clip, info, bits, src, dst, rop );
 #ifdef __SWITCH__
-    nxwin_trace( "[NXWIN] putimage ret=%x src=%d,%d %dx%d dst=%d,%d %dx%d",
-                 (int)ret, src->x, src->y, src->width, src->height,
-                 dst->x, dst->y, dst->width, dst->height );
-    nxwin_trace_surface_sample( "[NXWIN] after put p0=%08x pc=%08x bounds=%dx%d", physdev->surface );
+    /* Unlike windrv_ExtTextOut/windrv_PatBlt just below and above, this call
+     * site was never given the same nxwin_*_trace_count rate-limiting --
+     * fires unconditionally on every PutImage dispatch (which StretchDIBits
+     * routes through internally, confirmed via hardware log: a "putimage"
+     * pair appears between every "stretchdibits" pair), fflush()ing to the
+     * SD card with no cap. Same bug class chased all last session (found
+     * in trace_surface_samples, the pixel-loop trace, and three
+     * wine_nx_deko3d_trace call sites) -- this is the same mechanism,
+     * just in the GDI dispatch layer specifically, which is exactly the
+     * "~40ms gap upstream of window_surface_flush" this attempt is
+     * chasing. Capped at 40 samples, matching windrv_ExtTextOut/
+     * windrv_PatBlt's existing convention in this same file. */
+    if (nxwin_putimage_trace_count++ < 40)
+    {
+        nxwin_trace( "[NXWIN] putimage ret=%x src=%d,%d %dx%d dst=%d,%d %dx%d",
+                     (int)ret, src->x, src->y, src->width, src->height,
+                     dst->x, dst->y, dst->width, dst->height );
+        nxwin_trace_surface_sample( "[NXWIN] after put p0=%08x pc=%08x bounds=%dx%d", physdev->surface );
+    }
 #endif
     unlock_surface( physdev );
     return ret;
@@ -1060,14 +1077,22 @@ static INT windrv_StretchDIBits( PHYSDEV dev, INT x_dst, INT y_dst, INT width_ds
     lock_surface( physdev );
     dev = GET_NEXT_PHYSDEV( dev, pStretchDIBits );
 #ifdef __SWITCH__
-    nxwin_trace( "[NXWIN] stretchdibits dst=%d,%d %dx%d src=%d,%d %dx%d",
-                 x_dst, y_dst, width_dst, height_dst, x_src, y_src, width_src, height_src );
+    /* Same unconditional-fflush gap as windrv_PutImage above -- this call
+     * site fires twice per StretchDIBits (once before dispatch, once
+     * after) with no rate limit, unlike ExtTextOut/PatBlt in this same
+     * file. Capped at 40 samples for consistency. */
+    if (nxwin_stretchdibits_trace_count < 40)
+        nxwin_trace( "[NXWIN] stretchdibits dst=%d,%d %dx%d src=%d,%d %dx%d",
+                     x_dst, y_dst, width_dst, height_dst, x_src, y_src, width_src, height_src );
 #endif
     ret = dev->funcs->pStretchDIBits( dev, x_dst, y_dst, width_dst, height_dst,
                                       x_src, y_src, width_src, height_src, bits, src_info, coloruse, rop );
 #ifdef __SWITCH__
-    nxwin_trace( "[NXWIN] stretchdibits ret=%d rop=%x", ret, (int)rop );
-    nxwin_trace_surface_sample( "[NXWIN] after stretch p0=%08x pc=%08x bounds=%dx%d", physdev->surface );
+    if (nxwin_stretchdibits_trace_count++ < 40)
+    {
+        nxwin_trace( "[NXWIN] stretchdibits ret=%d rop=%x", ret, (int)rop );
+        nxwin_trace_surface_sample( "[NXWIN] after stretch p0=%08x pc=%08x bounds=%dx%d", physdev->surface );
+    }
 #endif
     unlock_surface( physdev );
     return ret;
