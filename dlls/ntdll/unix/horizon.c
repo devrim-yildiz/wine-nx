@@ -1706,6 +1706,15 @@ struct horizon_redraw_window_request
     char pad[4];
 };
 
+/* See the comment on redraw_window_reply in server_protocol.h. */
+struct horizon_redraw_window_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int child;
+    unsigned int flags;
+    unsigned int has_children;
+};
+
 struct horizon_set_window_property_request
 {
     struct horizon_server_request_header header;
@@ -5529,9 +5538,12 @@ static int horizon_server_handle_redraw_window( struct horizon_server_connection
 {
     const struct horizon_redraw_window_request *request = (const void *)message;
     const struct horizon_rectangle *rects = (const void *)data;
-    struct horizon_user_window *window;
+    struct horizon_user_window *window, *target = NULL, *child_win;
+    struct horizon_redraw_window_reply reply;
     unsigned int count = data_size / sizeof(*rects);
     unsigned int status = HORIZON_STATUS_SUCCESS;
+
+    memset( &reply, 0, sizeof(reply) );
 
     pthread_mutex_lock( &horizon_server_objects_mutex );
     if (!(window = horizon_server_find_window_locked( request->window )))
@@ -5581,14 +5593,46 @@ static int horizon_server_handle_redraw_window( struct horizon_server_connection
                 horizon_server_redraw_children_locked( window, dirty, request->flags );
             }
         }
-        horizon_trace( "[HZPAINT] redraw hwnd=%08x flags=%x count=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d err=%08x\n",
+
+        /* Same from_child=0 search as horizon_server_handle_get_update_flags_ex,
+         * computed unconditionally (pure read, no IPC, cheap in-memory tree
+         * walk) so switch_update_now() (dlls/win32u/dce.c) can reuse this
+         * reply instead of making its own separate get_update_flags_ex call
+         * right after -- see the comment on redraw_window_reply in
+         * server_protocol.h. UPDATE_PAINT|UPDATE_INTERNALPAINT|UPDATE_NOREGION
+         * matches exactly what switch_update_now()'s own first search flags
+         * always are. */
+        {
+            int past_from = 1;
+            unsigned int search_flags = HORIZON_UPDATE_PAINT | HORIZON_UPDATE_INTERNALPAINT |
+                                        HORIZON_UPDATE_NOREGION;
+            unsigned int update_flags;
+
+            if (request->flags & HORIZON_RDW_NOCHILDREN) search_flags |= HORIZON_UPDATE_NOCHILDREN;
+            else if (request->flags & HORIZON_RDW_ALLCHILDREN) search_flags |= HORIZON_UPDATE_ALLCHILDREN;
+
+            update_flags = horizon_server_find_window_update_locked( window, NULL, search_flags,
+                                                                      &past_from, &target );
+            if (target)
+            {
+                reply.child = target->handle;
+                reply.flags = update_flags;
+            }
+            for (child_win = horizon_windows; child_win; child_win = child_win->next)
+                if (child_win->parent == window->handle) { reply.has_children = 1; break; }
+        }
+
+        horizon_trace( "[HZPAINT] redraw hwnd=%08x flags=%x count=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d "
+                       "search_child=%08x search_flags=%x search_has_children=%u err=%08x\n",
                        request->window, request->flags, count, window->has_update_rect,
                        window->has_internal_paint, window->needs_erase, window->needs_nonclient,
                        window->update_rect.left, window->update_rect.top,
-                       window->update_rect.right, window->update_rect.bottom, status );
+                       window->update_rect.right, window->update_rect.bottom,
+                       reply.child, reply.flags, reply.has_children, status );
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
-    return horizon_server_write_status( connection->reply_fd, status );
+    reply.header.error = status;
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
 }
 
 static struct horizon_window_property *horizon_server_find_window_property_locked(

@@ -90,6 +90,35 @@ extern LONG switch_window_tree_generation;
  * takes effect when wine_nx_skip_redundant_update_check_enabled is also on,
  * since it depends on switch_update_now() existing. */
 extern int wine_nx_batch_redraw_updatenow_enabled;
+/* dlls/ntdll/unix/server.c -- bumped once per completed server call of any
+ * kind. Used below (see switch_redraw_window_cache) as a maximally-safe
+ * invalidation signal: a cached redraw_window reply is only trusted if
+ * this hasn't moved since, meaning literally nothing else called into the
+ * server in between. */
+extern unsigned int wine_server_call_generation;
+
+/* Populated by redraw_window_rects() below, opportunistically reused by
+ * switch_update_now() when it immediately follows the redraw_window call
+ * that produced it with no other server call in between -- exactly
+ * InvalidateRect()+UpdateWindow()'s own idiom (the common case protocol
+ * 312 above can't help with, since RDW_INVALIDATE and RDW_UPDATENOW never
+ * share one NtUserRedrawWindow call for that idiom). See the comment on
+ * redraw_window_reply in server_protocol.h. One-shot: cleared the moment
+ * it's consumed, so a later, unrelated UpdateWindow() call never reuses
+ * stale data. __thread for the same reason switch_paint_regions_prefetch
+ * below is -- no reason to risk a cross-thread false-share even though
+ * Wine's per-window UI threading model makes this effectively
+ * single-threaded per window in practice. */
+struct switch_redraw_window_cache
+{
+    int          valid;
+    HWND         hwnd;
+    HWND         child;
+    UINT         flags;
+    BOOL         has_children;
+    unsigned int gen_after;
+};
+static __thread struct switch_redraw_window_cache switch_redraw_window_cache;
 
 /* Update 2: switch_paint_trace() itself used to fflush() one line per
  * call (log_line(), unconditional fflush) -- exactly the same mistake
@@ -2128,12 +2157,27 @@ static BOOL redraw_window_rects( HWND hwnd, UINT flags, const RECT *rects, UINT 
     if (!(flags & (RDW_INVALIDATE|RDW_VALIDATE|RDW_INTERNALPAINT|RDW_NOINTERNALPAINT)))
         return TRUE;  /* nothing to do */
 
+#ifdef __SWITCH__
+    switch_redraw_window_cache.valid = 0;
+#endif
+
     SERVER_START_REQ( redraw_window )
     {
         req->window = wine_server_user_handle( hwnd );
         req->flags  = flags;
         wine_server_add_data( req, rects, count * sizeof(RECT) );
         ret = !wine_server_call_err( req );
+#ifdef __SWITCH__
+        if (ret && wine_nx_batch_redraw_updatenow_enabled)
+        {
+            switch_redraw_window_cache.valid       = 1;
+            switch_redraw_window_cache.hwnd         = hwnd;
+            switch_redraw_window_cache.child        = wine_server_ptr_handle( reply->child );
+            switch_redraw_window_cache.flags        = reply->flags;
+            switch_redraw_window_cache.has_children = reply->has_children != 0;
+            switch_redraw_window_cache.gen_after    = wine_server_call_generation;
+        }
+#endif
     }
     SERVER_END_REQ;
     return ret;
@@ -2725,6 +2769,45 @@ static void switch_update_now( HWND hwnd, UINT rdw_flags )
         erase_now( hwnd, rdw_flags | RDW_NOCHILDREN );
         return;
     }
+
+#ifdef __SWITCH__
+    /* Opportunistic reuse of the immediately-preceding redraw_window call's
+     * reply -- see the long comment on switch_redraw_window_cache above.
+     * gen_after == wine_server_call_generation proves nothing else called
+     * into the server between that redraw_window call and right now, so
+     * the search it already computed (from_child=0, same flags this
+     * function's own first fetch would use) is still exactly correct --
+     * not stale, not guessed. One-shot: cleared immediately so a second,
+     * unrelated UpdateWindow() later never reuses it. */
+    if (wine_nx_batch_redraw_updatenow_enabled &&
+        switch_redraw_window_cache.valid &&
+        switch_redraw_window_cache.hwnd == hwnd &&
+        switch_redraw_window_cache.gen_after == wine_server_call_generation)
+    {
+        HWND child = switch_redraw_window_cache.child;
+        UINT flags = switch_redraw_window_cache.flags;
+        BOOL has_children = switch_redraw_window_cache.has_children;
+        LONG gen_before = switch_window_tree_generation;
+
+        switch_redraw_window_cache.valid = 0;
+
+        if (wine_nx_paint_trace_enabled)
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                char buf[96];
+                snprintf( buf, sizeof(buf), "[NXCACHE] redraw_window reply reused, hwnd=%x",
+                         (int)(ULONG_PTR)hwnd );
+                wine_nx_runtime_trace( buf );
+                logged++;
+            }
+        }
+
+        switch_update_now_loop( hwnd, rdw_flags, child, flags, has_children, gen_before, TRUE );
+        return;
+    }
+#endif
 
     switch_update_now_loop( hwnd, rdw_flags, 0, 0, FALSE, 0, FALSE );
 }

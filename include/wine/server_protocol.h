@@ -4025,9 +4025,23 @@ struct redraw_window_request
     /* VARARG(region,rectangles); */
     char __pad_20[4];
 };
+/* child/flags/has_children added: the exact same get_update_flags_ex-style
+ * search (from_child=0), computed unconditionally under the same lock right
+ * after the mark-dirty step, on every redraw_window call. Existing callers
+ * that only care about success/failure are unaffected (extra reply bytes
+ * they don't read); switch_update_now() (dlls/win32u/dce.c) opportunistically
+ * caches and reuses this when it immediately follows the redraw_window call
+ * that produced it with no other server call in between, saving a whole
+ * separate get_update_flags_ex round trip for that (very common -- it's
+ * InvalidateRect()+UpdateWindow()'s own idiom) case. See
+ * dlls/ntdll/unix/horizon.c, horizon_server_handle_redraw_window. */
 struct redraw_window_reply
 {
     struct reply_header __header;
+    user_handle_t  child;
+    unsigned int   flags;
+    unsigned int   has_children;
+    char __pad_20[4];
 };
 
 
