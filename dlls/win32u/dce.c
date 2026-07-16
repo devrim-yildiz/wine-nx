@@ -134,6 +134,13 @@ struct switch_redraw_window_cache
 };
 static __thread struct switch_redraw_window_cache switch_redraw_window_cache;
 
+/* Diagnostic only -- see the long comment where this is set, in
+ * redraw_window_rects() below. Measures the real gap between
+ * redraw_window's IPC call finishing and get_paint_regions's IPC call
+ * starting, to answer "is there a usable prefetch window here" with a
+ * number instead of an assumption. */
+static __thread u64 switch_redraw_to_paintregions_t0;
+
 /* Update 2: switch_paint_trace() itself used to fflush() one line per
  * call (log_line(), unconditional fflush) -- exactly the same mistake
  * as the raw syscall trace, just at this tier's own call frequency.
@@ -2101,7 +2108,16 @@ static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
         {
 #ifdef __SWITCH__
             u64 ipc_t0 = 0, ipc_t1;
-            if (wine_nx_paint_trace_enabled) ipc_t0 = armGetSystemTick();
+            if (wine_nx_paint_trace_enabled)
+            {
+                ipc_t0 = armGetSystemTick();
+                if (switch_redraw_to_paintregions_t0)
+                {
+                    switch_paint_trace( "redraw_to_paintregions_gap",
+                                        (unsigned int)(armTicksToNs( ipc_t0 - switch_redraw_to_paintregions_t0 ) / 1000000ULL) );
+                    switch_redraw_to_paintregions_t0 = 0;
+                }
+            }
 #endif
             req->window        = wine_server_user_handle( hwnd );
             req->from_child    = wine_server_user_handle( child ? *child : 0 );
@@ -2240,6 +2256,17 @@ static BOOL redraw_window_rects( HWND hwnd, UINT flags, const RECT *rects, UINT 
         ret = !wine_server_call_err( req );
 #ifdef __SWITCH__
         switch_paint_state_generation++;
+        /* Answers a specific question before any prefetch/background-thread
+         * design gets built: how much wall-clock time is there between this
+         * call finishing and switch_prefetch_paint_regions()'s own
+         * get_paint_regions call starting? That's the entire window a
+         * same-window speculative prefetch would have to complete in before
+         * being raced out by the *next* frame's redraw_window bumping
+         * switch_paint_state_generation. If gui_smoke.c's InvalidateRect+
+         * UpdateWindow are back-to-back with nothing else happening (they
+         * are, per source), this is expected to be ~0 -- logged here to
+         * prove that instead of assuming it. */
+        if (wine_nx_paint_trace_enabled) switch_redraw_to_paintregions_t0 = armGetSystemTick();
         if (ret && wine_nx_batch_redraw_updatenow_enabled)
         {
             switch_redraw_window_cache.valid       = 1;
