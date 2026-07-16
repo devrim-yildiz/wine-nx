@@ -291,6 +291,13 @@ struct horizon_fd_queue
  * cannot collide with any existing, already-numbered request type. See README,
  * "The ~14ms Per-Call IPC Floor". */
 #define HORIZON_REQ_GET_PAINT_REGIONS 310
+/* Peek-only get_update_region variant (always UPDATE_NOREGION semantics)
+ * plus a has_children bit, added so switch_update_now() (dlls/win32u/dce.c)
+ * can learn "does this window have any children" in the SAME round trip
+ * it already has to make, instead of a separate call. 311 is appended
+ * right after get_paint_regions's 310 -- verified via the same standalone
+ * host-compile check, not guessed. */
+#define HORIZON_REQ_GET_UPDATE_FLAGS_EX 311
 #define HORIZON_STATUS_SUCCESS 0
 #define HORIZON_STATUS_OBJECT_NAME_EXISTS 0x40000000u
 #define HORIZON_STATUS_ALERTED 0x00000101u
@@ -1430,6 +1437,26 @@ struct horizon_get_paint_regions_reply
     struct horizon_rectangle win_rect;
     unsigned int paint_flags;
     unsigned int visible_total_size;
+};
+
+/* Peek-only get_update_region variant (see HORIZON_REQ_GET_UPDATE_FLAGS_EX
+ * above). has_children always reflects `window` itself, computed
+ * independently of the from_child/target search -- see
+ * horizon_server_handle_get_update_flags_ex(). */
+struct horizon_get_update_flags_ex_request
+{
+    struct horizon_server_request_header header;
+    unsigned int window;
+    unsigned int from_child;
+    unsigned int flags;
+};
+
+struct horizon_get_update_flags_ex_reply
+{
+    struct horizon_server_reply_header header;
+    unsigned int child;
+    unsigned int flags;
+    unsigned int has_children;
 };
 
 struct horizon_get_message_request
@@ -5917,6 +5944,67 @@ static int horizon_server_handle_get_paint_regions( struct horizon_server_connec
                                        reply.header.error ? 0 : reply.header.reply_size );
 }
 
+/* Peek-only get_update_region variant + has_children, for switch_update_now()
+ * (dlls/win32u/dce.c). Faithfully mirrors horizon_server_handle_get_update_region's
+ * search logic for the always-UPDATE_NOREGION case (get_update_flags()'s own
+ * semantics) -- no rect data, no has_update_rect/needs_erase/needs_nonclient
+ * mutation, since UPDATE_NOREGION already skips all of that in the original
+ * handler for every call this replaces (confirmed by reading
+ * horizon_server_find_window_update_locked: it never even looks at
+ * HORIZON_UPDATE_NOREGION, that flag only ever gates the outer handler's
+ * data-attachment/mutation logic, which this handler simply never does).
+ * has_children is a separate, flat check of `window`'s own children,
+ * independent of whatever the from_child search finds -- computed under the
+ * same lock as the search, so it's a consistent snapshot of server state at
+ * the instant this call runs. switch_update_now() combines it with its own
+ * client-side generation-counter check before trusting it across the
+ * WM_PAINT dispatch that follows. */
+static int horizon_server_handle_get_update_flags_ex( struct horizon_server_connection *connection,
+                                                       const unsigned char *message )
+{
+    const struct horizon_get_update_flags_ex_request *request = (const void *)message;
+    struct horizon_get_update_flags_ex_reply reply;
+    struct horizon_user_window *window, *from_child = NULL, *target = NULL, *child;
+    unsigned int update_flags = 0;
+    int past_from;
+
+    memset( &reply, 0, sizeof(reply) );
+
+    pthread_mutex_lock( &horizon_server_objects_mutex );
+    if (!(window = horizon_server_find_window_locked( request->window )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else if (request->from_child &&
+             !(from_child = horizon_server_find_window_locked( request->from_child )))
+        reply.header.error = HORIZON_STATUS_INVALID_HANDLE;
+    else
+    {
+        past_from = !from_child;
+        update_flags = horizon_server_find_window_update_locked( window, from_child, request->flags,
+                                                                  &past_from, &target );
+        if (from_child && !past_from)
+            reply.header.error = HORIZON_STATUS_INVALID_PARAMETER;
+        else if (target)
+        {
+            reply.child = target->handle;
+            reply.flags = update_flags;
+        }
+
+        if (!reply.header.error)
+        {
+            for (child = horizon_windows; child; child = child->next)
+                if (child->parent == window->handle) { reply.has_children = 1; break; }
+        }
+
+        horizon_trace( "[HZPAINT] get_update_flags_ex hwnd=%08x from=%08x child=%08x flags=%x "
+                       "has_children=%u err=%08x\n",
+                       request->window, request->from_child, reply.child, reply.flags,
+                       reply.has_children, reply.header.error );
+    }
+    pthread_mutex_unlock( &horizon_server_objects_mutex );
+
+    return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply), NULL, 0 );
+}
+
 static int horizon_server_handle_get_message( struct horizon_server_connection *connection,
                                               const unsigned char *message )
 {
@@ -8210,6 +8298,9 @@ static void *horizon_server_thread( void *param )
             break;
         case HORIZON_REQ_GET_PAINT_REGIONS:
             status = horizon_server_handle_get_paint_regions( connection, message );
+            break;
+        case HORIZON_REQ_GET_UPDATE_FLAGS_EX:
+            status = horizon_server_handle_get_update_flags_ex( connection, message );
             break;
         case HORIZON_REQ_UPDATE_WINDOW_ZORDER:
             status = horizon_server_handle_update_window_zorder( connection, message );

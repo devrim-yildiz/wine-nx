@@ -3941,6 +3941,32 @@ struct get_paint_regions_reply
     /* VARARG(update_region,rectangles); */
     /* VARARG(visible_region,rectangles); */
 };
+
+/* Peek-only variant of get_update_region (always UPDATE_NOREGION
+ * semantics, matching get_update_flags()'s use), used only by
+ * switch_update_now() (dlls/win32u/dce.c) to learn, in the SAME round
+ * trip it already has to make, whether the window it's about to dispatch
+ * WM_PAINT to has any children at all -- letting switch_update_now() skip
+ * a provably-redundant follow-up check for the common childless-window
+ * case. has_children always reflects `window` (the caller's original
+ * top-level target), independent of the from_child/target search below
+ * it, and independent of anything the recursive search itself finds. See
+ * dlls/ntdll/unix/horizon.c, horizon_server_handle_get_update_flags_ex. */
+struct get_update_flags_ex_request
+{
+    struct request_header __header;
+    user_handle_t  window;
+    user_handle_t  from_child;
+    unsigned int   flags;
+};
+struct get_update_flags_ex_reply
+{
+    struct reply_header __header;
+    user_handle_t  child;
+    unsigned int   flags;
+    unsigned int   has_children;
+    char __pad_20[4];
+};
 #define UPDATE_NONCLIENT       0x001
 #define UPDATE_ERASE           0x002
 #define UPDATE_PAINT           0x004
@@ -6608,6 +6634,7 @@ enum request
     REQ_d3dkmt_mutex_release,
     REQ_fsync_free_shm_idx,
     REQ_get_paint_regions,
+    REQ_get_update_flags_ex,
     REQ_NB_REQUESTS
 };
 
@@ -6782,6 +6809,7 @@ union generic_request
     struct set_window_region_request set_window_region_request;
     struct get_update_region_request get_update_region_request;
     struct get_paint_regions_request get_paint_regions_request;
+    struct get_update_flags_ex_request get_update_flags_ex_request;
     struct update_window_zorder_request update_window_zorder_request;
     struct redraw_window_request redraw_window_request;
     struct set_window_property_request set_window_property_request;
@@ -7098,6 +7126,7 @@ union generic_reply
     struct set_window_region_reply set_window_region_reply;
     struct get_update_region_reply get_update_region_reply;
     struct get_paint_regions_reply get_paint_regions_reply;
+    struct get_update_flags_ex_reply get_update_flags_ex_reply;
     struct update_window_zorder_reply update_window_zorder_reply;
     struct redraw_window_reply redraw_window_reply;
     struct set_window_property_reply set_window_property_reply;

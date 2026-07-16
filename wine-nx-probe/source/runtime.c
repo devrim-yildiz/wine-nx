@@ -341,6 +341,37 @@ static void wine_nx_batch_paint_regions_select(void)
              (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
 }
 
+/* Off by default -- same correctness-risk-change reasoning as
+ * wine_nx_batch_paint_regions_enabled above, applied to a different IPC
+ * pair. UpdateWindow() -> update_now() (dlls/win32u/dce.c) always issues
+ * get_update_region twice (once to find+dispatch WM_PAINT, once more to
+ * check whether more painting is needed) even for a window with zero
+ * children, where the second check is provably guaranteed to find nothing
+ * -- confirmed via hardware logs (exactly 2 get_update_region calls per
+ * get_paint_regions call, 129 frames, no variance) and via reading
+ * horizon_server_find_window_update_locked's exact recursion (nothing to
+ * iterate over with no children). ON routes RDW_UPDATENOW through
+ * switch_update_now() instead of update_now(), which skips that second
+ * round trip only when BOTH the window had zero children before the
+ * WM_PAINT dispatch AND switch_window_tree_generation (window.c) proves
+ * nothing created or reparented a window during it -- see the long design
+ * comment on switch_update_now() for the full correctness argument. Any
+ * window with real children, or any window-tree change during dispatch,
+ * falls through to the exact same calls update_now() would have made --
+ * so even with this toggle on, those cases cost no more than OFF does. */
+int wine_nx_skip_redundant_update_check_enabled;
+
+static void wine_nx_skip_redundant_update_check_select(void)
+{
+    const char *env = getenv( "WINE_NX_SKIP_REDUNDANT_UPDATE_CHECK" );
+    int file_flag = read_bool_file( RUNTIME_DIR "/skipupdatecheck.txt" );
+    wine_nx_skip_redundant_update_check_enabled = (env && env[0]) || file_flag;
+    log_line( "[NXTRACE] update_now redundant-check skip: %s (env=%s file=%s)",
+             wine_nx_skip_redundant_update_check_enabled ? "ON (skips proven-empty follow-up get_update_region calls)"
+                                                         : "off (default: update_now()'s original always-double-check behavior)",
+             (env && env[0]) ? "set" : "unset", file_flag ? "true" : "false/absent" );
+}
+
 #ifdef WINE_NX_DEKO3D_ONLY
 
 /* This build's entire purpose is to never make this call -- deko3d must be
@@ -1639,6 +1670,7 @@ int main( int argc, char **argv )
     wine_nx_paint_trace_select();
     wine_nx_flush_legacy_select();
     wine_nx_batch_paint_regions_select();
+    wine_nx_skip_redundant_update_check_select();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );

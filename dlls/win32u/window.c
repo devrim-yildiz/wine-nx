@@ -40,6 +40,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(win);
 
 static void *client_objects[MAX_USER_HANDLES];
 
+#ifdef __SWITCH__
+/* Bumped on every NtUserCreateWindowEx/NtUserSetParent call, attempted or
+ * not just successful (see the long comment on switch_update_now() in
+ * dlls/win32u/dce.c for why "attempted" is the right granularity to use
+ * here, not "succeeded"). Lets switch_update_now() prove nothing could
+ * have added a child to a window it just found to have none, without a
+ * round trip to ask the server again. */
+LONG switch_window_tree_generation;
+#endif
+
 #define SWP_AGG_NOGEOMETRYCHANGE \
     (SWP_NOSIZE | SWP_NOCLIENTSIZE | SWP_NOZORDER)
 #define SWP_AGG_NOPOSCHANGE \
@@ -585,6 +595,9 @@ HWND WINAPI NtUserSetParent( HWND hwnd, HWND parent )
     WND *win;
     BOOL ret;
 
+#ifdef __SWITCH__
+    InterlockedIncrement( &switch_window_tree_generation );
+#endif
     TRACE("(%p %p)\n", hwnd, parent);
 
     if (is_broadcast(hwnd) || is_broadcast(parent))
@@ -5781,6 +5794,9 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     RECT surface_rect;
     WND *win;
 
+#ifdef __SWITCH__
+    InterlockedIncrement( &switch_window_tree_generation );
+#endif
     TRACE( "ex_style %#x, class_name %s, version %s, window_name %s, style %#x, x %u, y %u, cx %u, cy %u, "
            "parent %p, menu %p, class_instance %p, params %p, flags %#x, instance %p, class %s, ansi %u\n",
            ex_style, debugstr_us(class_name), debugstr_us(version), debugstr_us(window_name), style, x, y, cx, cy,

@@ -73,6 +73,15 @@ extern int wine_nx_flush_legacy_enabled;
  * one, which is a real protocol change (wrong here = silent visual
  * corruption, not a crash), not a diagnostic. */
 extern int wine_nx_batch_paint_regions_enabled;
+/* wine-nx-probe/source/runtime.c -- A/B toggle for switch_update_now(),
+ * see the long comment there and on wine_nx_skip_redundant_update_check_select()
+ * in runtime.c. Off by default, same correctness-risk-change reasoning as
+ * wine_nx_batch_paint_regions_enabled above. */
+extern int wine_nx_skip_redundant_update_check_enabled;
+/* dlls/win32u/window.c -- bumped on every NtUserCreateWindowEx/
+ * NtUserSetParent call (attempted, not just successful). See the long
+ * comment on switch_update_now() below for why this exists. */
+extern LONG switch_window_tree_generation;
 
 /* Update 2: switch_paint_trace() itself used to fflush() one line per
  * call (log_line(), unconditional fflush) -- exactly the same mistake
@@ -2528,6 +2537,138 @@ void erase_now( HWND hwnd, UINT rdw_flags )
     }
 }
 
+#ifdef __SWITCH__
+static BOOL switch_get_update_flags_ex( HWND hwnd, HWND *child, UINT *flags, BOOL *has_children )
+{
+    BOOL ret;
+
+    SERVER_START_REQ( get_update_flags_ex )
+    {
+        req->window     = wine_server_user_handle( hwnd );
+        req->from_child = wine_server_user_handle( child ? *child : 0 );
+        req->flags      = *flags | UPDATE_NOREGION;
+        if ((ret = !wine_server_call_err( req )))
+        {
+            if (child) *child = wine_server_ptr_handle( reply->child );
+            *flags = reply->flags;
+            *has_children = reply->has_children != 0;
+        }
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
+/* Switch-specific replacement for update_now(), gated behind
+ * wine_nx_skip_redundant_update_check_enabled. Re-derived from source, not
+ * assumed: update_now()'s for(;;) loop calls get_update_flags() BEFORE
+ * dispatching WM_PAINT (finds whatever window in hwnd's subtree currently
+ * has a pending update, starting the search over from hwnd each time) and
+ * calls it AGAIN after (with from_child set to the window just dispatched,
+ * so the search resumes past it) to see if there's more to do -- looping
+ * until a call finds nothing. The AFTER check's real job is walking the
+ * REST of the subtree: siblings that already had their own pending update
+ * before this call started, OR a window that the just-processed WM_PAINT
+ * handler itself invalidated (a child painting itself, or a child newly
+ * created and invalidated by the parent's own handler -- both real,
+ * supported Win32 patterns this loop exists specifically to catch across
+ * multiple iterations, not just one extra safety check).
+ *
+ * For UpdateWindow() specifically (dlls/user32/win.c: RDW_UPDATENOW |
+ * RDW_ALLCHILDREN, no RDW_NOCHILDREN), this loop runs unconditionally
+ * twice for hwnd's own top-level paint even when hwnd has zero children --
+ * once to find+dispatch, once more that can only ever confirm nothing else
+ * is pending, because the search has nothing to recurse into. Confirmed via
+ * hardware logs: get_update_region fired exactly 2x per get_paint_regions
+ * (2:1:1 with redraw_window) across 129 frames of gui_smoke.c, a childless
+ * window, with no variance.
+ *
+ * The one case that makes the second check NOT redundant even for a
+ * childless window: the just-dispatched WM_PAINT handler creates a new
+ * child window and invalidates it, all before returning -- unusual, but a
+ * real, legal Win32 pattern, and exactly the kind of "silently breaks
+ * repaint correctness for more complex real apps" regression this session
+ * has been careful to avoid everywhere else. Handled by a proof, not a
+ * guess: has_children (from the first call's reply, always computed for
+ * hwnd itself, independent of whatever the recursive search finds) tells
+ * us hwnd had zero children before the dispatch; switch_window_tree_generation
+ * (bumped by every NtUserCreateWindowEx/NtUserSetParent call in this
+ * process, attempted or not, see window.c) tells us whether anything could
+ * have added one during the dispatch. Skip the follow-up round trip only
+ * when BOTH hold -- zero children before AND no window-tree-changing call
+ * happened during -- which is exactly the condition under which the
+ * server's own search algorithm (horizon_server_find_window_update_locked,
+ * dlls/ntdll/unix/horizon.c) is provably guaranteed to find nothing: with
+ * no children to recurse into, and past_from already true for hwnd itself
+ * (it was just dispatched), the for-loop over horizon_windows has nothing
+ * matching child->parent == hwnd to ever iterate over.
+ *
+ * Known, deliberately out-of-scope gap: a DIFFERENT thread in the same
+ * process creating or reparenting a window into hwnd's subtree while this
+ * thread is blocked inside the synchronous WM_PAINT dispatch would still
+ * bump the generation counter (correctly triggering the fallback), so this
+ * isn't actually a correctness gap -- just noting it as the one scenario
+ * that makes the counter earn its keep beyond the single-threaded case,
+ * since Wine's per-window UI threading model makes it exotic in practice. */
+static void switch_update_now( HWND hwnd, UINT rdw_flags )
+{
+    HWND child = 0;
+
+    if (hwnd == get_desktop_window())
+    {
+        erase_now( hwnd, rdw_flags | RDW_NOCHILDREN );
+        return;
+    }
+
+    for (;;)
+    {
+        UINT flags = UPDATE_PAINT | UPDATE_INTERNALPAINT;
+        BOOL has_children = TRUE;   /* fail-safe: never skip unless proven empty below */
+        LONG gen_before;
+
+        if (rdw_flags & RDW_NOCHILDREN) flags |= UPDATE_NOCHILDREN;
+        else if (rdw_flags & RDW_ALLCHILDREN) flags |= UPDATE_ALLCHILDREN;
+
+        gen_before = switch_window_tree_generation;
+        if (!switch_get_update_flags_ex( hwnd, &child, &flags, &has_children )) break;
+        if (!flags) break;
+
+        send_message( child, WM_PAINT, 0, 0 );
+        if (rdw_flags & RDW_NOCHILDREN) break;
+
+        if (!has_children && gen_before == switch_window_tree_generation)
+        {
+            if (wine_nx_paint_trace_enabled)
+            {
+                static unsigned int logged;
+                if (logged < 5)
+                {
+                    char buf[128];
+                    snprintf( buf, sizeof(buf), "[NXUPDATE] skip hwnd=%x (no children, tree unchanged)",
+                             (int)(ULONG_PTR)hwnd );
+                    wine_nx_runtime_trace( buf );
+                    logged++;
+                }
+            }
+            break;
+        }
+
+        if (wine_nx_paint_trace_enabled)
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                char buf[160];
+                snprintf( buf, sizeof(buf),
+                         "[NXUPDATE] fallback hwnd=%x has_children=%d gen_before=%d gen_after=%d",
+                         (int)(ULONG_PTR)hwnd, has_children, (int)gen_before, (int)switch_window_tree_generation );
+                wine_nx_runtime_trace( buf );
+                logged++;
+            }
+        }
+    }
+}
+#endif
+
 /***********************************************************************
  *           update_now
  *
@@ -2612,7 +2753,15 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
 
     if (!hwnd) hwnd = get_desktop_window();
 
-    if (flags & RDW_UPDATENOW) update_now( hwnd, flags );
+    if (flags & RDW_UPDATENOW)
+    {
+#ifdef __SWITCH__
+        if (wine_nx_skip_redundant_update_check_enabled) switch_update_now( hwnd, flags );
+        else update_now( hwnd, flags );
+#else
+        update_now( hwnd, flags );
+#endif
+    }
     else if (flags & RDW_ERASENOW) erase_now( hwnd, flags );
 
     return ret;
