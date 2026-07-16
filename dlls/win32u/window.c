@@ -2176,9 +2176,16 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
     else if (create_layered || is_layered) needs_surface = TRUE;
 
 #ifdef __SWITCH__
+    /* Same unconditional-fflush bug as everywhere else this round -- this
+     * fired on every single get_window_surface() call, no gate, no rate
+     * limit. Lower-traffic than the GetDCEx path for a static-position demo
+     * (this only runs on SetWindowPos, not every paint), but any app that
+     * moves/resizes windows every frame would pay it every frame. */
     {
         extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
+        extern int wine_nx_paint_trace_enabled;
+        static unsigned int logged;
+        if (&wine_nx_runtime_trace && wine_nx_paint_trace_enabled && logged < 5)
         {
             char buf[256];
             snprintf( buf, sizeof(buf), "[NXSURF] hwnd=%p needs=%d win=%ld,%ld-%ld,%ld vis=%ld,%ld-%ld,%ld surf=%ld,%ld-%ld,%ld",
@@ -2187,6 +2194,7 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
                       (long)rects->visible.left, (long)rects->visible.top, (long)rects->visible.right, (long)rects->visible.bottom,
                       (long)surface_rect->left, (long)surface_rect->top, (long)surface_rect->right, (long)surface_rect->bottom );
             wine_nx_runtime_trace( buf );
+            logged++;
         }
     }
 #endif
