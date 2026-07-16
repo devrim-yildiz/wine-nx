@@ -357,7 +357,26 @@ void *wine_nx_deko3d_fb_lock( int *width, int *height, int *stride_px )
             uint64_t t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
             dkFenceWait( &g_dk_stagingFence, UINT64_MAX );
             uint64_t t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-            wine_nx_deko3d_trace( "[NXDK][TIMING] fenceWait took %ums", (unsigned)(t1 - t0) );
+            /* wine_nx_deko3d_trace() -> wine_nx_runtime_trace() fflush()es
+             * unconditionally, every call, forever -- this one fires on
+             * essentially every frame in steady state (whenever a fresh
+             * staging-buffer use begins), same bug class as every other
+             * fflush-per-call fix tonight, just not caught until Thread A's
+             * 2.7s-stall investigation traced fb_lock_call's outer timer
+             * (which wraps this whole function, including this trace call)
+             * inflating to 200-262ms while this fence's own t1-t0 stayed
+             * 0ms -- the fence wait itself wasn't the stall, the trace
+             * write immediately after it plausibly was. Rate-limited to 5
+             * samples so the mechanism is still visible without paying the
+             * ongoing cost. */
+            {
+                static unsigned int fence_wait_logged;
+                if (fence_wait_logged < 5)
+                {
+                    wine_nx_deko3d_trace( "[NXDK][TIMING] fenceWait took %ums", (unsigned)(t1 - t0) );
+                    fence_wait_logged++;
+                }
+            }
             g_dk_stagingFenceValid = 0;
         }
         g_dk_pendingBits = g_dk_stagingCpuAddr;
@@ -397,7 +416,18 @@ void wine_nx_deko3d_fb_present(void)
         t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
         slot = dkQueueAcquireImage( g_dk_queue, g_dk_swapchain );
         t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        wine_nx_deko3d_trace( "[NXDK][TIMING] dkQueueAcquireImage took %ums slot=%d", (unsigned)(t1 - t0), slot );
+        /* Same unconditional-fflush issue as fenceWait's trace above --
+         * this one fires on every successful present, forever, with no
+         * rate limit at all. Rate-limited to 5 samples for the same
+         * reason. */
+        {
+            static unsigned int acquire_logged;
+            if (acquire_logged < 5)
+            {
+                wine_nx_deko3d_trace( "[NXDK][TIMING] dkQueueAcquireImage took %ums slot=%d", (unsigned)(t1 - t0), slot );
+                acquire_logged++;
+            }
+        }
 
         if (slot < 0 || slot >= WINE_NX_DEKO3D_FB_NUM)
         {
@@ -419,7 +449,17 @@ void wine_nx_deko3d_fb_present(void)
             g_dk_stagingFenceValid = 1;
             dkQueuePresentImage( g_dk_queue, g_dk_swapchain, slot );
             t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-            wine_nx_deko3d_trace( "[NXDK][TIMING] submit+signal+present took %ums", (unsigned)(t1 - t0) );
+            /* Same unconditional-fflush issue as the two traces above --
+             * fires on every successful present, forever. Rate-limited to
+             * 5 samples for the same reason. */
+            {
+                static unsigned int submit_logged;
+                if (submit_logged < 5)
+                {
+                    wine_nx_deko3d_trace( "[NXDK][TIMING] submit+signal+present took %ums", (unsigned)(t1 - t0) );
+                    submit_logged++;
+                }
+            }
             wine_nx_hud_mark_executed( t1 - t0 );
 
             g_dk_pendingBits = NULL;

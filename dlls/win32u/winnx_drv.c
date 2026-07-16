@@ -95,6 +95,14 @@ static void trace_surface_samples( const BITMAPINFO *color_info, const void *col
     int nonwhite = 0;
     int x, y;
 
+    /* nxdrv_trace() -> wine_nx_runtime_trace() fflush()es unconditionally --
+     * this call was contaminating the first ~40 frames of every run with
+     * real fflush cost regardless of WINE_NX_PAINT_TRACE. Same bug class
+     * being chased across this whole file tonight (Thread A, 2.7s stall
+     * investigation); ported here from the already-verified fix on
+     * fps-investigation, since this branch was cut from a clean main that
+     * predates it. */
+    if (!wine_nx_paint_trace_enabled) return;
     if (sample_count >= 40 || width <= 0 || height <= 0 || !bits) return;
 
     p0 = bits[0];
@@ -397,15 +405,23 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
     }
 #ifdef __SWITCH__
     t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-    /* Unlimited nxdrv_trace(), not the rate-limited nxdrv_trace_hot() used
-     * just above -- that helper's 120-call budget is shared across every
-     * call site in this file, and burning it 50% faster here would starve
-     * whichever of these three lines runs out first. Call frequency is
-     * already bounded by the (slow) frame rate itself, so there's no real
-     * flooding risk from leaving this one unlimited. */
-    nxdrv_trace( "[NXDRV][TIMING] pixel loop took %dms w=%d h=%d px=%d",
-                (int)(t1 - t0), blit.right - blit.left, blit.bottom - blit.top,
-                (blit.right - blit.left) * (blit.bottom - blit.top) );
+    /* This was wrongly reasoned as "unlimited but harmless" before tonight:
+     * nxdrv_trace() (used here, unlike nxdrv_trace_hot()) has no rate limit
+     * of its own at all -- every call unconditionally fflush()es to the SD
+     * card, every frame, forever. Part of Thread A's 2.7s-stall
+     * investigation; ported here from the already-verified fix on
+     * fps-investigation. Rate-limited to 5 samples, matching every other
+     * "just show me examples" trace in this file. */
+    {
+        static unsigned int pixel_loop_logged;
+        if (pixel_loop_logged < 5)
+        {
+            nxdrv_trace( "[NXDRV][TIMING] pixel loop took %dms w=%d h=%d px=%d",
+                        (int)(t1 - t0), blit.right - blit.left, blit.bottom - blit.top,
+                        (blit.right - blit.left) * (blit.bottom - blit.top) );
+            pixel_loop_logged++;
+        }
+    }
 #endif
 
 #ifdef __SWITCH__
