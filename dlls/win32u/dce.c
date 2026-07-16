@@ -1255,15 +1255,30 @@ static void update_visible_region( struct dce *dce )
     if (surface)
     {
 #ifdef __SWITCH__
-        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
+        /* This trace used to fire completely unconditionally on every single
+         * call -- no wine_nx_paint_trace_enabled gate, no rate limit at all --
+         * making it the single hottest unrated-limited fflush() call site in
+         * the whole port: update_visible_region() runs at least twice per
+         * WM_PAINT cycle (erase's own GetDCEx plus BeginPaint's, even when the
+         * IPC call itself is skipped via the get_paint_regions prefetch hit
+         * above, since this trace sits downstream of both branches). This is
+         * almost certainly the real explanation for "Track A"'s never-closed
+         * ~30-46ms update_visible_region() gap in the README. Gated and
+         * rate-limited to match every other one-off diagnostic trace in this
+         * file. */
+        if (wine_nx_paint_trace_enabled)
         {
-            char buf[192];
-            snprintf( buf, sizeof(buf), "[NXDCE] hwnd=%x top=%x flags=%x paint=%x surf=%x win=%d,%d %dx%d",
-                      (int)(ULONG_PTR)dce->hwnd, (int)(ULONG_PTR)top_win, (int)flags, (int)paint_flags,
-                      (int)(ULONG_PTR)surface, win_rect.left, win_rect.top,
-                      win_rect.right - win_rect.left, win_rect.bottom - win_rect.top );
-            wine_nx_runtime_trace( buf );
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                char buf[192];
+                snprintf( buf, sizeof(buf), "[NXDCE] hwnd=%x top=%x flags=%x paint=%x surf=%x win=%d,%d %dx%d",
+                          (int)(ULONG_PTR)dce->hwnd, (int)(ULONG_PTR)top_win, (int)flags, (int)paint_flags,
+                          (int)(ULONG_PTR)surface, win_rect.left, win_rect.top,
+                          win_rect.right - win_rect.left, win_rect.bottom - win_rect.top );
+                wine_nx_runtime_trace( buf );
+                logged++;
+            }
         }
 #endif
         user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
@@ -1276,14 +1291,19 @@ static void update_visible_region( struct dce *dce )
         UINT dpi;
 
 #ifdef __SWITCH__
-        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
-        if (&wine_nx_runtime_trace)
+        /* Same unconditional-fflush bug as the surface branch above, same fix. */
+        if (wine_nx_paint_trace_enabled)
         {
-            char buf[192];
-            snprintf( buf, sizeof(buf), "[NXDCE] hwnd=%x top=%x flags=%x paint=%x surf=0 win=%d,%d %dx%d",
-                      (int)(ULONG_PTR)dce->hwnd, (int)(ULONG_PTR)top_win, (int)flags, (int)paint_flags,
-                      win_rect.left, win_rect.top, win_rect.right - win_rect.left, win_rect.bottom - win_rect.top );
-            wine_nx_runtime_trace( buf );
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                char buf[192];
+                snprintf( buf, sizeof(buf), "[NXDCE] hwnd=%x top=%x flags=%x paint=%x surf=0 win=%d,%d %dx%d",
+                          (int)(ULONG_PTR)dce->hwnd, (int)(ULONG_PTR)top_win, (int)flags, (int)paint_flags,
+                          win_rect.left, win_rect.top, win_rect.right - win_rect.left, win_rect.bottom - win_rect.top );
+                wine_nx_runtime_trace( buf );
+                logged++;
+            }
         }
 #endif
 

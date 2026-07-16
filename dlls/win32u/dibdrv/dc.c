@@ -44,6 +44,9 @@ extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
 /* wine-nx-probe/source/runtime.c -- see the long comment on
  * FLUSH_PERIOD below and wine_nx_fast_flush_period_select() there. */
 extern int wine_nx_fast_flush_period_enabled;
+/* dlls/win32u/dce.c -- gates the bind/unbind traces below, same as
+ * everything else in this tier. */
+extern int wine_nx_paint_trace_enabled;
 
 static void nxwin_trace( const char *fmt, ... )
 {
@@ -676,12 +679,28 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
         dibdrv->bounds = &surface->bounds;
         DC_InitDC( dc );
 #ifdef __SWITCH__
-        nxwin_trace( "[NXWIN] bind hdc=%x surf=%x vis=%dx%d dev=%dx%d",
-                     (int)(ULONG_PTR)dc->hSelf, (int)(ULONG_PTR)surface,
-                     dc->attr->vis_rect.right - dc->attr->vis_rect.left,
-                     dc->attr->vis_rect.bottom - dc->attr->vis_rect.top,
-                     dc->device_rect.right - dc->device_rect.left,
-                     dc->device_rect.bottom - dc->device_rect.top );
+        /* nxwin_trace() itself has no gate or rate limit built in -- every
+         * other call site in this file wraps it in a per-site counter, but
+         * this one and "unbind" below never got that treatment. dibdrv_set_
+         * window_surface() is called from set_visible_region(), which fires
+         * from update_visible_region() on every NtUserGetDCEx call -- at
+         * least twice per WM_PAINT cycle -- so this was an unconditional
+         * fflush() on one of the hottest paths in the port, same bug class
+         * as everything else this tier exists to avoid. */
+        if (wine_nx_paint_trace_enabled)
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                nxwin_trace( "[NXWIN] bind hdc=%x surf=%x vis=%dx%d dev=%dx%d",
+                             (int)(ULONG_PTR)dc->hSelf, (int)(ULONG_PTR)surface,
+                             dc->attr->vis_rect.right - dc->attr->vis_rect.left,
+                             dc->attr->vis_rect.bottom - dc->attr->vis_rect.top,
+                             dc->device_rect.right - dc->device_rect.left,
+                             dc->device_rect.bottom - dc->device_rect.top );
+                logged++;
+            }
+        }
 #endif
     }
     else if (windev)
@@ -690,7 +709,16 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
         windev->funcs->pDeleteDC( windev );
         DC_InitDC( dc );
 #ifdef __SWITCH__
-        nxwin_trace( "[NXWIN] unbind hdc=%x", (int)(ULONG_PTR)dc->hSelf );
+        /* Same unconditional-fflush bug as "bind" above, same fix. */
+        if (wine_nx_paint_trace_enabled)
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                nxwin_trace( "[NXWIN] unbind hdc=%x", (int)(ULONG_PTR)dc->hSelf );
+                logged++;
+            }
+        }
 #endif
     }
 }
