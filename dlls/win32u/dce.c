@@ -2033,11 +2033,37 @@ static HRGN switch_build_region_from_bytes( const void *bytes, size_t byte_size 
     return hrgn;
 }
 
+/* EXPERIMENTAL, riskier than the rest of this session's fixes: avoids a
+ * malloc/free cycle on this hot path (once per BeginPaint, i.e. once per
+ * frame). Motivated by a real, unexplained observation, not a guess --
+ * on hardware this call's own IPC time (ncpaint_ipc) averaged noticeably
+ * higher than redraw_window's (21-27ms vs a steady 14-15ms) with real
+ * per-second spikes up to 74ms, and the two calls go through the exact
+ * same transport, so a per-call cost difference this large needs an
+ * explanation beyond "IPC is just slow." A per-frame malloc/free
+ * contending with this port's allocator lock against whatever else is
+ * allocating around the same time (the HUD's own periodic work, deko3d
+ * present-path allocations) is a plausible, checkable candidate; this
+ * removes it as a variable entirely for the common case instead of
+ * guessing further from source. 512 bytes matches the size this function
+ * already started at (established as sufficient for this app's
+ * single-rectangle regions); falls back to a real malloc only if a
+ * genuine STATUS_BUFFER_OVERFLOW retry needs more (a non-rectangular or
+ * multi-rect dirty area from a more complex app), which the existing
+ * retry loop already handles correctly either way -- this changes only
+ * where the FIRST attempt's memory comes from, not the fallback
+ * correctness. __thread for the same reason switch_paint_regions_prefetch
+ * below already is. Unverified whether this actually explains the
+ * variance -- that's what the next hardware run is for. */
+#define SWITCH_PREFETCH_STATIC_BUF_SIZE 512
+static __thread unsigned char switch_prefetch_static_buf[sizeof(RGNDATA) + SWITCH_PREFETCH_STATIC_BUF_SIZE - 1];
+
 static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
 {
     HRGN hrgn = 0;
     NTSTATUS status;
     RGNDATA *combined;
+    int combined_is_static = 0;
     size_t size = 512;
     UINT visible_flags = DCX_INTERSECTRGN | DCX_USESTYLE;
 
@@ -2046,11 +2072,17 @@ static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
 
     do
     {
-        if (!(combined = malloc( sizeof(*combined) + size - 1 )))
+        if (size <= SWITCH_PREFETCH_STATIC_BUF_SIZE)
+        {
+            combined = (RGNDATA *)switch_prefetch_static_buf;
+            combined_is_static = 1;
+        }
+        else if (!(combined = malloc( sizeof(*combined) + size - 1 )))
         {
             RtlSetLastWin32Error( ERROR_OUTOFMEMORY );
             return 0;
         }
+        else combined_is_static = 0;
 
         SERVER_START_REQ( get_paint_regions )
         {
@@ -2116,7 +2148,7 @@ static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
             else size = reply->update_total_size + reply->visible_total_size;
         }
         SERVER_END_REQ;
-        free( combined );
+        if (!combined_is_static) free( combined );
     } while (status == STATUS_BUFFER_OVERFLOW);
 
     if (status) RtlSetLastWin32Error( RtlNtStatusToDosError(status) );
