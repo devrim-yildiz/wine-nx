@@ -521,6 +521,28 @@ target_link_options(wine-nx-ntdll-smoke PRIVATE -Wl,--gc-sections)
 
 target_link_libraries(wine-nx-ntdll-smoke PRIVATE nx)
 
+# Standalone libnx JIT (W^X-bypass) smoke test -- see source/jit_smoke.c's
+# header comment. Zero Wine dependency by design, unlike the ntdll-smoke
+# targets above; only links libnx.
+add_executable(wine-nx-jit-smoke
+    source/jit_smoke.c
+)
+
+set_target_properties(wine-nx-jit-smoke PROPERTIES SUFFIX ".elf")
+
+target_compile_options(wine-nx-jit-smoke PRIVATE
+    -std=gnu99
+    -Wall
+    -Wextra
+    -Werror=implicit-function-declaration
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_link_options(wine-nx-jit-smoke PRIVATE -Wl,--gc-sections)
+
+target_link_libraries(wine-nx-jit-smoke PRIVATE nx)
+
 add_executable(wine-nx-ntdll-file-smoke
     source/ntdll_file_smoke.c
     $<TARGET_OBJECTS:wine-horizon-real>
@@ -743,6 +765,8 @@ if(NACPTOOL AND ELF2NRO)
     set(PE_NTDLL_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-pe-ntdll-smoke.nro")
     set(NTDLL_SMOKE_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-smoke.nacp")
     set(NTDLL_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-smoke.nro")
+    set(JIT_SMOKE_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-jit-smoke.nacp")
+    set(JIT_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-jit-smoke.nro")
     set(NTDLL_FILE_SMOKE_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-file-smoke.nacp")
     set(NTDLL_FILE_SMOKE_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-ntdll-file-smoke.nro")
     set(DEKO3D_SMOKE_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-deko3d-smoke.nacp")
@@ -841,6 +865,21 @@ if(NACPTOOL AND ELF2NRO)
     )
 
     add_custom_target(wine-nx-ntdll-smoke-nro ALL DEPENDS "${NTDLL_SMOKE_NRO_FILE}")
+
+    add_custom_command(
+        OUTPUT "${JIT_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX JIT Smoke" "Codex" "0.1.0" "${JIT_SMOKE_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${JIT_SMOKE_NRO_FILE}"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-jit-smoke>" "${JIT_SMOKE_NRO_FILE}" "--nacp=${JIT_SMOKE_NACP_FILE}"
+        DEPENDS wine-nx-jit-smoke "${JIT_SMOKE_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_target(wine-nx-jit-smoke-nro ALL DEPENDS "${JIT_SMOKE_NRO_FILE}")
 
     add_custom_command(
         OUTPUT "${NTDLL_FILE_SMOKE_NACP_FILE}"
