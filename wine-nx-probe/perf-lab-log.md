@@ -550,3 +550,61 @@ time, but the fix needs to write `user_shared_data->TickCount` from
 somewhere reachable in this port's actual link closure -- not yet
 implemented.
 
+
+## 2026-07-19 — Verification run: NXWAKE verdict, rate-limited traces, rebuilt DLLs (build 2e4af89)
+
+On-hardware verification pass for the fix batch (build `2e4af89`, main). Config: `painttrace=1` from config.txt only; **all batching toggles OFF** (all 8 [NXTRACE] boot lines print correct `(source=...)` — the parsing fix works). Target gui_smoke.exe; both binaries run (deko3d `nx-deko3d-only-1` ~11.3s, plain libnx `nx-present-throttle-1` ~136s, 3 boot sessions total in horizon-trace.log).
+
+### NXWAKE: the scheduler-wake hypothesis is dead
+
+The instrumentation I added last session finally reported, and the answer is emphatic:
+
+| metric | value |
+|---|---|
+| [NXWAKE] aggregate samples | 224 (horizon-trace.log:211–3312) |
+| n-weighted avg wake latency | **6.95us** (137,860 wakes) |
+| avg-of-avgs / max sample avg | 7.09us / 11us |
+| overall max single wake | 43us (line 1907) |
+| wake rate median / p90 / peak | 670 / 705 / **1383 per sec** |
+| drift early-half vs late-half | 6.97us vs 6.94us (none) |
+| corr(avg, load) | r = -0.785 (faster when busy) |
+
+I hypothesized ~7ms per wake, two wakes per call = the 14ms floor. Reality is ~7**us** — a clean 1000x miss. Two wakes explain ~0.1% of the floor. The 1383 wakes/sec peak alone kills the theory (a 14ms/call thread caps out near 71/sec). **The 14ms floor was the unconditional fflush-to-SD traces in get_visible_region/get_update_region, executed under the server mutex, hiding inside every prior session's "IPC call took Xms".** This run proves it directly: the first [NXPAINT][AVG] window — while the 5 rate-limited [HZPAINT] samples still fire — replays the old baseline (ncpaint=21ms, erase=19ms, deko3d:1081), then collapses the moment they exhaust. The planned inline-dispatch work loses its premise: ~14us/call is the ceiling of what it can save. Dropping it.
+
+### FPS and sub-phases vs baseline
+
+[NXDK][TIMING] presents/sec: 7, 23, 31, 39, 39, 27, 33, 31, 33, 38, 35 (deko3d:1147–3786).
+
+| metric | baseline | this run |
+|---|---|---|
+| presents/sec (steady) | 8 | **34.4** (27–39, peak 39) — 4.3x |
+| paint_avg (gui_timing.log) | ~113–116ms | **25.2ms** |
+| ncpaint | ~21ms | 1.0ms |
+| erase | ~24ms | 3.61ms (all of it = getdcex_vis_rgn) |
+| surface_funcs_flush | ~7ms | 5.0ms (now the top phase) |
+| present_dirty | ~9ms | 3.45ms |
+| blit_avg | ~2ms | 1ms |
+
+The two ~20x collapses are exactly the two handlers whose fflush traces I capped. Reconciliation is exact: 1000/total_avg per gui_timing row tracks presents/sec one-for-one (330 iters vs 336 presents); no hidden throttle remains. The libnx run independently sustains ~35 cycles/sec (fb_present_call n=35–36/sec) with p50=0ms/max 6ms on 22,662 paint-path IPC calls — only 3 calls ≥10ms in 136s, all boot-time create_mapping. The one fps dip (27) lines up with a dispatch_avg burst of 4–7ms, not paint.
+
+### Fix confirmations
+
+- **Rate limits**: exactly 5 [HZPAINT] samples per type (visible/get_update/redraw) per boot, all 3 sessions (15/15/15). Careful: 3 boots share the file — whole-file counts falsely look like a cap failure.
+- **Boot fix**: `[LDR] PE ntdll hash_table initialized (32 buckets at 0x7fff440be0, 13 modules inserted)` in both binaries (deko3d:302, libnx:309). Zero [EXC] anywhere; both runs ended via Minus with full [EXIT] sequences in the logs (note: prior sessions crashed to Home Menu *after* completing [EXIT] logging, so whether that symptom is finally gone needs an eyeball confirmation, not just these logs).
+- **Rebuilt DLLs**: all 13 modules attach status=00000000 (deko3d:304–545); imm32/uxtheme/ole32 dynamic loads clean.
+- **Toggles**: 8/8 with correct source attribution; only painttrace non-default.
+
+### Anomalies
+
+- 7 of 13 staged fonts fail FreeType load in both font dirs (the bitmap-font stand-ins: fixedsys/system/courier/small_fonts/ms_sans_serif + _jp) — unparseable files, not a staging miss. Falls back to Tahoma.
+- [NXFONT] select_cached is the new unguarded trace: 2 lines/paint cycle, 29–33% of both runtime logs. Same cap treatment needed. Its status=20000057 is a flags/status field swap in the format string, cosmetic.
+- ~12ms of the 25.2ms paint_avg sits outside all phase timers (phases sum ~13.1ms), and phase timers say ~3–5ms where per-call timers say 0ms — ms-granularity truncation; need finer timers before the next optimization call.
+- [NXIPC][TIMING] was 0 lines in horizon-trace.log (toggle off), so no direct per-request-type server-side costs this run.
+- Cold calls still pay ~6–9ms (create_mapping avg 6.3–7.2ms); hot calls ~0ms. One-off 73ms vis_rgn spike at ~t=57s (libnx:14851), no recurrence. Torn log lines at shutdown (no line atomicity). 6 benign HZDIR err=80000006 (end of font enumeration). setpos-dirty trace shows 9/session — low volume, but verify its cap.
+- pe-real-run.nro: loader clean (38/38 relocs, loader_failures=0) but blocked at 46/89 unresolved imports — target.txt pointed the console-shim loader at a GUI exe; rerun against curl.exe.
+
+### Next
+
+1. Turn batching toggles ON: 5–6 round trips/frame → 2–3 projects ~50–70fps.
+2. Rerun with NXIPC timing on + sub-ms paint-path timers to find the untimed ~12ms/frame.
+3. Cap the NXFONT trace; fix the 7 font files; rerun pe-real-run with curl.exe; add build sha/hashes + exe/NROs to runtime-manifest.txt.

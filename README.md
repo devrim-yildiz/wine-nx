@@ -15,9 +15,10 @@ Two different numbers matter here, and they measure different things: the
 compositor itself is hardware-confirmed at **60fps** in an isolated smoke
 test (device/queue/present, real shaders and 3D geometry, no Wine
 involved); the full Win32 GUI pipeline that feeds it — message loop, GDI
-drawing, Wine's client/server IPC — is CPU-bound and currently reaches a
-hardware-confirmed **8fps** end to end. The full investigation trail behind
-those numbers lives in
+drawing, Wine's client/server IPC — currently reaches a hardware-confirmed
+**~34fps steady state** (27–39) end to end, up from 8fps after diagnostic
+overhead hidden in the IPC path was found and removed. The full
+investigation trail behind those numbers lives in
 [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md).
 
 Originally started by [dantiicu](https://github.com/dantiicu/wine-nx) as an
@@ -90,13 +91,15 @@ incomplete (see Known Limitations).
 
 ## Known Limitations
 
-- **~8fps GUI ceiling, CPU-bound in the paint/IPC pipeline** — not the GPU
-  and not the pixel blit. Every `wine_server_call()` round trip through the
-  in-process server transport costs ~14-15ms (consistent with Horizon
-  thread-wake latency), and a paint cycle needs 3 of them. The compositor
-  itself is fast. Diagnosis, fixes landed so far (2fps → 8fps), and next
-  candidates are documented in
-  [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md).
+- **~34fps GUI steady state, CPU-bound in the paint/IPC pipeline** — not
+  the GPU and not the pixel blit. The long-suspected "~14ms per IPC call
+  transport floor" turned out to be diagnostic logging (unconditional
+  fflush-to-SD in the hot server handlers), not Horizon scheduler latency —
+  measured server-thread wake latency is ~7µs, and with the traces
+  rate-limited the same calls now measure ~0ms median. Remaining frame cost
+  is ~25ms/frame: several synchronous server round trips per paint plus
+  ~12ms not yet covered by any timer. Full trail, numbers, and next levers
+  in [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md).
 - **`GetTickCount`/`GetTickCount64` are frozen for PE apps** — the shared
   user data page's `TickCount` is never written on this port (the
   wineserver poll loop that updates it in real Wine never runs here). The
@@ -349,10 +352,12 @@ wine-nx-probe/source/jit_smoke.c
 
 1. **Paint-pipeline performance** — the compositor is no longer the open
    question (deko3d is hardware-confirmed, in isolation and as the real
-   backend via `wine-nx-runtime-deko3d`). The bottleneck is the CPU-bound
-   Win32/GDI/IPC pipeline feeding it: the ~14ms-per-call IPC transport
-   floor and `update_visible_region()`'s client-side cost are the scoped
-   next targets — see
+   backend via `wine-nx-runtime-deko3d`), and the "~14ms IPC floor" theory
+   is settled (it was diagnostic-logging overhead; scheduler wakes measure
+   ~7µs). At ~34fps the scoped next levers are: turn the already-landed
+   batching toggles on (5–6 round trips/frame → 2–3, projecting roughly
+   50–70fps), and add sub-ms timers to account for the ~12ms/frame no
+   phase timer currently covers — see
    [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md) for
    what's been tried, ruled out, and measured.
 2. **Substrate correctness** — real blocking waits/timeouts, a timer
