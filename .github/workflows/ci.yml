@@ -58,11 +58,16 @@ jobs:
           name: wine-generated-headers
           path: wine-nx-probe/build-wine-headers/include
 
-      # Same portlib set build-switch.sh installs (font rendering needs the
-      # freetype portlib); --needed makes this a no-op if the image already
-      # has them.
-      - name: Install Switch portlibs
-        run: dkp-pacman -Sy --noconfirm --needed switch-freetype switch-harfbuzz switch-bzip2 switch-libpng
+      # The pinned image already ships these portlibs (verified against this
+      # exact digest: ft2build.h + freetype/harfbuzz/bz2/png libs present),
+      # and pkg.devkitpro.org deliberately 403s CI traffic -- so never sync
+      # pacman unless a future image digest actually drops them. Same
+      # existence guard build-switch.sh uses.
+      - name: Check Switch portlibs
+        run: |
+          if [ ! -f "$DEVKITPRO/portlibs/switch/include/freetype2/ft2build.h" ]; then
+            dkp-pacman -Sy --noconfirm --needed switch-freetype switch-harfbuzz switch-bzip2 switch-libpng
+          fi
 
       - name: Configure
         working-directory: wine-nx-probe
