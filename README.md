@@ -21,6 +21,13 @@ Originally started by [dantiicu](https://github.com/dantiicu/wine-nx) as an
 early Horizon/libnx Wine bring-up — the loader, initial win32u driver, and
 NTDLL substrate are his foundation. This fork continues that work.
 
+## Discord Server
+I created a discord server for this project!
+
+It will be a place to ask questions, see preview on features which arent on discord and get all the newest releases!
+
+Join [here](https://discord.gg/vprPQ46Q3)!
+
 ## What's new in this fork
 
 - **A real GPU compositor (deko3d), hardware-confirmed at 60fps in
