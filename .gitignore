@@ -1,7 +1,11 @@
 wine-nx-probe/build-switch/
+wine-nx-probe/build-wine-arm64-pe/
 wine-nx-probe/build-wine-arm64-pe-clean/
 wine-nx-probe/build-wine-arm64-pe-local/
 wine-nx-probe/build-host-sim/
 wine-nx-probe/build-host-sim-linux/
 wine-nx-probe/toolchains/
+# Stray captured build logs (a build.txt full of CMake output was once
+# committed by accident).
+/build.txt
 .DS_Store
