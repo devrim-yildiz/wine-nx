@@ -1757,6 +1757,7 @@
 @ stdcall __wine_ctrl_routine(ptr)
 @ extern -private __wine_syscall_dispatcher
 @ extern -private wine_nx_pe_teb
+@ extern -private wine_nx_pe_hash_table
 @ extern -private __wine_unix_call_dispatcher
 @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
 @ extern -private __wine_unixlib_handle
