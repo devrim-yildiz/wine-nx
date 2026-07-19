@@ -25,9 +25,19 @@ mkdir -p "$OUT"
 cd "$OUT"
 
 if [ ! -f Makefile ]; then
+    # On x86_64 hosts wine's configure defaults to a 32-bit build and dies
+    # without multilib ("Cannot build a 32-bit program") -- seen on the
+    # first real CI run, invisible on the aarch64 hosts this script was
+    # developed on (aarch64 wine is 64-bit-only by default).
+    win64_flag=""
+    case "$(uname -m)" in
+        x86_64|amd64) win64_flag="--enable-win64" ;;
+    esac
+
     # Tools-only configure: every optional dependency off, no PE cross
     # compiler wanted -- we only ever run `make include` here.
     "$ROOT/configure" \
+        $win64_flag \
         --disable-tests \
         --without-x --without-freetype --without-fontconfig --without-gettext \
         --without-gnutls --without-opengl --without-vulkan --without-sdl \

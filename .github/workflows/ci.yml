@@ -27,12 +27,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bison flex
       - name: Generate headers
         run: ./wine-nx-probe/tools/generate-wine-headers.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wine-generated-headers
           path: wine-nx-probe/build-wine-headers/include/*.h
@@ -51,9 +51,9 @@ jobs:
     container:
       image: devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: wine-generated-headers
           path: wine-nx-probe/build-wine-headers/include
@@ -81,7 +81,7 @@ jobs:
           test -f wine-nx-runtime-deko3d.nro
 
       - name: Upload NROs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: switch-nros
           path: wine-nx-probe/build-switch/*.nro
@@ -100,12 +100,12 @@ jobs:
     timeout-minutes: 240
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The wine build tree is large but incremental: cache it so re-runs
       # only rebuild what changed instead of the whole tree.
       - name: Cache host-sim build tree
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: wine-nx-probe/build-host-sim-linux
           key: host-sim-build-${{ runner.arch }}-${{ hashFiles('configure.ac', 'wine-nx-probe/docker-host-sim/Dockerfile') }}
@@ -123,7 +123,7 @@ jobs:
 
       - name: Upload screenshot
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: host-sim-screenshot
           path: wine-nx-probe/docker-host-sim/host-sim-screenshot.png
