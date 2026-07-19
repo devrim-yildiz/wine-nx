@@ -1715,6 +1715,292 @@ struct horizon_redraw_window_reply
     unsigned int has_children;
 };
 
+/* ==== Wire-protocol mirror consistency checks ==========================
+ *
+ * Every HORIZON_REQ_* value near the top of this file, and every
+ * horizon_*_request/_reply struct above, is a hand-maintained mirror of
+ * the generated wire protocol in include/wine/server_protocol.h:
+ * send_request() (dlls/ntdll/unix/server.c) writes the raw 64-byte
+ * union generic_request of *wine's* struct onto the pipe and this file
+ * reinterprets those bytes as the horizon_* mirror (and replies go back
+ * the same way, zero-padded to the same 64 bytes by
+ * horizon_server_write_reply). An upstream protocol change that renumbers
+ * a request or moves a field would therefore corrupt the wire silently at
+ * runtime; these asserts turn that failure mode into a compile error.
+ * If one fires after a rebase: re-sync the mirror (the defines and the
+ * affected structs) with the new server_protocol.h, then update the
+ * pinned SERVER_PROTOCOL_VERSION value asserted below.
+ *
+ * Per-struct sizeof equality against wine's structs is deliberately NOT
+ * asserted: both directions of the wire always carry the full zero-padded
+ * 64-byte union, so a mirror legitimately omitting wine's explicit
+ * trailing __pad_* member is harmless -- what must match is every field
+ * offset, the header layouts, and that each mirror fits in the fixed
+ * message size at all.
+ *
+ * Not checkable under HORIZON_STANDALONE_SYNTAX (the syntax-shim build
+ * has no wine headers), and not compiled on host builds either (this whole
+ * region is #ifdef __SWITCH__); the real Switch build (the CMake
+ * wine-horizon-real target, and CI's NRO job) is what enforces these. */
+#ifndef HORIZON_STANDALONE_SYNTAX
+
+#define HORIZON_PROTOCOL_ASSERT( e ) \
+    _Static_assert( (e), "horizon protocol mirror out of sync: " #e )
+
+HORIZON_PROTOCOL_ASSERT( SERVER_PROTOCOL_VERSION == 931 );
+HORIZON_PROTOCOL_ASSERT( HORIZON_SERVER_FIXED_MESSAGE_SIZE == sizeof(union generic_request) );
+HORIZON_PROTOCOL_ASSERT( HORIZON_SERVER_FIXED_MESSAGE_SIZE == sizeof(union generic_reply) );
+HORIZON_PROTOCOL_ASSERT( sizeof(struct horizon_server_request_header) == sizeof(struct request_header) );
+HORIZON_PROTOCOL_ASSERT( sizeof(struct horizon_server_reply_header) == sizeof(struct reply_header) );
+HORIZON_PROTOCOL_ASSERT( sizeof(struct horizon_rectangle) == sizeof(struct rectangle) );
+
+/* Request IDs: one assert per hand-copied HORIZON_REQ_* define, against
+ * the positional request enum in server_protocol.h. */
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_NEW_THREAD == REQ_new_thread );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_INIT_PROCESS_DONE == REQ_init_process_done );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_INIT_FIRST_THREAD == REQ_init_first_thread );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_INIT_THREAD == REQ_init_thread );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SUSPEND_THREAD == REQ_suspend_thread );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_RESUME_THREAD == REQ_resume_thread );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CLOSE_HANDLE == REQ_close_handle );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_HANDLE_INFO == REQ_set_handle_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_DUP_HANDLE == REQ_dup_handle );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_ALLOCATE_RESERVE_OBJECT == REQ_allocate_reserve_object );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_COMPARE_OBJECTS == REQ_compare_objects );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_OBJECT_PERMANENCE == REQ_set_object_permanence );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_PROCESS == REQ_open_process );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_THREAD == REQ_open_thread );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SELECT == REQ_select );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_EVENT == REQ_create_event );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_EVENT_OP == REQ_event_op );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_QUERY_EVENT == REQ_query_event );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_EVENT == REQ_open_event );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_KEYED_EVENT == REQ_create_keyed_event );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_KEYED_EVENT == REQ_open_keyed_event );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_MUTEX == REQ_create_mutex );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_RELEASE_MUTEX == REQ_release_mutex );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_MUTEX == REQ_open_mutex );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_QUERY_MUTEX == REQ_query_mutex );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_SEMAPHORE == REQ_create_semaphore );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_RELEASE_SEMAPHORE == REQ_release_semaphore );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_QUERY_SEMAPHORE == REQ_query_semaphore );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_SEMAPHORE == REQ_open_semaphore );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_FILE == REQ_create_file );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_FILE_OBJECT == REQ_open_file_object );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_HANDLE_FD == REQ_get_handle_fd );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_RECV_SOCKET == REQ_recv_socket );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SEND_SOCKET == REQ_send_socket );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SOCKET_GET_EVENTS == REQ_socket_get_events );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_QUERY_DIRECTORY_FILE == REQ_query_directory_file );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_ASYNC_DIRECT_RESULT == REQ_set_async_direct_result );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_IOCTL == REQ_ioctl );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_MAPPING == REQ_create_mapping );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_MAPPING == REQ_open_mapping );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_MAPPING_INFO == REQ_get_mapping_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_IMAGE_MAP_ADDRESS == REQ_get_image_map_address );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_MAP_VIEW == REQ_map_view );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_MAP_IMAGE_VIEW == REQ_map_image_view );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_UNMAP_VIEW == REQ_unmap_view );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_TIMER == REQ_create_timer );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_TIMER == REQ_open_timer );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_TIMER == REQ_set_timer );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CANCEL_TIMER == REQ_cancel_timer );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_TIMER_INFO == REQ_get_timer_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_ADD_ATOM == REQ_add_atom );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_FIND_ATOM == REQ_find_atom );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SEND_HARDWARE_MESSAGE == REQ_send_hardware_message );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_MESSAGE == REQ_get_message );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_ACCEPT_HARDWARE_MESSAGE == REQ_accept_hardware_message );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_WINDOW == REQ_create_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_DESTROY_WINDOW == REQ_destroy_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_DESKTOP_WINDOW == REQ_get_desktop_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_WINDOW_OWNER == REQ_set_window_owner );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_WINDOW_INFO == REQ_get_window_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_INIT_WINDOW_INFO == REQ_init_window_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_WINDOW_INFO == REQ_set_window_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_WINDOW_CHILDREN_FROM_POINT == REQ_get_window_children_from_point );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_WINDOW_TREE == REQ_get_window_tree );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_WINDOW_POS == REQ_set_window_pos );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_WINDOW_RECTANGLES == REQ_get_window_rectangles );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_VISIBLE_REGION == REQ_get_visible_region );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_UPDATE_REGION == REQ_get_update_region );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_UPDATE_WINDOW_ZORDER == REQ_update_window_zorder );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_REDRAW_WINDOW == REQ_redraw_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_WINDOW_PROPERTY == REQ_set_window_property );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_REMOVE_WINDOW_PROPERTY == REQ_remove_window_property );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_WINDOW_PROPERTY == REQ_get_window_property );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_WINDOW_PROPERTIES == REQ_get_window_properties );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_WINSTATION == REQ_create_winstation );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_WINSTATION == REQ_open_winstation );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CLOSE_WINSTATION == REQ_close_winstation );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_WINSTATION_MONITORS == REQ_set_winstation_monitors );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_PROCESS_WINSTATION == REQ_get_process_winstation );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_PROCESS_WINSTATION == REQ_set_process_winstation );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_ENUM_WINSTATION == REQ_enum_winstation );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_DESKTOP == REQ_create_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_DESKTOP == REQ_open_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_OPEN_INPUT_DESKTOP == REQ_open_input_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_INPUT_DESKTOP == REQ_set_input_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CLOSE_DESKTOP == REQ_close_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_THREAD_DESKTOP == REQ_get_thread_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_THREAD_DESKTOP == REQ_set_thread_desktop );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_USER_OBJECT_INFO == REQ_set_user_object_info );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_THREAD_INPUT == REQ_get_thread_input );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_KEY_STATE == REQ_get_key_state );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_KEY_STATE == REQ_set_key_state );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_FOREGROUND_WINDOW == REQ_set_foreground_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_FOCUS_WINDOW == REQ_set_focus_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_ACTIVE_WINDOW == REQ_set_active_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_CAPTURE_WINDOW == REQ_set_capture_window );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_CREATE_CLASS == REQ_create_class );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_DESTROY_CLASS == REQ_destroy_class );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_ALLOC_USER_HANDLE == REQ_alloc_user_handle );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_FREE_USER_HANDLE == REQ_free_user_handle );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_SET_CURSOR == REQ_set_cursor );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_PAINT_REGIONS == REQ_get_paint_regions );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_GET_UPDATE_FLAGS_EX == REQ_get_update_flags_ex );
+HORIZON_PROTOCOL_ASSERT( HORIZON_REQ_REDRAW_WINDOW_UPDATENOW == REQ_redraw_window_updatenow );
+
+/* Struct layouts for the paint-pipeline and boot-critical requests (the
+ * hottest paths and the most catastrophic to desync). Field names in the
+ * mirrors match wine's payload field names, so offsetof lines up 1:1.
+ * Consolidated mirrors that intentionally cover several wine requests
+ * with one struct (horizon_open_named_object_request for the open_*
+ * family, horizon_atom_reply for add/find_atom, horizon_socket_io_reply
+ * for recv/send_socket) are not 1:1 by design and are not asserted. */
+#define HORIZON_ASSERT_FITS( name ) \
+    HORIZON_PROTOCOL_ASSERT( sizeof(struct horizon_##name) <= HORIZON_SERVER_FIXED_MESSAGE_SIZE )
+#define HORIZON_ASSERT_FIELD( name, field ) \
+    HORIZON_PROTOCOL_ASSERT( offsetof(struct horizon_##name, field) == offsetof(struct name, field) )
+
+HORIZON_ASSERT_FITS( init_first_thread_request );
+HORIZON_ASSERT_FIELD( init_first_thread_request, unix_pid );
+HORIZON_ASSERT_FIELD( init_first_thread_request, unix_tid );
+HORIZON_ASSERT_FIELD( init_first_thread_request, debug_level );
+HORIZON_ASSERT_FIELD( init_first_thread_request, reply_fd );
+HORIZON_ASSERT_FIELD( init_first_thread_request, wait_fd );
+
+HORIZON_ASSERT_FITS( init_first_thread_reply );
+HORIZON_ASSERT_FIELD( init_first_thread_reply, pid );
+HORIZON_ASSERT_FIELD( init_first_thread_reply, tid );
+HORIZON_ASSERT_FIELD( init_first_thread_reply, server_start );
+HORIZON_ASSERT_FIELD( init_first_thread_reply, session_id );
+HORIZON_ASSERT_FIELD( init_first_thread_reply, inproc_device );
+HORIZON_ASSERT_FIELD( init_first_thread_reply, info_size );
+
+HORIZON_ASSERT_FITS( init_thread_request );
+HORIZON_ASSERT_FIELD( init_thread_request, unix_tid );
+HORIZON_ASSERT_FIELD( init_thread_request, reply_fd );
+HORIZON_ASSERT_FIELD( init_thread_request, wait_fd );
+HORIZON_ASSERT_FIELD( init_thread_request, teb );
+HORIZON_ASSERT_FIELD( init_thread_request, entry );
+
+HORIZON_ASSERT_FITS( init_thread_reply );
+HORIZON_ASSERT_FIELD( init_thread_reply, suspend );
+
+HORIZON_ASSERT_FITS( select_request );
+HORIZON_ASSERT_FIELD( select_request, flags );
+HORIZON_ASSERT_FIELD( select_request, cookie );
+HORIZON_ASSERT_FIELD( select_request, timeout );
+HORIZON_ASSERT_FIELD( select_request, size );
+HORIZON_ASSERT_FIELD( select_request, prev_apc );
+
+HORIZON_ASSERT_FITS( select_reply );
+HORIZON_ASSERT_FIELD( select_reply, apc_handle );
+HORIZON_ASSERT_FIELD( select_reply, signaled );
+
+HORIZON_ASSERT_FITS( get_message_request );
+HORIZON_ASSERT_FIELD( get_message_request, flags );
+HORIZON_ASSERT_FIELD( get_message_request, get_win );
+HORIZON_ASSERT_FIELD( get_message_request, get_first );
+HORIZON_ASSERT_FIELD( get_message_request, get_last );
+HORIZON_ASSERT_FIELD( get_message_request, hw_id );
+HORIZON_ASSERT_FIELD( get_message_request, wake_mask );
+HORIZON_ASSERT_FIELD( get_message_request, changed_mask );
+HORIZON_ASSERT_FIELD( get_message_request, internal );
+
+HORIZON_ASSERT_FITS( get_message_reply );
+HORIZON_ASSERT_FIELD( get_message_reply, win );
+HORIZON_ASSERT_FIELD( get_message_reply, msg );
+HORIZON_ASSERT_FIELD( get_message_reply, wparam );
+HORIZON_ASSERT_FIELD( get_message_reply, lparam );
+HORIZON_ASSERT_FIELD( get_message_reply, type );
+HORIZON_ASSERT_FIELD( get_message_reply, x );
+HORIZON_ASSERT_FIELD( get_message_reply, y );
+HORIZON_ASSERT_FIELD( get_message_reply, time );
+HORIZON_ASSERT_FIELD( get_message_reply, total );
+
+HORIZON_ASSERT_FITS( get_visible_region_request );
+HORIZON_ASSERT_FIELD( get_visible_region_request, window );
+HORIZON_ASSERT_FIELD( get_visible_region_request, flags );
+
+HORIZON_ASSERT_FITS( get_visible_region_reply );
+HORIZON_ASSERT_FIELD( get_visible_region_reply, top_win );
+HORIZON_ASSERT_FIELD( get_visible_region_reply, top_rect );
+HORIZON_ASSERT_FIELD( get_visible_region_reply, win_rect );
+HORIZON_ASSERT_FIELD( get_visible_region_reply, paint_flags );
+HORIZON_ASSERT_FIELD( get_visible_region_reply, total_size );
+
+HORIZON_ASSERT_FITS( get_update_region_request );
+HORIZON_ASSERT_FIELD( get_update_region_request, window );
+HORIZON_ASSERT_FIELD( get_update_region_request, from_child );
+HORIZON_ASSERT_FIELD( get_update_region_request, flags );
+
+HORIZON_ASSERT_FITS( get_update_region_reply );
+HORIZON_ASSERT_FIELD( get_update_region_reply, child );
+HORIZON_ASSERT_FIELD( get_update_region_reply, flags );
+HORIZON_ASSERT_FIELD( get_update_region_reply, total_size );
+
+HORIZON_ASSERT_FITS( get_paint_regions_request );
+HORIZON_ASSERT_FIELD( get_paint_regions_request, window );
+HORIZON_ASSERT_FIELD( get_paint_regions_request, from_child );
+HORIZON_ASSERT_FIELD( get_paint_regions_request, update_flags );
+HORIZON_ASSERT_FIELD( get_paint_regions_request, visible_flags );
+
+HORIZON_ASSERT_FITS( get_paint_regions_reply );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, child );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, update_flags );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, update_total_size );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, top_win );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, top_rect );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, win_rect );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, paint_flags );
+HORIZON_ASSERT_FIELD( get_paint_regions_reply, visible_total_size );
+
+HORIZON_ASSERT_FITS( get_update_flags_ex_request );
+HORIZON_ASSERT_FIELD( get_update_flags_ex_request, window );
+HORIZON_ASSERT_FIELD( get_update_flags_ex_request, from_child );
+HORIZON_ASSERT_FIELD( get_update_flags_ex_request, flags );
+
+HORIZON_ASSERT_FITS( get_update_flags_ex_reply );
+HORIZON_ASSERT_FIELD( get_update_flags_ex_reply, child );
+HORIZON_ASSERT_FIELD( get_update_flags_ex_reply, flags );
+HORIZON_ASSERT_FIELD( get_update_flags_ex_reply, has_children );
+
+HORIZON_ASSERT_FITS( redraw_window_request );
+HORIZON_ASSERT_FIELD( redraw_window_request, window );
+HORIZON_ASSERT_FIELD( redraw_window_request, flags );
+
+HORIZON_ASSERT_FITS( redraw_window_reply );
+HORIZON_ASSERT_FIELD( redraw_window_reply, child );
+HORIZON_ASSERT_FIELD( redraw_window_reply, flags );
+HORIZON_ASSERT_FIELD( redraw_window_reply, has_children );
+
+HORIZON_ASSERT_FITS( redraw_window_updatenow_request );
+HORIZON_ASSERT_FIELD( redraw_window_updatenow_request, window );
+HORIZON_ASSERT_FIELD( redraw_window_updatenow_request, redraw_flags );
+HORIZON_ASSERT_FIELD( redraw_window_updatenow_request, search_flags );
+
+HORIZON_ASSERT_FITS( redraw_window_updatenow_reply );
+HORIZON_ASSERT_FIELD( redraw_window_updatenow_reply, child );
+HORIZON_ASSERT_FIELD( redraw_window_updatenow_reply, flags );
+HORIZON_ASSERT_FIELD( redraw_window_updatenow_reply, has_children );
+
+#undef HORIZON_ASSERT_FIELD
+#undef HORIZON_ASSERT_FITS
+
+#endif /* HORIZON_STANDALONE_SYNTAX */
+
 struct horizon_set_window_property_request
 {
     struct horizon_server_request_header header;
