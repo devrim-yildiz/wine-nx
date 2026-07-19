@@ -66,6 +66,7 @@ extern int wine_nx_neon_blit_enabled;
  * rather than a per-call fflush(), same reasoning as everything else
  * gated behind wine_nx_paint_trace_enabled. */
 extern void  switch_paint_trace( const char *phase, unsigned int ms );
+extern void  switch_paint_trace_us( const char *phase, unsigned int us );
 
 struct wine_nx_surface
 {
@@ -376,26 +377,26 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
      * (see dlls/win32u/dce.c's switch_paint_trace()) for the same reason,
      * off by default. */
 #ifdef __SWITCH__
-    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
 #endif
     trace_surface_samples( color_info, color_bits );
 #ifdef __SWITCH__
     if (wine_nx_paint_trace_enabled)
     {
-        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        switch_paint_trace( "trace_samples", (unsigned int)(t1 - t0) );
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
+        switch_paint_trace_us( "trace_samples", (unsigned int)(t1 - t0) );
     }
 #endif
 
 #ifdef __SWITCH__
-    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
 #endif
     fb = wine_nx_fb_lock( &fbw, &fbh, &fbstride );
 #ifdef __SWITCH__
     if (wine_nx_paint_trace_enabled)
     {
-        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        switch_paint_trace( "fb_lock_call", (unsigned int)(t1 - t0) );
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
+        switch_paint_trace_us( "fb_lock_call", (unsigned int)(t1 - t0) );
     }
 #endif
     nxdrv_trace_hot( "[NXDRV] fb_lock -> fb=%d fbw=%d fbh=%d stride=%d", fb ? 1 : 0, fbw, fbh, fbstride );
@@ -426,7 +427,7 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
      * surface_funcs_flush's ~7-8ms this actually accounts for; that's what
      * the next hardware run is for. */
 #ifdef __SWITCH__
-    t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    t0 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
 #endif
     {
         int sx_min = blit.left;
@@ -497,7 +498,13 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
         }
     }
 #ifdef __SWITCH__
-    t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    t1 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
+    /* The pixel blit loop is the untimed interior of surface_funcs_flush:
+     * the 2026-07-19 run showed 5.03ms in that phase with only ~0ms
+     * accounted for by trace_samples/fb_lock/fb_unlock -- this loop is the
+     * missing term, but it only ever fed the 5-sample example trace below,
+     * never the per-second AVG stats. Feed it in. */
+    switch_paint_trace_us( "fb_blit_loop", (unsigned int)(t1 - t0) );
     /* This was wrongly reasoned as "unlimited but harmless" before tonight:
      * nxdrv_trace() (used here, unlike nxdrv_trace_hot()) has no rate limit
      * of its own at all -- every call unconditionally fflush()es to the SD
@@ -509,7 +516,7 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
         static unsigned int pixel_loop_logged;
         if (pixel_loop_logged < 5)
         {
-            nxdrv_trace( "[NXDRV][TIMING] pixel loop took %dms w=%d h=%d px=%d",
+            nxdrv_trace( "[NXDRV][TIMING] pixel loop took %dus w=%d h=%d px=%d",
                         (int)(t1 - t0), blit.right - blit.left, blit.bottom - blit.top,
                         (blit.right - blit.left) * (blit.bottom - blit.top) );
             pixel_loop_logged++;
@@ -518,14 +525,14 @@ static BOOL wine_nx_surface_flush( struct window_surface *surface, const RECT *r
 #endif
 
 #ifdef __SWITCH__
-    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
+    if (wine_nx_paint_trace_enabled) t0 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
 #endif
     wine_nx_fb_unlock();
 #ifdef __SWITCH__
     if (wine_nx_paint_trace_enabled)
     {
-        t1 = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
-        switch_paint_trace( "fb_unlock_call", (unsigned int)(t1 - t0) );
+        t1 = armTicksToNs( armGetSystemTick() ) / 1000ULL;
+        switch_paint_trace_us( "fb_unlock_call", (unsigned int)(t1 - t0) );
     }
 #endif
     return TRUE;

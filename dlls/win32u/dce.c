@@ -168,27 +168,41 @@ static __thread u64 switch_redraw_to_paintregions_t0;
  * today's count. */
 #define SWITCH_PAINT_TRACE_MAX_PHASES 40
 
+/* Update 3 (post-50fps run): the whole tier now accumulates MICROSECONDS,
+ * not milliseconds. The 2026-07-19 analysis showed the ms-resolution
+ * timers systematically lying by truncation: phase timers printed "1ms"
+ * for calls the per-call [NXIPC][TIMING] timers measured at 0.01-0.03ms,
+ * and ~6.6ms/frame sat in no phase at all partly because sub-ms costs
+ * rounded to 0 everywhere. The printed line now shows fractional ms with
+ * 10us resolution ("erase=1.03ms(max=52.71,n=49)"). Call sites pass us
+ * via switch_paint_trace_us(); the old ms-unit entry point remains as a
+ * thin wrapper so nothing silently changes meaning if an unconverted
+ * call site slips in. */
+
 struct switch_paint_trace_phase
 {
     const char *name;
-    unsigned long long sum_ms;
+    unsigned long long sum_us;
     unsigned int count;
-    unsigned int max_ms;
+    unsigned int max_us;
 };
 
 static struct switch_paint_trace_phase switch_paint_trace_phases[SWITCH_PAINT_TRACE_MAX_PHASES];
 static unsigned int switch_paint_trace_phase_count;
 static u64 switch_paint_trace_epoch_ms;
+/* BeginPaint-exit tick, consumed by NtUserEndPaint's app_draw_gap phase. */
+static u64 switch_app_draw_t0;
 
 static void switch_paint_trace_flush(void)
 {
     /* Sized for SWITCH_PAINT_TRACE_MAX_PHASES (40) entries at the longest
-     * real phase name currently in use plus its "=NNNms(max=NNN,n=NN)"
-     * suffix, with headroom -- the previous 900-byte size was tuned for
-     * a smaller phase count and would silently truncate the printed line
-     * (not the underlying data, just what actually reaches the log) once
-     * enough phases were in use, same bug class as the array cap above. */
-    char buf[2048];
+     * real phase name currently in use plus its fractional-ms
+     * "=NNN.NNms(max=NNN.NN,n=NN)" suffix, with headroom -- the previous
+     * 900-byte size was tuned for a smaller phase count and would silently
+     * truncate the printed line (not the underlying data, just what
+     * actually reaches the log) once enough phases were in use, same bug
+     * class as the array cap above. */
+    char buf[2560];
     int len = 0;
     unsigned int i;
 
@@ -196,18 +210,19 @@ static void switch_paint_trace_flush(void)
     for (i = 0; i < switch_paint_trace_phase_count && len < (int)sizeof(buf) - 64; i++)
     {
         struct switch_paint_trace_phase *p = &switch_paint_trace_phases[i];
-        unsigned long long avg = p->count ? p->sum_ms / p->count : 0;
+        unsigned long long avg_us = p->count ? p->sum_us / p->count : 0;
 
-        len += snprintf( buf + len, sizeof(buf) - len, " %s=%llums(max=%u,n=%u)",
-                         p->name, avg, p->max_ms, p->count );
-        p->sum_ms = 0;
+        len += snprintf( buf + len, sizeof(buf) - len, " %s=%llu.%02llums(max=%u.%02u,n=%u)",
+                         p->name, avg_us / 1000, (avg_us % 1000) / 10,
+                         p->max_us / 1000, (p->max_us % 1000) / 10, p->count );
+        p->sum_us = 0;
         p->count = 0;
-        p->max_ms = 0;
+        p->max_us = 0;
     }
     wine_nx_runtime_trace( buf );
 }
 
-void switch_paint_trace( const char *phase, unsigned int ms )
+void switch_paint_trace_us( const char *phase, unsigned int us )
 {
     unsigned int i;
     u64 now_ms;
@@ -223,9 +238,30 @@ void switch_paint_trace( const char *phase, unsigned int ms )
     }
     if (i < SWITCH_PAINT_TRACE_MAX_PHASES)
     {
-        switch_paint_trace_phases[i].sum_ms += ms;
+        switch_paint_trace_phases[i].sum_us += us;
         switch_paint_trace_phases[i].count++;
-        if (ms > switch_paint_trace_phases[i].max_ms) switch_paint_trace_phases[i].max_ms = ms;
+        if (us > switch_paint_trace_phases[i].max_us) switch_paint_trace_phases[i].max_us = us;
+    }
+
+    /* Spike capture: the 27-53ms single-paint stall class survives in the
+     * per-window max columns of every hardware run but has never been
+     * caught in the act -- the AVG line only says it happened, not when
+     * or in what sequence. Emit one immediate line per spike (first 8
+     * only: enough to characterize the class, bounded so a pathological
+     * run can't recreate the fflush-per-call bug this tier exists to
+     * avoid), so its log position shows what preceded and followed it. */
+    if (us >= 20000)
+    {
+        static unsigned int spikes_logged;
+        if (spikes_logged < 8)
+        {
+            char sbuf[160];
+            snprintf( sbuf, sizeof(sbuf), "[NXPAINT][SPIKE] phase=%s ms=%u.%02u count_this_window=%u",
+                      phase, us / 1000, (us % 1000) / 10,
+                      i < SWITCH_PAINT_TRACE_MAX_PHASES ? switch_paint_trace_phases[i].count : 0 );
+            wine_nx_runtime_trace( sbuf );
+            spikes_logged++;
+        }
     }
 
     now_ms = armTicksToNs( armGetSystemTick() ) / 1000000ULL;
@@ -235,6 +271,13 @@ void switch_paint_trace( const char *phase, unsigned int ms )
         switch_paint_trace_flush();
         switch_paint_trace_epoch_ms = now_ms;
     }
+}
+
+/* Legacy ms-unit entry point; every in-tree call site now passes us via
+ * switch_paint_trace_us directly. */
+void switch_paint_trace( const char *phase, unsigned int ms )
+{
+    switch_paint_trace_us( phase, ms * 1000 );
 }
 #endif
 
@@ -876,7 +919,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
      * lock contention or a slow lock primitive on this port, a different
      * class of bug than anything found so far (see README, "Presentation
      * Is Still Too Slow"), not just more bookkeeping to shrug off. */
-    switch_paint_trace( "surface_lock", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "surface_lock", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 
 #ifdef __SWITCH__
@@ -891,7 +934,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     OffsetRect( &dirty, -dirty.left, -dirty.top );
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
-    switch_paint_trace( "rect_math", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "rect_math", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 
 #ifdef __SWITCH__
@@ -902,7 +945,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
         BOOL shape_changed;
 #ifdef __SWITCH__
         t1 = armGetSystemTick();
-        switch_paint_trace( "surface_get_color", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "surface_get_color", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 
         t0 = armGetSystemTick();
 #endif
@@ -910,7 +953,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
         void *shape_bits = window_surface_get_shape( surface, shape_info );
 #ifdef __SWITCH__
         t1 = armGetSystemTick();
-        switch_paint_trace( "surface_shape", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "surface_shape", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 
 #ifdef __SWITCH__
@@ -920,7 +963,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
 #ifdef __SWITCH__
         t1 = armGetSystemTick();
-        switch_paint_trace( "trace_macro", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "trace_macro", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 
 #ifdef __SWITCH__
@@ -931,7 +974,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
             reset_bounds( &surface->bounds );
 #ifdef __SWITCH__
         t1 = armGetSystemTick();
-        switch_paint_trace( "surface_funcs_flush", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "surface_funcs_flush", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
     }
 
@@ -941,7 +984,7 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     window_surface_unlock( surface );
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
-    switch_paint_trace( "surface_unlock", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "surface_unlock", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 }
 
@@ -1815,7 +1858,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     if (wine_nx_paint_trace_enabled)
     {
         t1 = armGetSystemTick();
-        switch_paint_trace( "getdcex_flags_fixup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "getdcex_flags_fixup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
         t0 = armGetSystemTick();
     }
 #endif
@@ -1883,7 +1926,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     if (wine_nx_paint_trace_enabled)
     {
         t1 = armGetSystemTick();
-        switch_paint_trace( "getdcex_dce_lookup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "getdcex_dce_lookup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
         t0 = armGetSystemTick();
     }
 #endif
@@ -1913,7 +1956,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     if (wine_nx_paint_trace_enabled)
     {
         t1 = armGetSystemTick();
-        switch_paint_trace( "getdcex_clip_setup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "getdcex_clip_setup", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
         t0 = armGetSystemTick();
     }
 #endif
@@ -1929,7 +1972,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
          * already accounted for. getdcex_flags_fixup/dce_lookup/clip_setup
          * above are the three candidates for the rest. See README, "The
          * ~14ms Per-Call IPC Floor". */
-        switch_paint_trace( "getdcex_vis_rgn", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "getdcex_vis_rgn", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
     }
 #endif
 
@@ -2113,8 +2156,8 @@ static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
                 ipc_t0 = armGetSystemTick();
                 if (switch_redraw_to_paintregions_t0)
                 {
-                    switch_paint_trace( "redraw_to_paintregions_gap",
-                                        (unsigned int)(armTicksToNs( ipc_t0 - switch_redraw_to_paintregions_t0 ) / 1000000ULL) );
+                    switch_paint_trace_us( "redraw_to_paintregions_gap",
+                                        (unsigned int)(armTicksToNs( ipc_t0 - switch_redraw_to_paintregions_t0 ) / 1000ULL) );
                     switch_redraw_to_paintregions_t0 = 0;
                 }
             }
@@ -2129,7 +2172,7 @@ static HRGN switch_prefetch_paint_regions( HWND hwnd, UINT *flags, HWND *child )
             if (wine_nx_paint_trace_enabled)
             {
                 ipc_t1 = armGetSystemTick();
-                switch_paint_trace( "ncpaint_ipc", (unsigned int)(armTicksToNs( ipc_t1 - ipc_t0 ) / 1000000ULL) );
+                switch_paint_trace_us( "ncpaint_ipc", (unsigned int)(armTicksToNs( ipc_t1 - ipc_t0 ) / 1000ULL) );
             }
 #endif
             if (!status)
@@ -2438,7 +2481,7 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
          * the WM_ERASEBKGND dispatch below tells us how much of erase's
          * ~47ms is "getting a DC" vs. "actually erasing". See wine-nx-probe/perf-lab-log.md,
          * "The ~14ms Per-Call IPC Floor". */
-        switch_paint_trace( "erase_get_dcex", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "erase_get_dcex", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
         if (hdc)
         {
@@ -2448,7 +2491,7 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
             INT type = NtGdiGetAppClipBox( hdc, clip_rect );
 #ifdef __SWITCH__
             t1 = armGetSystemTick();
-            switch_paint_trace( "erase_clipbox", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+            switch_paint_trace_us( "erase_clipbox", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 
             if (flags & UPDATE_ERASE)
@@ -2469,7 +2512,7 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
                      * gui_smoke.c that's DefWindowProcW's default FillRect with the
                      * class background brush, since the app doesn't handle
                      * WM_ERASEBKGND itself. */
-                    switch_paint_trace( "erase_wm_erasebkgnd", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+                    switch_paint_trace_us( "erase_wm_erasebkgnd", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
                     if (need_erase && RtlGetLastWin32Error() == ERROR_TIMEOUT) ERR( "timeout.\n" );
                 }
@@ -2482,7 +2525,7 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
                 release_dc( hwnd, hdc, TRUE );
 #ifdef __SWITCH__
                 t1 = armGetSystemTick();
-                switch_paint_trace( "erase_release_dc", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+                switch_paint_trace_us( "erase_release_dc", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
             }
         }
@@ -2591,7 +2634,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     }
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
-    switch_paint_trace( "ncpaint", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "ncpaint", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
 
 #ifdef __SWITCH__
@@ -2600,7 +2643,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
-    switch_paint_trace( "erase", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "erase", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
     /* Defensive: if update_vis_rgn ended up FALSE inside NtUserGetDCEx (e.g.
      * a cached DCE was reused without needing a visible-region refresh), the
      * prefetch above was never consumed. Clear it here so it can never be
@@ -2618,6 +2661,14 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     ps->fErase = erase;
     ps->rcPaint = rect;
     ps->hdc = hdc;
+#ifdef __SWITCH__
+    /* Stamp BeginPaint's successful exit so NtUserEndPaint can measure the
+     * span in between -- that span is the app's own drawing, the single
+     * largest untimed term of the 2026-07-19 runs (~6.6ms/frame inferred
+     * by subtraction, never measured directly until now). Single-window
+     * diagnostic bookkeeping, same threading caveat as the whole tier. */
+    switch_app_draw_t0 = armGetSystemTick();
+#endif
     return hdc;
 }
 
@@ -2644,14 +2695,14 @@ static void switch_present_surface_dirty( struct window_surface *surface )
     t0 = armGetSystemTick();
     window_surface_flush( surface );
     t1 = armGetSystemTick();
-    switch_paint_trace( "surface_flush_call", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "surface_flush_call", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 
     if (&wine_nx_fb_present)
     {
         t0 = armGetSystemTick();
         wine_nx_fb_present();
         t1 = armGetSystemTick();
-        switch_paint_trace( "fb_present_call", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "fb_present_call", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
     }
 }
 #endif
@@ -2661,6 +2712,15 @@ BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
     struct window_surface *surface;
 #ifdef __SWITCH__
     u64 t0, t1;
+
+    /* The BeginPaint-return -> EndPaint-entry span is the app's own GDI
+     * drawing (see the stamp in NtUserBeginPaint). */
+    if (switch_app_draw_t0)
+    {
+        switch_paint_trace_us( "app_draw_gap",
+                               (unsigned int)(armTicksToNs( armGetSystemTick() - switch_app_draw_t0 ) / 1000ULL) );
+        switch_app_draw_t0 = 0;
+    }
 #endif
 
     NtUserShowCaret( hwnd );
@@ -2670,7 +2730,7 @@ BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
     flush_window_surfaces( FALSE );
 #ifdef __SWITCH__
     t1 = armGetSystemTick();
-    switch_paint_trace( "flush_surfaces", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+    switch_paint_trace_us( "flush_surfaces", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
 #endif
     if (!ps)
     {
@@ -2685,7 +2745,7 @@ BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
         t0 = armGetSystemTick();
         switch_present_surface_dirty( surface );
         t1 = armGetSystemTick();
-        switch_paint_trace( "present_dirty", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
+        switch_paint_trace_us( "present_dirty", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000ULL) );
         window_surface_release( surface );
     }
     else user_driver->pProcessEvents( 0 );
@@ -2841,7 +2901,7 @@ static void switch_update_now_loop( HWND hwnd, UINT rdw_flags, HWND child, UINT 
             if (wine_nx_paint_trace_enabled)
             {
                 wm_t1 = armGetSystemTick();
-                switch_paint_trace( "wm_paint_dispatch", (unsigned int)(armTicksToNs( wm_t1 - wm_t0 ) / 1000000ULL) );
+                switch_paint_trace_us( "wm_paint_dispatch", (unsigned int)(armTicksToNs( wm_t1 - wm_t0 ) / 1000ULL) );
             }
         }
 #else
@@ -3049,7 +3109,7 @@ BOOL WINAPI NtUserRedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT fla
         if (wine_nx_paint_trace_enabled)
         {
             cfe_t1 = armGetSystemTick();
-            switch_paint_trace( "check_for_events", (unsigned int)(armTicksToNs( cfe_t1 - cfe_t0 ) / 1000000ULL) );
+            switch_paint_trace_us( "check_for_events", (unsigned int)(armTicksToNs( cfe_t1 - cfe_t0 ) / 1000ULL) );
         }
     }
 #else

@@ -385,6 +385,21 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         echo "# wine-nx runtime package manifest"
         echo "# Copy this whole directory to sdmc:/switch/wine"
         echo
+        # Provenance: a stale NRO on the SD card has burned multiple debug
+        # sessions (the README checklist's build-marker gotcha) and the
+        # 2026-07-19 deploy had to be *proven* current via a behavioral
+        # change in the logs because this manifest carried no identity.
+        echo "[build]"
+        echo "git: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO_ROOT" diff --quiet 2>/dev/null || echo '-dirty')"
+        echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+        echo "[nro-sha256]"
+        for nro in "$PACKAGE_DIR"/*.nro; do
+            if [ -f "$nro" ]; then
+                echo "$(basename "$nro"): $(shasum -a 256 "$nro" | cut -d' ' -f1)"
+            fi
+        done
+        echo
         echo "[system32]"
         find "$SYSTEM_DIR" -maxdepth 1 -type f -name '*.dll' -exec basename {} \; | sort
         echo

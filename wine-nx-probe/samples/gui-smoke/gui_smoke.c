@@ -424,8 +424,25 @@ static ULONGLONG now_ms(void)
 
 static void timing_open(void)
 {
+    /* OPEN_ALWAYS + seek-to-end + a run header, NOT CREATE_ALWAYS: the
+     * 2026-07-19 analysis lost the deko3d run's entire app-side dataset
+     * because the libnx run 48 seconds later truncated this file. Each
+     * run now appends under its own header so multi-binary sessions keep
+     * every dataset. */
     g_timing_file = CreateFileW( TIMING_LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    if (g_timing_file != INVALID_HANDLE_VALUE)
+    {
+        char header[96];
+        DWORD written;
+        int len;
+
+        SetFilePointer( g_timing_file, 0, NULL, FILE_END );
+        len = snprintf( header, sizeof(header), "=== run start qpc_ms=%llu ===\r\n",
+                        (unsigned long long)now_ms() );
+        if (len > 0) WriteFile( g_timing_file, header, (DWORD)len, &written, NULL );
+        FlushFileBuffers( g_timing_file );
+    }
 }
 
 static void timing_stat_add( phase_stat_t *s, ULONGLONG ms )
