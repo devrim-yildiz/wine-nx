@@ -1,4 +1,5 @@
 build-switch/
+build-wine-headers/
 build-wine-arm64-pe/
 build-wine-arm64-pe-clean/
 build-wine-arm64-pe-local/

@@ -95,6 +95,14 @@ docker run --rm \
         if [ ! -f "$DEVKITPRO/portlibs/switch/include/freetype2/ft2build.h" ]; then
             dkp-pacman -Sy --noconfirm --needed switch-freetype switch-harfbuzz switch-bzip2 switch-libpng
         fi
+        # win32u also needs wine'\''s widl-generated headers (objidlbase.h
+        # etc.), which are not in git -- generate them on first build. The
+        # devkitA64 image is Debian but ships without bison/flex, which
+        # wine'\''s configure needs for the generator tools.
+        if [ ! -f build-wine-headers/include/objidlbase.h ] && [ ! -f build-wine-arm64-pe-clean/include/objidlbase.h ]; then
+            command -v bison >/dev/null 2>&1 || { apt-get update && apt-get install -y --no-install-recommends bison flex; }
+            ./tools/generate-wine-headers.sh
+        fi
         cmake -S . -B build-switch \
             -DCMAKE_TOOLCHAIN_FILE=cmake/switch-devkitA64.cmake \
             -DCMAKE_BUILD_TYPE=Release

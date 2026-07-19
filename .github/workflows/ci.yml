@@ -18,7 +18,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Job 1: build every Switch NRO target with the same devkitA64 image
+  # Wine's widl-generated headers (objidlbase.h etc.) are not in git; the
+  # NRO build needs them (see wine-nx-probe/tools/generate-wine-headers.sh).
+  # Generate them once on a plain runner and hand them to the NRO job --
+  # cheaper than apt-installing bison/flex into the devkitA64 container on
+  # every run.
+  wine-headers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bison flex
+      - name: Generate headers
+        run: ./wine-nx-probe/tools/generate-wine-headers.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wine-generated-headers
+          path: wine-nx-probe/build-wine-headers/include/*.h
+          retention-days: 1
+
+  # Build every Switch NRO target with the same devkitA64 image
   # build-switch.sh uses, pinned by digest so CI can't drift under us.
   # To refresh the pin: check https://hub.docker.com/r/devkitpro/devkita64/tags
   # (or `docker manifest inspect devkitpro/devkita64:latest`), update the
@@ -26,11 +46,17 @@ jobs:
   # against the new image first. build-switch.sh itself floats :latest.
   switch-nro:
     runs-on: ubuntu-latest
+    needs: wine-headers
     timeout-minutes: 60
     container:
       image: devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wine-generated-headers
+          path: wine-nx-probe/build-wine-headers/include
 
       # Same portlib set build-switch.sh installs (font rendering needs the
       # freetype portlib); --needed makes this a no-op if the image already

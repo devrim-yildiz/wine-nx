@@ -304,6 +304,24 @@ endforeach()
 
 # win32u unix side: GDI/USER kernel implementation + syscall table (KeServiceDescriptorTable[1]).
 # This is what NtUser*/NtGdi* syscalls dispatch into; required for any GUI app.
+# widl-generated COM headers (objidlbase.h etc.) are NOT tracked in git --
+# upstream Wine generates them during its own build. A fresh clone must
+# create them first: run wine-nx-probe/tools/generate-wine-headers.sh
+# (writes to the default location below), or point this at any wine build
+# tree's include dir. build-wine-arm64-pe-clean/include is kept as a
+# fallback for dev trees that already carry a PE build.
+set(WINE_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-headers/include"
+    CACHE PATH "Directory containing wine's widl-generated headers (objidlbase.h etc.)")
+
+if(NOT EXISTS "${WINE_GENERATED_INCLUDE_DIR}/objidlbase.h" AND
+   NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-arm64-pe-clean/include/objidlbase.h")
+    message(FATAL_ERROR
+        "No widl-generated wine headers found (looked for objidlbase.h in "
+        "'${WINE_GENERATED_INCLUDE_DIR}' and 'build-wine-arm64-pe-clean/include'). "
+        "Run ./wine-nx-probe/tools/generate-wine-headers.sh first, or pass "
+        "-DWINE_GENERATED_INCLUDE_DIR=<wine-build-dir>/include.")
+endif()
+
 set(WINE_SWITCH_WIN32U_INCLUDES
     ${WINE_SWITCH_NTDLL_INCLUDES}
     # <dlfcn.h> shim: Horizon has no dynamic linker; dlopen() returns NULL so
@@ -311,8 +329,9 @@ set(WINE_SWITCH_WIN32U_INCLUDES
     # toolchain dlfcn.h (there is none on devkitA64, but keep it first).
     "${CMAKE_CURRENT_SOURCE_DIR}/switch-shims"
     "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/win32u"
-    # widl-generated COM headers (objidlbase.h etc.) produced by the PE build;
-    # last so checked-in include/ and syntax/config.h still win.
+    # Generated headers last so checked-in include/ and syntax/config.h
+    # still win.
+    "${WINE_GENERATED_INCLUDE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/build-wine-arm64-pe-clean/include"
     "$ENV{DEVKITPRO}/portlibs/switch/include/freetype2"
 )
