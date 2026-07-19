@@ -608,3 +608,65 @@ The two ~20x collapses are exactly the two handlers whose fflush traces I capped
 1. Turn batching toggles ON: 5–6 round trips/frame → 2–3 projects ~50–70fps.
 2. Rerun with NXIPC timing on + sub-ms paint-path timers to find the untimed ~12ms/frame.
 3. Cap the NXFONT trace; fix the 7 font files; rerun pe-real-run with curl.exe; add build sha/hashes + exe/NROs to runtime-manifest.txt.
+## 2026-07-19 (second deploy) — select_cached cap pays off big; ALLOW_BITMAP lands but can't win (build b9a76d6)
+
+Second on-hardware pass of the day, build `b9a76d6`. Two changes vs `2e4af89`: (1) the [NXFONT] select_cached trace capped at 5 samples (it was 2 unguarded fflush-to-SD writes per paint cycle, in the hot paint path), (2) the Switch font scan now passes ADDFONT_ALLOW_BITMAP for both dirs. Both verifiably deployed: `nx_open_dir flags=2` (deko3d:357) and `flags=3` (deko3d:444). Config unchanged: `painttrace=1` only, all batching toggles OFF (8/8 [NXTRACE] lines correct). Both binaries run + the two parked smokes; 3 boot segments in horizon-trace.log (third is a 5-line aborted pe-real boot — the file appends across processes, segment on the [VA] ASLR marker).
+
+### FPS: 8 → 34.4 → 50.06, still without batching
+
+[NXDK][TIMING]: 35 windows (deko3d:1016–9718) — ramp 17, 36, then **33 steady windows mean 50.06** (47–51, median 50, stdev 1.12). No dips this time; dispatch_avg is 0 in every window.
+
+| metric | first light | 2e4af89 | b9a76d6 |
+|---|---|---|---|
+| presents/sec (steady) | 8 | 34.4 (27–39) | **50.06** (47–51) |
+| frame budget | ~125ms | 29.07ms | **19.98ms** |
+| libnx paint-cycles/sec | — | ~35 | **39.4** |
+| gui total_avg (app-side) | — | 29.4ms | 24.35ms (libnx run) |
+
+### Where the 9.1ms/frame came from: the cap, twice over
+
+N-weighted steady sub-phases (last 33 AVG windows, n=1636 cycles):
+
+| phase | 2e4af89 | b9a76d6 |
+|---|---|---|
+| ncpaint | 1.0 | 1.03 |
+| erase (= getdcex_vis_rgn) | **3.61** | **1.06** |
+| surface_funcs_flush (flush_call) | 5.0 | 5.03 (3.27) |
+| present_dirty (fb_present_call) | 3.45 | 3.30 (0.00) |
+| untimed gap | ~12.1 | **~6.6** |
+
+Reconciliation: −2.55ms timed (all of it erase/vis_rgn) + −5.58ms untimed = 8.22 of the 9.09ms recovered; the rest is ms-truncation dust. Both deltas are exactly where the 2 removed fflush-to-SD writes/cycle (~2–4ms each) lived. Direct per-write evidence: the first AVG window — while the 5 capped samples still fire — shows trace_samples=2ms/max 4 (deko3d:845) and 17ms (libnx:749), then 0.00 forever. **Cap verified: exactly 5 select_cached lines in BOTH binaries** (deko3d:556–560, libnx:560–564); NXFONT log share fell 29–33% → 3.46%. The libnx binary is now cleanly "deko3d + ~5ms CPU present": present_dirty 8.63 vs 3.30, fb_present_call 4.00 vs 0.00, every other phase within 0.1ms.
+
+New cost ranking per 19.98ms frame: untimed ~6.6ms > surface_funcs_flush 5.03 > present_dirty 3.30 > erase/ncpaint ~1 each. Measured round trips: 5.22 tracked IPC calls/frame (get_update 3.13, vis_rgn 1.04, redraw 1.04). Batching away 2–3 saves 1–3ms depending on how much of the 1ms phase readings is truncation (raw per-call avgs are 0.01–0.03ms) → **projects ~52–59 presents/sec, not 60**. The untimed gap and surface_flush_call are the real remaining targets; sub-ms timers first.
+
+### NXWAKE holds at 50fps
+
+74 reports, 52,308 wakes: **7.02us n-weighted, max 39us** (line 785) — indistinguishable from 6.95us/43us at 34.4fps. Deko3d steady ~933 wakes/sec ≈ 19 wakes/present, below last run's 1383/sec peak. The scheduler theory stays dead at 45% higher throughput.
+
+### Fonts: the flag landed; wine itself is the gate
+
+The 7 bitmap TTFs **still face_fail** (14 lines: 7 files × 2 dirs, flags=2 and flags=3), with map_font_ok preceding every failure — the files map fine, the flag arrives, the face dies anyway. Root cause found in source + byte-level parse of all 13 staged TTFs (13/13 match): the failing 7 all carry OS/2 achVendID=**'Wine'** plus **EBSC**/EBDT/EBLC — and wine deliberately rejects that in BOTH paths: opentype.c:669–681 ("intermediate step in building its bitmap fonts") and the same probe in new_ft_face (freetype.c:865–873). allow_bitmap is only consulted for non-SFNT faces (freetype.c:846) — never applies here. The Mac-names/charmap theory is refuted (all 7 have (3,1) cmaps and Windows name records; charmap selection happens at load, not face creation). These TTFs are upstream's build-time *sources*; upstream ships the .fon conversions.
+
+Plan: stage the built .fon set (50 files in build-host-sim-linux/fonts/; build-switch.sh:204–209 copies only `*.ttf`), build the missing vgaoem.fon/serife.fon (6 of 8 for locale 1252/437 exist), drop the 7 dead TTFs. **Caveat discovered server-side: all 56 [HZDIR] queries use mask=*.ttf** — staged .fon files would never be enumerated as-is; the scan must also issue *.fon (or wildcard). Side note: GDI "System" requests are being substitution-served by Tahoma (fs=20000057 match) until vgasys.fon loads.
+
+### Smokes
+
+- **ntdll-file-smoke**: 15/15 [OK], failures=0 — open→server handle→fd passing (write+read)→seek→read-back→close all real; real-file.txt holds the exact payload.
+- **pe-real-run**: loader machinery 100% clean (13 sections, 38/38 relocs, TLS, per-section PROT, loader_failures=0) but it loaded gui_smoke.exe from target.txt, ignoring its curl argv; blocked at 46/89 unresolved imports by design.
+- **pe-real-report**: curl.exe unopenable at all 4 paths — the gui-target package stages no drive_c/curl (manifest confirms). Packaging, not loader. Its boot is the 5-line third horizon-trace segment: aborted before any mapping request.
+
+### Anomalies
+
+- gui_timing.log is from the **libnx** run (mtimes prove it; deko3d ran first and was overwritten) — app-side deko3d rows lost; make it per-run and flush before svcExitProcess (25 rows vs 27 windows).
+- 27–53ms single-paint spike class persists in ncpaint/erase/vis_rgn max columns (~5–6 windows/run, both binaries; erase max=53 deko3d:1728, ncpaint max=50 libnx:4100). The 73ms magnitude didn't recur; the class did. Boot-only: fb_lock_call max=105ms first window, open_mapping 54ms.
+- 4 torn lines, all at exit ([EXIT] racing the trace thread); zero mid-run, zero in horizon-trace — still no line atomicity.
+- Zero [EXC] anywhere; both runs clean Minus-press exits through svcExitProcess. Only nonzero server status: 4× HZDIR err=80000006 end-of-enumeration.
+- setpos-dirty trace: 9/session again, now explained — per-hwnd cap (max 4 per hwnd), deterministic across sessions. Closing last entry's "verify its cap" item.
+
+### Next
+
+1. Batching ON — expect ~52–59, treat as a per-round-trip cost measurement.
+2. Sub-ms timers; then attack the 6.6ms untimed gap and 5.03ms surface_funcs_flush.
+3. .fon staging + *.fon scan query + missing 2 .fon builds; drop the 7 intermediate TTFs.
+4. Stage curl, make pe-real-run honor argv, add the 7 KERNEL32 + 5 CRT console shims.
+5. Spike-capture trace for the 27–53ms class; per-run gui_timing; build sha in the manifest.

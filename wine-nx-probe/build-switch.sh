@@ -180,10 +180,21 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     NLS_DIR="$PACKAGE_DIR/share/wine/nls"
     DATA_FONTS_DIR="$PACKAGE_DIR/share/wine/fonts"
     mkdir -p "$APP_DIR" "$SYSTEM_DIR" "$WIN_FONTS_DIR" "$NLS_DIR" "$DATA_FONTS_DIR"
+    # pe-real-report.nro ships in every package and probes drive_c/curl for
+    # a real console exe (its 2026-07-19 hardware run returned
+    # real_exe_ready=NO purely because a gui-target package had stripped
+    # curl.exe). Stage the curl sample binaries whenever they exist
+    # (fetched via tools/fetch-samples.sh) so that smoke is meaningful
+    # regardless of WINE_NX_APP; only the .args files, which steer the
+    # curl *runtime target*, stay curl-target-only.
     if [ "$APP_KIND" != "curl" ]; then
-        rm -f "$APP_DIR/curl.exe" "$APP_DIR/trurl.exe" "$APP_DIR/libcurl-arm64.dll" \
-              "$APP_DIR/curl.args" "$APP_DIR/trurl.args"
+        rm -f "$APP_DIR/curl.args" "$APP_DIR/trurl.args"
     fi
+    for curl_file in curl.exe trurl.exe libcurl-arm64.dll; do
+        if [ -f "$SCRIPT_DIR/samples/curl-arm64/$curl_file" ]; then
+            cp "$SCRIPT_DIR/samples/curl-arm64/$curl_file" "$APP_DIR/$curl_file"
+        fi
+    done
     if [ "$APP_KIND" != "notepad" ]; then
         rm -f "$SYSTEM_DIR/notepad.exe"
     fi
@@ -201,12 +212,39 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     else
         echo "WARNING: no .nls files found (searched Proton/wine/nls, nls/); locale init will fail" >&2
     fi
-    if [ -d "$REPO_ROOT/fonts" ] && compgen -G "$REPO_ROOT/fonts/*.ttf" >/dev/null; then
-        cp "$REPO_ROOT/fonts/"*.ttf "$WIN_FONTS_DIR/"
-        cp "$REPO_ROOT/fonts/"*.ttf "$DATA_FONTS_DIR/"
-        echo "Copied $(ls -1 "$WIN_FONTS_DIR"/*.ttf 2>/dev/null | wc -l | tr -d ' ') Wine fonts from $REPO_ROOT/fonts"
+    # Wine's fonts/ dir mixes two kinds of files: real, loadable TTFs and
+    # bitmap-font build INTERMEDIATES (OS/2 vendor 'Wine' + EBSC tables:
+    # fixedsys/system/courier/small_fonts/ms_sans_serif + _jp) that win32u
+    # deliberately refuses to load in both of its parse paths
+    # (dlls/win32u/opentype.c: "Wine uses ttfs as an intermediate step in
+    # building its bitmap fonts; we don't want to load these"). Staging
+    # those seven only produced 14 face_fail lines per boot, hardware-
+    # confirmed twice. Stage only the loadable TTFs, plus the built .fon
+    # bitmap fonts from the PE build tree -- the artifact upstream actually
+    # installs; FreeType loads Windows FNT natively, the Switch scan
+    # accepts the .fon extension and passes ADDFONT_ALLOW_BITMAP.
+    WINE_LOADABLE_TTFS="marlett symbol tahoma tahomabd webdings wingding"
+    rm -f "$WIN_FONTS_DIR"/*.ttf "$DATA_FONTS_DIR"/*.ttf
+    ttf_count=0
+    for font_name in $WINE_LOADABLE_TTFS; do
+        if [ -f "$REPO_ROOT/fonts/$font_name.ttf" ]; then
+            cp "$REPO_ROOT/fonts/$font_name.ttf" "$WIN_FONTS_DIR/"
+            cp "$REPO_ROOT/fonts/$font_name.ttf" "$DATA_FONTS_DIR/"
+            ttf_count=$((ttf_count + 1))
+        fi
+    done
+    if [ "$ttf_count" -gt 0 ]; then
+        echo "Copied $ttf_count Wine TTF fonts from $REPO_ROOT/fonts"
     else
-        echo "WARNING: no Wine .ttf fonts found in $REPO_ROOT/fonts; GDI text may not render" >&2
+        echo "WARNING: no loadable Wine .ttf fonts found in $REPO_ROOT/fonts; GDI text may not render" >&2
+    fi
+    if compgen -G "$WINE_PE_BUILD_DIR/fonts/*.fon" >/dev/null; then
+        cp "$WINE_PE_BUILD_DIR/fonts/"*.fon "$WIN_FONTS_DIR/"
+        cp "$WINE_PE_BUILD_DIR/fonts/"*.fon "$DATA_FONTS_DIR/"
+        echo "Copied $(ls -1 "$WIN_FONTS_DIR"/*.fon 2>/dev/null | wc -l | tr -d ' ') Wine bitmap .fon fonts from $WINE_PE_BUILD_DIR/fonts"
+    else
+        echo "WARNING: no built .fon fonts in $WINE_PE_BUILD_DIR/fonts;" \
+             "bitmap families (System/Fixedsys/Courier) will substitute to Tahoma" >&2
     fi
     if [ -d "$WINE_PE_DLL_ROOT" ]; then
         while IFS= read -r -d '' dll; do
