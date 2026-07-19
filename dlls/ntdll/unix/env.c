@@ -1686,8 +1686,23 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
 
 wait:
     timeout.QuadPart = (ULONGLONG)5 * 60 * 1000 * -10000;
-    if (NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout ) == WAIT_TIMEOUT)
-        ERR( "boot event wait timed out\n" );
+    status = NtWaitForMultipleObjects( count, handles, WaitAny, FALSE, &timeout );
+    if (status == WAIT_TIMEOUT) ERR( "boot event wait timed out\n" );
+    else if (count == 2 && status == WAIT_OBJECT_0 + 1)
+    {
+        /* The wineboot process handle signaled (it exited) without the boot
+         * event ever being set: prefix initialization failed. Continuing
+         * silently here used to make the *next* failure downstream (e.g.
+         * "failed to load kernel32.dll" out of a half-initialized prefix)
+         * look like the root cause -- be loud about the real one. */
+        PROCESS_BASIC_INFORMATION info;
+        if (!NtQueryInformationProcess( handles[1], ProcessBasicInformation,
+                                        &info, sizeof(info), NULL ))
+            ERR( "wineboot exited with status %x without signaling the boot event -- prefix init failed\n",
+                 (unsigned int)info.ExitStatus );
+        else
+            ERR( "wineboot exited without signaling the boot event -- prefix init failed\n" );
+    }
     while (count) NtClose( handles[--count] );
 }
 

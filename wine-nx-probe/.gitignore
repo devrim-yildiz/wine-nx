@@ -9,3 +9,7 @@ toolchains/
 samples/**/*.exe
 samples/**/*.dll
 samples/*.zip
+# host-sim run artifacts
+docker-host-sim/hello.exe
+docker-host-sim/host-sim-screenshot.png
+docker-host-sim/notepad-screenshot.png
