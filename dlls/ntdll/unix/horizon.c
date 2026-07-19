@@ -5602,14 +5602,24 @@ static int horizon_server_handle_get_visible_region( struct horizon_server_conne
         reply.total_size = horizon_server_rect_empty( &rect ) ? 0 : sizeof(rect);
         reply.header.reply_size = data_size;
 
-        horizon_trace( "[HZPAINT] visible hwnd=%08x top=%08x flags=%x rect=%d,%d-%d,%d "
-                       "toprect=%d,%d-%d,%d data=%u err=%08x\n",
-                       request->window, reply.top_win, request->flags,
-                       reply.win_rect.left, reply.win_rect.top,
-                       reply.win_rect.right, reply.win_rect.bottom,
-                       reply.top_rect.left, reply.top_rect.top,
-                       reply.top_rect.right, reply.top_rect.bottom,
-                       data_size, reply.header.error );
+        /* Same per-call fflush-to-SD-under-the-lock cost as the redraw
+         * handler's trace (see the long comment there); same 5-sample
+         * rate limit. This one fires on every BeginPaint/GetDCEx. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] visible hwnd=%08x top=%08x flags=%x rect=%d,%d-%d,%d "
+                               "toprect=%d,%d-%d,%d data=%u err=%08x\n",
+                               request->window, reply.top_win, request->flags,
+                               reply.win_rect.left, reply.win_rect.top,
+                               reply.win_rect.right, reply.win_rect.bottom,
+                               reply.top_rect.left, reply.top_rect.top,
+                               reply.top_rect.right, reply.top_rect.bottom,
+                               data_size, reply.header.error );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -5706,16 +5716,16 @@ static int horizon_server_handle_redraw_window( struct horizon_server_connection
                 if (child_win->parent == window->handle) { reply.has_children = 1; break; }
         }
 
-        /* horizon_trace() does a real fopen(append)+vfprintf+fclose on the
-         * SD card EVERY call -- worse than the fflush()-on-an-already-open-
-         * handle pattern found and fixed six times on the client side
-         * earlier tonight, this is a full filesystem open/close cycle, on
-         * the server thread, while holding horizon_server_objects_mutex,
-         * on literally every redraw_window call this whole session has
-         * been trying to speed up. Invisible to every client-side phase
-         * timer built tonight, since it happens entirely inside the "IPC
-         * call took Xms" black box. Rate-limited to the same 5-sample
-         * convention used everywhere else this session. */
+        /* horizon_trace() does a synchronous vfprintf+fflush to the SD
+         * card on every call (it used to be a full fopen/fclose cycle per
+         * call, fixed at the source since; the per-line fflush remains, by
+         * design, so traces survive a crash) -- on the server thread,
+         * while holding horizon_server_objects_mutex, on literally every
+         * redraw_window call this whole session has been trying to speed
+         * up. Invisible to every client-side phase timer built tonight,
+         * since it happens entirely inside the "IPC call took Xms" black
+         * box. Rate-limited to the same 5-sample convention used
+         * everywhere else this session. */
         {
             static unsigned int logged;
             if (logged < 5)
@@ -5961,14 +5971,24 @@ static int horizon_server_handle_get_update_region( struct horizon_server_connec
                 }
             }
         }
-        horizon_trace( "[HZPAINT] get_update hwnd=%08x from=%08x req=%x child=%08x flags=%x size=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d err=%08x\n",
-                       request->window, request->from_child, request->flags, reply.child, reply.flags,
-                       reply.total_size, target ? target->has_update_rect : window->has_update_rect,
-                       target ? target->has_internal_paint : window->has_internal_paint,
-                       target ? target->needs_erase : window->needs_erase,
-                       target ? target->needs_nonclient : window->needs_nonclient,
-                       rect.left, rect.top, rect.right, rect.bottom,
-                       reply.header.error );
+        /* Same per-call fflush-to-SD-under-the-lock cost as the redraw
+         * handler's trace (see the long comment there); same 5-sample
+         * rate limit. This one fires up to 3x per paint cycle. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] get_update hwnd=%08x from=%08x req=%x child=%08x flags=%x size=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d err=%08x\n",
+                               request->window, request->from_child, request->flags, reply.child, reply.flags,
+                               reply.total_size, target ? target->has_update_rect : window->has_update_rect,
+                               target ? target->has_internal_paint : window->has_internal_paint,
+                               target ? target->needs_erase : window->needs_erase,
+                               target ? target->needs_nonclient : window->needs_nonclient,
+                               rect.left, rect.top, rect.right, rect.bottom,
+                               reply.header.error );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
