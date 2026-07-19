@@ -151,6 +151,15 @@ struct file_id
 #define HASH_MAP_SIZE 32
 static LIST_ENTRY hash_table[HASH_MAP_SIZE];
 
+/* wine-nx: the Switch bring-up loader (native side; see the hash-table
+ * bootstrap block near the bottom of this file) must locate the PE
+ * module's hash_table by address at runtime. Exported as data
+ * (ntdll.spec: wine_nx_pe_hash_table, same pattern as wine_nx_pe_teb) so
+ * the lookup survives rebuilds -- the hard-coded .data offset previously
+ * used broke, with a boot-killing write AV, the first time PE ntdll was
+ * actually rebuilt. */
+LIST_ENTRY *wine_nx_pe_hash_table = hash_table;
+
 /* internal representation of loaded modules */
 typedef struct _wine_modref
 {
@@ -4370,17 +4379,15 @@ static void wine_nx_patch_ntdll_dispatchers(void)
      * ucrtbase's DllMain) dereferences a NULL pointer. version_init also touches the TEB
      * via x18, so it needs the same wrapper as RtlCreateHeap.
      *
-     * Preferred: lookup via the export table (requires version_init in ntdll.spec and a
-     * PE ntdll rebuild). Fallback: hardcoded offset 0x76d24 of `version_init` inside the
-     * prebuilt aarch64 ntdll.dll currently shipped. The fallback is fragile across PE
-     * ntdll rebuilds — update if `llvm-objdump -t ntdll.dll | grep version_init` differs. */
+     * Resolved via the export table (version_init is in ntdll.spec). There used to be a
+     * hardcoded-offset fallback (0x76d24, valid for one specific prebuilt ntdll.dll);
+     * removed -- branching to a stale code offset in a rebuilt DLL is an undiagnosable
+     * crash, whereas skipping with a trace names the actual problem. */
     {
         void *version_init_fn = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "version_init" );
         if (!version_init_fn)
-        {
-            version_init_fn = (char *)ntdll->ldr.DllBase + 0x76d24;
-            wine_nx_trace( "[LDR] version_init export missing; falling back to hardcoded offset %p", version_init_fn );
-        }
+            wine_nx_trace( "[LDR] version_init export missing from PE ntdll; skipping -- "
+                           "rebuild PE ntdll with current ntdll.spec" );
         if (version_init_fn)
         {
             uintptr_t teb_val = (uintptr_t)NtCurrentTeb();
@@ -4447,15 +4454,30 @@ static void wine_nx_patch_ntdll_dispatchers(void)
      * ntdll_pe_compat.c uses DJB2, which would index different buckets and
      * leave lookups missing.
      *
-     * Offset 0xc2410 is the .data offset of `hash_table` symbol in the
-     * prebuilt aarch64 ntdll.dll — verify with `llvm-objdump -t | grep hash_table`
-     * if PE ntdll is ever rebuilt. */
+     * The table's address comes from PE ntdll's wine_nx_pe_hash_table data
+     * export (a pointer variable next to the static array; ntdll.spec).
+     * This used to be a hard-coded .data offset (0xc2410) into one specific
+     * prebuilt ntdll.dll, which crashed the boot with a write AV into
+     * .pdata the first time PE ntdll was rebuilt at a different layout. */
     {
-        LIST_ENTRY *pe_hash_table = (LIST_ENTRY *)((char *)ntdll->ldr.DllBase + 0xc2410);
+        LIST_ENTRY *pe_hash_table = NULL;
+        LIST_ENTRY **hash_table_export =
+            RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "wine_nx_pe_hash_table" );
         PEB *peb_local = NtCurrentTeb()->Peb;
         LIST_ENTRY *head, *cursor;
         unsigned int i, inserted = 0;
 
+        if (hash_table_export) pe_hash_table = *hash_table_export;
+        if (!pe_hash_table)
+        {
+            /* No guessing at offsets: a skipped init is diagnosable (module
+             * lookups via LdrGetDllHandle will fail loudly later), a write
+             * through a wrong offset is a silent boot kill. */
+            wine_nx_trace( "[LDR] wine_nx_pe_hash_table export missing from PE ntdll; "
+                           "skipping hash-table init -- rebuild PE ntdll with current ntdll.spec" );
+        }
+        else
+        {
         for (i = 0; i < 32; i++)
         {
             pe_hash_table[i].Flink = &pe_hash_table[i];
@@ -4495,6 +4517,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
         }
         wine_nx_trace( "[LDR] PE ntdll hash_table initialized (32 buckets at %p, %u modules inserted)",
                        pe_hash_table, inserted );
+        }
     }
 }
 

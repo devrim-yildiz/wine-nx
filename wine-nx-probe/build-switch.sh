@@ -95,6 +95,14 @@ docker run --rm \
         if [ ! -f "$DEVKITPRO/portlibs/switch/include/freetype2/ft2build.h" ]; then
             dkp-pacman -Sy --noconfirm --needed switch-freetype switch-harfbuzz switch-bzip2 switch-libpng
         fi
+        # win32u also needs wine'\''s widl-generated headers (objidlbase.h
+        # etc.), which are not in git -- generate them on first build. The
+        # devkitA64 image is Debian but ships without bison/flex, which
+        # wine'\''s configure needs for the generator tools.
+        if [ ! -f build-wine-headers/include/objidlbase.h ] && [ ! -f build-wine-arm64-pe-clean/include/objidlbase.h ]; then
+            command -v bison >/dev/null 2>&1 || { apt-get update && apt-get install -y --no-install-recommends bison flex; }
+            ./tools/generate-wine-headers.sh
+        fi
         cmake -S . -B build-switch \
             -DCMAKE_TOOLCHAIN_FILE=cmake/switch-devkitA64.cmake \
             -DCMAKE_BUILD_TYPE=Release
@@ -172,10 +180,21 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     NLS_DIR="$PACKAGE_DIR/share/wine/nls"
     DATA_FONTS_DIR="$PACKAGE_DIR/share/wine/fonts"
     mkdir -p "$APP_DIR" "$SYSTEM_DIR" "$WIN_FONTS_DIR" "$NLS_DIR" "$DATA_FONTS_DIR"
+    # pe-real-report.nro ships in every package and probes drive_c/curl for
+    # a real console exe (its 2026-07-19 hardware run returned
+    # real_exe_ready=NO purely because a gui-target package had stripped
+    # curl.exe). Stage the curl sample binaries whenever they exist
+    # (fetched via tools/fetch-samples.sh) so that smoke is meaningful
+    # regardless of WINE_NX_APP; only the .args files, which steer the
+    # curl *runtime target*, stay curl-target-only.
     if [ "$APP_KIND" != "curl" ]; then
-        rm -f "$APP_DIR/curl.exe" "$APP_DIR/trurl.exe" "$APP_DIR/libcurl-arm64.dll" \
-              "$APP_DIR/curl.args" "$APP_DIR/trurl.args"
+        rm -f "$APP_DIR/curl.args" "$APP_DIR/trurl.args"
     fi
+    for curl_file in curl.exe trurl.exe libcurl-arm64.dll; do
+        if [ -f "$SCRIPT_DIR/samples/curl-arm64/$curl_file" ]; then
+            cp "$SCRIPT_DIR/samples/curl-arm64/$curl_file" "$APP_DIR/$curl_file"
+        fi
+    done
     if [ "$APP_KIND" != "notepad" ]; then
         rm -f "$SYSTEM_DIR/notepad.exe"
     fi
@@ -193,12 +212,39 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     else
         echo "WARNING: no .nls files found (searched Proton/wine/nls, nls/); locale init will fail" >&2
     fi
-    if [ -d "$REPO_ROOT/fonts" ] && compgen -G "$REPO_ROOT/fonts/*.ttf" >/dev/null; then
-        cp "$REPO_ROOT/fonts/"*.ttf "$WIN_FONTS_DIR/"
-        cp "$REPO_ROOT/fonts/"*.ttf "$DATA_FONTS_DIR/"
-        echo "Copied $(ls -1 "$WIN_FONTS_DIR"/*.ttf 2>/dev/null | wc -l | tr -d ' ') Wine fonts from $REPO_ROOT/fonts"
+    # Wine's fonts/ dir mixes two kinds of files: real, loadable TTFs and
+    # bitmap-font build INTERMEDIATES (OS/2 vendor 'Wine' + EBSC tables:
+    # fixedsys/system/courier/small_fonts/ms_sans_serif + _jp) that win32u
+    # deliberately refuses to load in both of its parse paths
+    # (dlls/win32u/opentype.c: "Wine uses ttfs as an intermediate step in
+    # building its bitmap fonts; we don't want to load these"). Staging
+    # those seven only produced 14 face_fail lines per boot, hardware-
+    # confirmed twice. Stage only the loadable TTFs, plus the built .fon
+    # bitmap fonts from the PE build tree -- the artifact upstream actually
+    # installs; FreeType loads Windows FNT natively, the Switch scan
+    # accepts the .fon extension and passes ADDFONT_ALLOW_BITMAP.
+    WINE_LOADABLE_TTFS="marlett symbol tahoma tahomabd webdings wingding"
+    rm -f "$WIN_FONTS_DIR"/*.ttf "$DATA_FONTS_DIR"/*.ttf
+    ttf_count=0
+    for font_name in $WINE_LOADABLE_TTFS; do
+        if [ -f "$REPO_ROOT/fonts/$font_name.ttf" ]; then
+            cp "$REPO_ROOT/fonts/$font_name.ttf" "$WIN_FONTS_DIR/"
+            cp "$REPO_ROOT/fonts/$font_name.ttf" "$DATA_FONTS_DIR/"
+            ttf_count=$((ttf_count + 1))
+        fi
+    done
+    if [ "$ttf_count" -gt 0 ]; then
+        echo "Copied $ttf_count Wine TTF fonts from $REPO_ROOT/fonts"
     else
-        echo "WARNING: no Wine .ttf fonts found in $REPO_ROOT/fonts; GDI text may not render" >&2
+        echo "WARNING: no loadable Wine .ttf fonts found in $REPO_ROOT/fonts; GDI text may not render" >&2
+    fi
+    if compgen -G "$WINE_PE_BUILD_DIR/fonts/*.fon" >/dev/null; then
+        cp "$WINE_PE_BUILD_DIR/fonts/"*.fon "$WIN_FONTS_DIR/"
+        cp "$WINE_PE_BUILD_DIR/fonts/"*.fon "$DATA_FONTS_DIR/"
+        echo "Copied $(ls -1 "$WIN_FONTS_DIR"/*.fon 2>/dev/null | wc -l | tr -d ' ') Wine bitmap .fon fonts from $WINE_PE_BUILD_DIR/fonts"
+    else
+        echo "WARNING: no built .fon fonts in $WINE_PE_BUILD_DIR/fonts;" \
+             "bitmap families (System/Fixedsys/Courier) will substitute to Tahoma" >&2
     fi
     if [ -d "$WINE_PE_DLL_ROOT" ]; then
         while IFS= read -r -d '' dll; do
@@ -235,7 +281,10 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         GUI_SRC="$SCRIPT_DIR/samples/gui-smoke/gui_smoke.c"
         GUI_EXE="$SCRIPT_DIR/samples/gui-smoke/gui_smoke.exe"
         GUI_CC="$LLVM_MINGW_BIN_DIR/aarch64-w64-mingw32-clang"
-        if [ -f "$GUI_SRC" ]; then
+        # Only require the PE compiler when a rebuild is actually needed --
+        # a fresh gui_smoke.exe built elsewhere (e.g. inside the
+        # docker-host-sim container, which has llvm-mingw) stages as-is.
+        if [ -f "$GUI_SRC" ] && { [ ! -f "$GUI_EXE" ] || [ "$GUI_SRC" -nt "$GUI_EXE" ]; }; then
             if [ ! -x "$GUI_CC" ]; then
                 GUI_CC="$(command -v aarch64-w64-mingw32-clang || true)"
             fi
@@ -243,10 +292,8 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
                 echo "Missing aarch64-w64-mingw32-clang; cannot build GUI smoke app" >&2
                 exit 1
             fi
-            if [ ! -f "$GUI_EXE" ] || [ "$GUI_SRC" -nt "$GUI_EXE" ]; then
-                "$GUI_CC" -municode -mwindows -O2 -Wall -Wextra \
-                    -o "$GUI_EXE" "$GUI_SRC" -luser32 -lgdi32
-            fi
+            "$GUI_CC" -municode -mwindows -O2 -Wall -Wextra \
+                -o "$GUI_EXE" "$GUI_SRC" -luser32 -lgdi32
         fi
     fi
     # Direct-blit test app: WINE_NX_APP=blit stages the no-InvalidateRect/
@@ -256,7 +303,8 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         BLIT_SRC="$SCRIPT_DIR/samples/direct-blit/direct_blit.c"
         BLIT_EXE="$SCRIPT_DIR/samples/direct-blit/direct_blit.exe"
         BLIT_CC="$LLVM_MINGW_BIN_DIR/aarch64-w64-mingw32-clang"
-        if [ -f "$BLIT_SRC" ]; then
+        # Same stale-check-first ordering as the GUI smoke app above.
+        if [ -f "$BLIT_SRC" ] && { [ ! -f "$BLIT_EXE" ] || [ "$BLIT_SRC" -nt "$BLIT_EXE" ]; }; then
             if [ ! -x "$BLIT_CC" ]; then
                 BLIT_CC="$(command -v aarch64-w64-mingw32-clang || true)"
             fi
@@ -264,10 +312,8 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
                 echo "Missing aarch64-w64-mingw32-clang; cannot build direct-blit test app" >&2
                 exit 1
             fi
-            if [ ! -f "$BLIT_EXE" ] || [ "$BLIT_SRC" -nt "$BLIT_EXE" ]; then
-                "$BLIT_CC" -municode -mwindows -O2 -Wall -Wextra \
-                    -o "$BLIT_EXE" "$BLIT_SRC" -luser32 -lgdi32
-            fi
+            "$BLIT_CC" -municode -mwindows -O2 -Wall -Wextra \
+                -o "$BLIT_EXE" "$BLIT_SRC" -luser32 -lgdi32
         fi
     fi
     if [ "$APP_KIND" = "gui" ] && [ -f "$SCRIPT_DIR/samples/gui-smoke/gui_smoke.exe" ]; then
@@ -339,6 +385,21 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         echo "# wine-nx runtime package manifest"
         echo "# Copy this whole directory to sdmc:/switch/wine"
         echo
+        # Provenance: a stale NRO on the SD card has burned multiple debug
+        # sessions (the README checklist's build-marker gotcha) and the
+        # 2026-07-19 deploy had to be *proven* current via a behavioral
+        # change in the logs because this manifest carried no identity.
+        echo "[build]"
+        echo "git: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO_ROOT" diff --quiet 2>/dev/null || echo '-dirty')"
+        echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+        echo "[nro-sha256]"
+        for nro in "$PACKAGE_DIR"/*.nro; do
+            if [ -f "$nro" ]; then
+                echo "$(basename "$nro"): $(shasum -a 256 "$nro" | cut -d' ' -f1)"
+            fi
+        done
+        echo
         echo "[system32]"
         find "$SYSTEM_DIR" -maxdepth 1 -type f -name '*.dll' -exec basename {} \; | sort
         echo
@@ -346,7 +407,7 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         find "$NLS_DIR" -maxdepth 1 -type f -name '*.nls' -exec basename {} \; | sort
         echo
         echo "[fonts]"
-        find "$WIN_FONTS_DIR" -maxdepth 1 -type f -name '*.ttf' -exec basename {} \; | sort
+        find "$WIN_FONTS_DIR" -maxdepth 1 -type f \( -name '*.ttf' -o -name '*.fon' \) -exec basename {} \; | sort
         echo
         if [ -f "$SYSTEM_DIR/notepad.exe" ]; then
             echo "[notepad]"

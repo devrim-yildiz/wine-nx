@@ -312,8 +312,8 @@ static void wine_nx_flush_legacy_select(void)
  * diagnostic, so wrong here means silent visual corruption, not a crash.
  *
  * NtUserBeginPaint always issues get_update_region followed by
- * get_visible_region, each its own ~14-15ms IPC round trip (see README,
- * "The ~14ms Per-Call IPC Floor"). horizon_server_handle_get_paint_regions
+ * get_visible_region, each its own ~14-15ms IPC round trip (see
+ * wine-nx-probe/perf-lab-log.md, "The ~14ms Per-Call IPC Floor"). horizon_server_handle_get_paint_regions
  * computes both under one lock pass with no cross-dependency between them,
  * so ON fetches both in a single round trip via
  * switch_prefetch_paint_regions() (dlls/win32u/dce.c) instead of two
@@ -432,13 +432,17 @@ int wine_nx_batch_redraw_updatenow_enabled;
 
 static void wine_nx_batch_redraw_updatenow_select(void)
 {
-    const char *env = getenv( "WINE_NX_BATCH_REDRAW_UPDATENOW" );
-    if (env && env[0]) wine_nx_batch_redraw_updatenow_enabled = 1;
-    else wine_nx_batch_redraw_updatenow_enabled = wine_nx_config_get_bool( "batchredrawupdatenow" );
+    const char *source;
+
+    /* NULL legacy path: config.txt only for this toggle, per the comment
+     * above -- the shared resolver just skips that tier. */
+    wine_nx_batch_redraw_updatenow_enabled =
+        wine_nx_resolve_bool_toggle( "WINE_NX_BATCH_REDRAW_UPDATENOW", "batchredrawupdatenow",
+                                     NULL, &source );
     log_line( "[NXTRACE] combined redraw_window+get_update_flags_ex mode: %s (source=%s)",
              wine_nx_batch_redraw_updatenow_enabled ? "ON (one combined IPC round trip for UpdateWindow's first search)"
                                                     : "off (default: separate redraw_window + get_update_flags_ex calls)",
-             (env && env[0]) ? "env" : (wine_nx_batch_redraw_updatenow_enabled ? "config.txt" : "default") );
+             source );
 }
 
 #ifdef WINE_NX_DEKO3D_ONLY
@@ -1059,13 +1063,27 @@ static int read_first_line( const char *path, char *line, size_t size )
     return line[0] != 0;
 }
 
+/* Single boolean-value parser shared by all three toggle tiers (env var,
+ * config.txt, legacy standalone .txt file). "Present but no value" -- an env
+ * var set to the empty string, or a bare config key with no '=' -- counts as
+ * on; otherwise only the four affirmative spellings count. Everything else
+ * (including "0"/"false") is off, so WINE_NX_X=0 really disables X. */
+static int wine_nx_parse_bool_value( const char *value )
+{
+    if (!value[0]) return 1;
+    return !strcmp( value, "1" ) || !strcasecmp( value, "true" ) ||
+           !strcasecmp( value, "yes" ) || !strcasecmp( value, "run" );
+}
+
 static int read_bool_file( const char *path )
 {
     char line[32];
 
+    /* read_first_line already returns 0 for an empty first line, so the
+     * empty-means-on rule above can't engage here; a missing/empty file
+     * stays off, same as it always has. */
     if (!read_first_line( path, line, sizeof(line) )) return 0;
-    return !strcmp( line, "1" ) || !strcasecmp( line, "true" ) ||
-           !strcasecmp( line, "yes" ) || !strcasecmp( line, "run" );
+    return wine_nx_parse_bool_value( line );
 }
 
 /* One consolidated config file (sdmc:/switch/wine/config.txt) instead of a
@@ -1084,6 +1102,7 @@ static struct
 {
     char key[32];
     char value[64];
+    int used;
 } wine_nx_config_entries[WINE_NX_CONFIG_MAX_ENTRIES];
 static int wine_nx_config_entry_count;
 static int wine_nx_config_loaded;
@@ -1134,38 +1153,66 @@ static const char *wine_nx_config_get( const char *key )
 
     wine_nx_config_load();
     for (i = 0; i < wine_nx_config_entry_count; i++)
-        if (!strcasecmp( wine_nx_config_entries[i].key, key )) return wine_nx_config_entries[i].value;
+        if (!strcasecmp( wine_nx_config_entries[i].key, key ))
+        {
+            wine_nx_config_entries[i].used = 1;
+            return wine_nx_config_entries[i].value;
+        }
     return NULL;
+}
+
+/* Called once after the boot-time *_select() block: any config.txt entry
+ * nothing has looked up by then is almost certainly a typo'd key, and a
+ * typo'd key is a SILENT no-op -- the 2026-07-19 run 3 deploy shipped
+ * skipredundantupdate=1 (real key: skipupdatecheck) and the toggle just
+ * quietly stayed off, contaminating an A/B run. Keys consumed later than
+ * the select block are whitelisted here; extend the list when adding one. */
+static void wine_nx_config_warn_unused(void)
+{
+    static const char *const late_keys[] = { "target", "args", "deko3d" };
+    int i;
+    unsigned int j;
+
+    for (i = 0; i < wine_nx_config_entry_count; i++)
+    {
+        int later = 0;
+        if (wine_nx_config_entries[i].used) continue;
+        for (j = 0; j < sizeof(late_keys) / sizeof(late_keys[0]); j++)
+            if (!strcasecmp( wine_nx_config_entries[i].key, late_keys[j] )) { later = 1; break; }
+        if (!later)
+            log_line( "[NXCONF] WARNING: config.txt key '%s' matches no known toggle -- typo? (value '%s' ignored)",
+                      wine_nx_config_entries[i].key, wine_nx_config_entries[i].value );
+    }
 }
 
 static int wine_nx_config_get_bool( const char *key )
 {
     const char *value = wine_nx_config_get( key );
 
-    if (!value) return 0;
-    if (!value[0]) return 1;  /* bare key, no '=' -> true */
-    return !strcmp( value, "1" ) || !strcasecmp( value, "true" ) ||
-           !strcasecmp( value, "yes" ) || !strcasecmp( value, "run" );
+    return value ? wine_nx_parse_bool_value( value ) : 0;
 }
 
 /* Shared 3-tier resolution every boolean runtime toggle in this file uses:
  * env var (highest priority, useful for host-sim/quick dev testing) ->
  * config.txt key -> legacy standalone .txt file (lowest priority, kept only
- * for backward compatibility) -> default off. *source_out is set to a short
- * label for the log line, so it's always clear which of the three actually
- * engaged (or that none did). */
+ * for backward compatibility) -> default off. A tier that is *present*
+ * claims the decision in both directions: WINE_NX_X=0 forces X off even if
+ * config.txt enables it, exactly so a dev run can override an SD card's
+ * config without editing it. Set-but-empty means on, mirroring a bare
+ * config key. *source_out is set to a short label for the log line, so it's
+ * always clear which of the three actually engaged (or that none did). */
 static int wine_nx_resolve_bool_toggle( const char *env_name, const char *config_key,
                                         const char *legacy_path, const char **source_out )
 {
     const char *env = getenv( env_name );
 
-    if (env && env[0]) { *source_out = "env"; return 1; }
+    if (env) { *source_out = "env"; return wine_nx_parse_bool_value( env ); }
     if (wine_nx_config_get( config_key ))
     {
         *source_out = "config.txt";
         return wine_nx_config_get_bool( config_key );
     }
-    if (read_bool_file( legacy_path )) { *source_out = "legacy .txt file"; return 1; }
+    if (legacy_path && read_bool_file( legacy_path )) { *source_out = "legacy .txt file"; return 1; }
     *source_out = "default";
     return 0;
 }
@@ -1853,6 +1900,7 @@ int main( int argc, char **argv )
     wine_nx_fast_flush_period_select();
     wine_nx_batch_redraw_updatenow_select();
     wine_nx_neon_blit_select();
+    wine_nx_config_warn_unused();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else

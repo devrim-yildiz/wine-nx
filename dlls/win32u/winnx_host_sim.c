@@ -60,6 +60,17 @@ void wine_nx_runtime_trace( const char *msg )
     fprintf( stderr, "%s\n", msg );
 }
 
+#ifndef __SWITCH__
+/* Runtime toggle globals normally defined by wine-nx-probe/source/runtime.c,
+ * which only links into the Switch binaries -- without host-side definitions
+ * here, winnx_drv.c's references leave win32u.so unlinkable on host builds
+ * (found the first time a full host build was actually attempted). Both stay
+ * at their off defaults: the paint-trace tier and the NEON blit are
+ * Switch-hardware concerns the sim deliberately doesn't model. */
+int wine_nx_paint_trace_enabled;
+int wine_nx_neon_blit_enabled;
+#endif
+
 /* Lazily bring up the SDL window in place of framebufferCreate()/MakeLinear().
  * Must run on the main thread on macOS -- see the file header. Caller must
  * hold sim_mutex: both wine_nx_fb_lock() and wine_nx_touch_poll() can reach

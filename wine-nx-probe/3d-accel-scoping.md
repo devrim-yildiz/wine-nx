@@ -1,19 +1,24 @@
 # 3D-accel (GPU compositor) milestone -- scoping
 
-Status: the Mesa/NVK dependency question is **resolved** (see below), the
-deko3d bring-up smoke test (`wine-nx-probe/source/deko3d_smoke.c`, target
-`wine-nx-deko3d-smoke`) hardware-confirmed device/queue/swapchain creation,
-a CPU-to-GPU texture upload, and a real shader-driven rotating cube all
-running together at 60-62fps -- and the actual compositor swap into
-`wine_nx_fb_lock/unlock/present` (`wine-nx-probe/source/runtime_deko3d.c`)
-has been attempted and is now **architecturally blocked** for the
-single-binary, runtime-selectable-backend design this project uses. See
-"Compositor-swap attempt: blocked by libnx's pre-main() vi bootstrap"
-below for the root cause and the real path forward, and "What's actually
-built vs. planned" at the bottom for the full picture. The runtime falls
-back to the proven libnx-framebuffer path automatically and unconditionally
-on any deko3d failure, so this is a parked dead end, not a regression --
-the app works today exactly as it did before this milestone was attempted.
+Status (updated since this doc was first written): the Mesa/NVK dependency
+question is **resolved** (see below), the deko3d bring-up smoke test
+(`wine-nx-probe/source/deko3d_smoke.c`, target `wine-nx-deko3d-smoke`)
+hardware-confirmed device/queue/swapchain creation, a CPU-to-GPU texture
+upload, and a real shader-driven rotating cube all running together at
+60-62fps -- and the compositor path this doc's blocker analysis called for
+**has since landed and is hardware-confirmed working**: the separate
+`wine-nx-runtime-deko3d` binary (built with `WINE_NX_DEKO3D_ONLY`, see
+`wine-nx-probe/CMakeLists.txt`) compiles out every libnx-framebuffer/
+console path so deko3d really is the first `vi` consumer, and the full
+Win32 GUI smoke stack renders and presents through it on hardware. What
+remains blocked -- permanently, for the pre-main() `__appInit` reason
+documented below -- is the *single-binary, runtime-selectable* backend
+swap inside the original `wine-nx-runtime`: that binary's parked
+`WINE_NX_DEKO3D` flag can never work and is kept only as documentation.
+See "Compositor-swap attempt: blocked by libnx's pre-main() vi bootstrap"
+below for that root cause (still accurate for the single-binary case),
+and the top-level README plus `wine-nx-probe/perf-lab-log.md` for the
+hardware results measured through the separate binary.
 
 ## Resolved: does a usable Mesa/NVK (Vulkan) port exist for this project?
 

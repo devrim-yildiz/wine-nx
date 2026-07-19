@@ -6,7 +6,7 @@
  * InvalidateRect()+UpdateWindow()+BeginPaint()/EndPaint() repaint chain
  * (redraw_window + two get_update_region calls + get_paint_regions/
  * get_visible_region, all real IPC round trips through horizon.c, see
- * README "The ~14ms Per-Call IPC Floor"), or a ceiling on Win32 rendering
+ * wine-nx-probe/perf-lab-log.md, "The ~14ms Per-Call IPC Floor"), or a ceiling on Win32 rendering
  * on this port generally?
  *
  * This app never calls InvalidateRect(), UpdateWindow(), BeginPaint(), or

@@ -1,0 +1,135 @@
+# CI for the wine-nx Switch port. (The stock .gitlab-ci.yml is upstream
+# Wine's and does not exercise any of this fork's code.)
+#
+# What CI here can NOT cover, by nature: hardware fps and the 8fps GUI
+# baseline, [NXWAKE] IPC wake latency, SD-card I/O behavior, the deko3d GPU
+# path, and touch/controller input. Those need the hardware checklist in the
+# README. What it CAN cover: that every NRO target still compiles (including
+# horizon.c's wire-protocol static asserts, which only real Switch builds
+# check), and that the SDL2 host-sim dev loop still boots a PE and renders.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Wine's widl-generated headers (objidlbase.h etc.) are not in git; the
+  # NRO build needs them (see wine-nx-probe/tools/generate-wine-headers.sh).
+  # Generate them once on a plain runner and hand them to the NRO job --
+  # cheaper than apt-installing bison/flex into the devkitA64 container on
+  # every run.
+  wine-headers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bison flex
+      - name: Generate headers
+        run: ./wine-nx-probe/tools/generate-wine-headers.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wine-generated-headers
+          path: wine-nx-probe/build-wine-headers/include/*.h
+          retention-days: 1
+
+  # Build every Switch NRO target with the same devkitA64 image
+  # build-switch.sh uses, pinned by digest so CI can't drift under us.
+  # To refresh the pin: check https://hub.docker.com/r/devkitpro/devkita64/tags
+  # (or `docker manifest inspect devkitpro/devkita64:latest`), update the
+  # digest below, and verify a local ./wine-nx-probe/build-switch.sh run
+  # against the new image first. build-switch.sh itself floats :latest.
+  switch-nro:
+    runs-on: ubuntu-latest
+    needs: wine-headers
+    timeout-minutes: 60
+    container:
+      image: devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wine-generated-headers
+          path: wine-nx-probe/build-wine-headers/include
+
+      # The pinned image already ships these portlibs (verified against this
+      # exact digest: ft2build.h + freetype/harfbuzz/bz2/png libs present),
+      # and pkg.devkitpro.org deliberately 403s CI traffic -- so never sync
+      # pacman unless a future image digest actually drops them. Same
+      # existence guard build-switch.sh uses.
+      - name: Check Switch portlibs
+        run: |
+          if [ ! -f "$DEVKITPRO/portlibs/switch/include/freetype2/ft2build.h" ]; then
+            dkp-pacman -Sy --noconfirm --needed switch-freetype switch-harfbuzz switch-bzip2 switch-libpng
+          fi
+
+      - name: Configure
+        working-directory: wine-nx-probe
+        run: cmake -S . -B build-switch -DCMAKE_TOOLCHAIN_FILE=cmake/switch-devkitA64.cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        working-directory: wine-nx-probe
+        run: cmake --build build-switch -j"$(nproc)"
+
+      - name: Check NRO outputs
+        working-directory: wine-nx-probe/build-switch
+        run: |
+          ls -la *.nro
+          test -f wine-nx-probe.nro
+          test -f wine-nx-runtime.nro
+          test -f wine-nx-runtime-deko3d.nro
+
+      - name: Upload NROs
+        uses: actions/upload-artifact@v7
+        with:
+          name: switch-nros
+          path: wine-nx-probe/build-switch/*.nro
+          retention-days: 7
+
+  # Job 2: build the SDL2 host-sim (full wine build: unix side + aarch64 PE
+  # DLLs) and run the self-checking smoke -- run-host-sim.sh exits nonzero
+  # unless a PE actually loads and renders through the host-sim surface.
+  # Needs an arm64 runner: the container installs the aarch64 llvm-mingw
+  # toolchain and the wine build is aarch64-native.
+  #
+  # A required gate since its first green run on GitHub infrastructure
+  # (2026-07-19, run 29702983794).
+  host-sim:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      # The wine build tree is large but incremental: cache it so re-runs
+      # only rebuild what changed instead of the whole tree.
+      - name: Cache host-sim build tree
+        uses: actions/cache@v6
+        with:
+          path: wine-nx-probe/build-host-sim-linux
+          key: host-sim-build-${{ runner.arch }}-${{ hashFiles('configure.ac', 'wine-nx-probe/docker-host-sim/Dockerfile') }}
+          restore-keys: |
+            host-sim-build-${{ runner.arch }}-
+
+      - name: Build host-sim image
+        run: docker build -t wine-nx-host-sim:latest wine-nx-probe/docker-host-sim
+
+      - name: Run host-sim smoke
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            wine-nx-host-sim:latest \
+            ./wine-nx-probe/docker-host-sim/run-host-sim.sh
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: host-sim-screenshot
+          path: wine-nx-probe/docker-host-sim/host-sim-screenshot.png
+          if-no-files-found: ignore
+          retention-days: 7

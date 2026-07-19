@@ -1,4 +1,15 @@
 build-switch/
+build-wine-headers/
+build-wine-arm64-pe/
 build-wine-arm64-pe-clean/
 build-wine-arm64-pe-local/
 toolchains/
+# Sample binaries are fetched (sha256-pinned), not tracked -- see
+# tools/fetch-samples.sh.
+samples/**/*.exe
+samples/**/*.dll
+samples/*.zip
+# host-sim run artifacts
+docker-host-sim/hello.exe
+docker-host-sim/host-sim-screenshot.png
+docker-host-sim/notepad-screenshot.png

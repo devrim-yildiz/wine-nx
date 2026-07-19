@@ -71,7 +71,13 @@ static void nxfont_trace( const char *fmt, ... )
     wine_nx_runtime_trace( buf );
 }
 
-static void nxfont_trace_wpath( const char *tag, const WCHAR *path, UINT flags, NTSTATUS status )
+/* The two numeric values mean different things per tag (charset +
+ * font-signature fsCsb[0] for the select_* tags, flags + signature for
+ * select_file, signature + face index for select_family, ...), so the
+ * labels are deliberately neutral -- the old "flags=/status=" labels were
+ * wrong for most call sites (e.g. printing fsCsb[0] 0x20000057 as a
+ * "status", which reads like an error code and isn't one). */
+static void nxfont_trace_wpath( const char *tag, const WCHAR *path, UINT v1, UINT v2 )
 {
     char pathA[180];
     unsigned int i;
@@ -79,7 +85,7 @@ static void nxfont_trace_wpath( const char *tag, const WCHAR *path, UINT flags, 
     for (i = 0; path && path[i] && i < sizeof(pathA) - 1; i++)
         pathA[i] = (path[i] >= 32 && path[i] < 127) ? (char)path[i] : '?';
     pathA[i] = 0;
-    nxfont_trace( "[NXFONT] %s flags=%x status=%08x path=%s", tag, flags, (unsigned int)status, pathA );
+    nxfont_trace( "[NXFONT] %s v1=%x v2=%08x path=%s", tag, v1, v2, pathA );
 }
 #endif
 
@@ -4545,7 +4551,18 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
     {
         TRACE( "returning cached gdiFont(%p)\n", font );
 #ifdef __SWITCH__
-        nxfont_trace_wpath( "select_cached", lf->lfFaceName, lf->lfCharSet, font->fs.fsCsb[0] );
+        /* Cache hits fire on every single paint cycle -- unguarded, this
+         * one trace was ~30% of all runtime log lines on hardware (the
+         * same unconditional-hot-trace bug class fixed in horizon.c and
+         * winnx_drv.c). Same 5-sample convention as everywhere else. */
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                nxfont_trace_wpath( "select_cached", lf->lfFaceName, lf->lfCharSet, font->fs.fsCsb[0] );
+                logged++;
+            }
+        }
 #endif
         return font;
     }
@@ -6831,11 +6848,20 @@ static void load_file_system_fonts(void)
 #endif
 
 #ifdef __SWITCH__
+    /* ADDFONT_ALLOW_BITMAP: on this port the directory scan is the ONLY
+     * path bitmap faces can load through -- upstream admits them via
+     * load_registry_fonts() (wineboot registers .fon files in the
+     * registry, and that path passes the flag), but the Switch boot takes
+     * the registry_cache=0 early-out below and never runs it. Without the
+     * flag, the staged bitmap-only faces (fixedsys/system/ms_sans_serif/
+     * small_fonts/courier + _jp variants, EBDT-only TTFs) all die in
+     * new_ft_face's !scalable check -- 14 face_fail pairs every boot,
+     * with everything silently falling back to Tahoma. */
     load_switch_directory_fonts( "sdmc:/switch/wine/drive_c/windows/fonts",
-                                 "\\??\\C:\\windows\\fonts\\", 0 );
+                                 "\\??\\C:\\windows\\fonts\\", ADDFONT_ALLOW_BITMAP );
     load_switch_directory_fonts( "sdmc:/switch/wine/share/wine/fonts",
                                  "\\??\\Z:\\switch\\wine\\share\\wine\\fonts\\",
-                                 ADDFONT_EXTERNAL_FONT );
+                                 ADDFONT_EXTERNAL_FONT | ADDFONT_ALLOW_BITMAP );
 #else
     /* Windows directory */
     get_fonts_win_dir_path( NULL, path );

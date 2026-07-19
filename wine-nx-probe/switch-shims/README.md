@@ -74,8 +74,9 @@ Homebrew prefix for now -- `configure.ac` has no real SDL2 detection yet).
   simultaneous contact aren't exercised.
 - Presentation performance: SDL2's texture-upload/present cost has nothing
   to do with the Switch's block-linear framebuffer conversion, which is the
-  actual bottleneck described in the top-level README's "Current Problems"
-  section. This sim is for rendering/input *correctness*, not for
+  presentation-cost model investigated in wine-nx-probe/perf-lab-log.md
+  (block-linear conversion turned out not to be the dominant cost, but the
+  point stands: SDL2 tells you nothing about real present cost). This sim is for rendering/input *correctness*, not for
   reproducing or validating fixes to that performance problem.
 - Window close: `SDL_QUIT` currently calls `exit(0)` directly. There's no
   host-side path back to a real `WM_CLOSE`/HOME-menu-equivalent yet.

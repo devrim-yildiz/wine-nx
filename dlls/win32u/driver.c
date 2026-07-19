@@ -26,6 +26,8 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -1018,8 +1020,13 @@ static void load_display_driver(void)
     /* Host simulation of the Switch presentation path: opt-in via env var so
      * a normal host build keeps using its real graphics driver (macdrv/x11drv)
      * untouched unless WINE_NX_HOST_SIM is set. See dlls/win32u/winnx_drv.c
-     * and dlls/win32u/winnx_host_sim.c (SDL2-backed). */
-    if (getenv( "WINE_NX_HOST_SIM" ))
+     * and dlls/win32u/winnx_host_sim.c (SDL2-backed). Value semantics match
+     * wine-nx-probe's toggle parser (runtime.c wine_nx_parse_bool_value,
+     * not linkable from win32u): set-but-empty counts as on, otherwise only
+     * the affirmative spellings enable it -- so WINE_NX_HOST_SIM=0 is off. */
+    const char *host_sim = getenv( "WINE_NX_HOST_SIM" );
+    if (host_sim && (!host_sim[0] || !strcmp( host_sim, "1" ) || !strcasecmp( host_sim, "true" ) ||
+                     !strcasecmp( host_sim, "yes" ) || !strcasecmp( host_sim, "run" )))
     {
         extern BOOL wine_nx_drv_CreateWindow( HWND );
         extern BOOL wine_nx_drv_CreateWindowSurface( HWND, BOOL, const RECT *, struct window_surface ** );
