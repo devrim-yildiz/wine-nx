@@ -243,7 +243,10 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         GUI_SRC="$SCRIPT_DIR/samples/gui-smoke/gui_smoke.c"
         GUI_EXE="$SCRIPT_DIR/samples/gui-smoke/gui_smoke.exe"
         GUI_CC="$LLVM_MINGW_BIN_DIR/aarch64-w64-mingw32-clang"
-        if [ -f "$GUI_SRC" ]; then
+        # Only require the PE compiler when a rebuild is actually needed --
+        # a fresh gui_smoke.exe built elsewhere (e.g. inside the
+        # docker-host-sim container, which has llvm-mingw) stages as-is.
+        if [ -f "$GUI_SRC" ] && { [ ! -f "$GUI_EXE" ] || [ "$GUI_SRC" -nt "$GUI_EXE" ]; }; then
             if [ ! -x "$GUI_CC" ]; then
                 GUI_CC="$(command -v aarch64-w64-mingw32-clang || true)"
             fi
@@ -251,10 +254,8 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
                 echo "Missing aarch64-w64-mingw32-clang; cannot build GUI smoke app" >&2
                 exit 1
             fi
-            if [ ! -f "$GUI_EXE" ] || [ "$GUI_SRC" -nt "$GUI_EXE" ]; then
-                "$GUI_CC" -municode -mwindows -O2 -Wall -Wextra \
-                    -o "$GUI_EXE" "$GUI_SRC" -luser32 -lgdi32
-            fi
+            "$GUI_CC" -municode -mwindows -O2 -Wall -Wextra \
+                -o "$GUI_EXE" "$GUI_SRC" -luser32 -lgdi32
         fi
     fi
     # Direct-blit test app: WINE_NX_APP=blit stages the no-InvalidateRect/
@@ -264,7 +265,8 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         BLIT_SRC="$SCRIPT_DIR/samples/direct-blit/direct_blit.c"
         BLIT_EXE="$SCRIPT_DIR/samples/direct-blit/direct_blit.exe"
         BLIT_CC="$LLVM_MINGW_BIN_DIR/aarch64-w64-mingw32-clang"
-        if [ -f "$BLIT_SRC" ]; then
+        # Same stale-check-first ordering as the GUI smoke app above.
+        if [ -f "$BLIT_SRC" ] && { [ ! -f "$BLIT_EXE" ] || [ "$BLIT_SRC" -nt "$BLIT_EXE" ]; }; then
             if [ ! -x "$BLIT_CC" ]; then
                 BLIT_CC="$(command -v aarch64-w64-mingw32-clang || true)"
             fi
@@ -272,10 +274,8 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
                 echo "Missing aarch64-w64-mingw32-clang; cannot build direct-blit test app" >&2
                 exit 1
             fi
-            if [ ! -f "$BLIT_EXE" ] || [ "$BLIT_SRC" -nt "$BLIT_EXE" ]; then
-                "$BLIT_CC" -municode -mwindows -O2 -Wall -Wextra \
-                    -o "$BLIT_EXE" "$BLIT_SRC" -luser32 -lgdi32
-            fi
+            "$BLIT_CC" -municode -mwindows -O2 -Wall -Wextra \
+                -o "$BLIT_EXE" "$BLIT_SRC" -luser32 -lgdi32
         fi
     fi
     if [ "$APP_KIND" = "gui" ] && [ -f "$SCRIPT_DIR/samples/gui-smoke/gui_smoke.exe" ]; then

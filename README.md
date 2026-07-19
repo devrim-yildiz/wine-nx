@@ -128,10 +128,12 @@ incomplete (see Known Limitations).
   shell/comdlg/shell32, COM/OLE, registry/prefix behavior, font
   discovery/fallback beyond the staged set, clipboard/IME/keyboard/
   controller input, audio, networking, multi-process.
-- **Host-sim rendering is blocked by a loader bug** — the host build
-  compiles and links, but any top-level `wine <program>` currently fails to
-  load kernel32.dll right after the automatic wineboot spawn/wait, so
-  nothing renders through the SDL2 path yet.
+- ~~Host-sim rendering is blocked by a loader bug~~ — **fixed**: the
+  "kernel32.dll fails to load" symptom was the old
+  `docker-host-sim/run-host-sim.sh` never building any PE DLLs, not a
+  loader bug. The script now does a full build and is a self-checking
+  smoke gate (a test PE must actually render through the SDL2 path for it
+  to pass).
 - **Known crash** — the GUI smoke demo's Minus-button exit crashes to the
   Home Menu instead of returning to hbmenu (root cause unresolved; `[EXIT]`
   step logging is in place). The physical HOME button is the clean way out.
