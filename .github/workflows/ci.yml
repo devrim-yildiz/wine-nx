@@ -98,12 +98,11 @@ jobs:
   # Needs an arm64 runner: the container installs the aarch64 llvm-mingw
   # toolchain and the wine build is aarch64-native.
   #
-  # continue-on-error until the first green run on GitHub infrastructure;
-  # flip it to a required gate after that.
+  # A required gate since its first green run on GitHub infrastructure
+  # (2026-07-19, run 29702983794).
   host-sim:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
