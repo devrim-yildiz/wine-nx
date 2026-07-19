@@ -2436,7 +2436,7 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
         /* NtUserGetDCEx's DCX_INTERSECTRGN forces update_visible_region(),
          * which is the get_visible_region IPC call -- isolating this from
          * the WM_ERASEBKGND dispatch below tells us how much of erase's
-         * ~47ms is "getting a DC" vs. "actually erasing". See README,
+         * ~47ms is "getting a DC" vs. "actually erasing". See wine-nx-probe/perf-lab-log.md,
          * "The ~14ms Per-Call IPC Floor". */
         switch_paint_trace( "erase_get_dcex", (unsigned int)(armTicksToNs( t1 - t0 ) / 1000000ULL) );
 #endif

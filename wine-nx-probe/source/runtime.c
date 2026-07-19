@@ -312,8 +312,8 @@ static void wine_nx_flush_legacy_select(void)
  * diagnostic, so wrong here means silent visual corruption, not a crash.
  *
  * NtUserBeginPaint always issues get_update_region followed by
- * get_visible_region, each its own ~14-15ms IPC round trip (see README,
- * "The ~14ms Per-Call IPC Floor"). horizon_server_handle_get_paint_regions
+ * get_visible_region, each its own ~14-15ms IPC round trip (see
+ * wine-nx-probe/perf-lab-log.md, "The ~14ms Per-Call IPC Floor"). horizon_server_handle_get_paint_regions
  * computes both under one lock pass with no cross-dependency between them,
  * so ON fetches both in a single round trip via
  * switch_prefetch_paint_regions() (dlls/win32u/dce.c) instead of two

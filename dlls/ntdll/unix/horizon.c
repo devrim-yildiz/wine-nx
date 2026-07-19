@@ -288,8 +288,8 @@ struct horizon_fd_queue
  * NtUserBeginPaint's two unconditional back-to-back IPC round trips into one.
  * 310 is appended after REQ_NB_REQUESTS's prior value (309) in server_protocol.h's
  * enum request -- verified via a standalone host compile, not guessed -- so it
- * cannot collide with any existing, already-numbered request type. See README,
- * "The ~14ms Per-Call IPC Floor". */
+ * cannot collide with any existing, already-numbered request type. See wine-nx-probe/
+ * perf-lab-log.md, "The ~14ms Per-Call IPC Floor". */
 #define HORIZON_REQ_GET_PAINT_REGIONS 310
 /* Peek-only get_update_region variant (always UPDATE_NOREGION semantics)
  * plus a has_children bit, added so switch_update_now() (dlls/win32u/dce.c)
