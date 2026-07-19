@@ -407,7 +407,7 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         find "$NLS_DIR" -maxdepth 1 -type f -name '*.nls' -exec basename {} \; | sort
         echo
         echo "[fonts]"
-        find "$WIN_FONTS_DIR" -maxdepth 1 -type f -name '*.ttf' -exec basename {} \; | sort
+        find "$WIN_FONTS_DIR" -maxdepth 1 -type f \( -name '*.ttf' -o -name '*.fon' \) -exec basename {} \; | sort
         echo
         if [ -f "$SYSTEM_DIR/notepad.exe" ]; then
             echo "[notepad]"

@@ -16,10 +16,11 @@ compositor itself is hardware-confirmed at **60fps** in an isolated smoke
 test (device/queue/present, real shaders and 3D geometry, no Wine
 involved); the full Win32 GUI pipeline that feeds it — message loop, GDI
 drawing, Wine's client/server IPC — currently reaches a hardware-confirmed
-**~50fps steady state** (47–51) end to end; the trajectory across three
-measured deploys is 8 → 34 → 50fps, essentially all of it from finding and
-removing diagnostic overhead hidden in the hot paths. The full
-investigation trail behind those numbers lives in
+**~56fps steady state** (53–58) end to end; the trajectory across four
+measured deploys is 8 → 34 → 50 → 56fps, from removing diagnostic overhead
+hidden in the hot paths and then batching the paint-path IPC (3.0 round
+trips/frame, down from the original 5+). The full investigation trail
+behind those numbers lives in
 [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md).
 
 Originally started by [dantiicu](https://github.com/dantiicu/wine-nx) as an
@@ -92,16 +93,15 @@ incomplete (see Known Limitations).
 
 ## Known Limitations
 
-- **~50fps GUI steady state, CPU-bound in the paint pipeline** — not the
-  GPU and not the pixel blit. The long-suspected "~14ms per IPC call
-  transport floor" turned out to be diagnostic logging (unconditional
-  fflush-to-SD traces in hot paths), not Horizon scheduler latency —
-  measured server-thread wake latency is ~7µs, and paint-path server calls
-  now measure ~0ms median. The remaining ~20ms frame budget is dominated
-  by an untimed ~6.6ms app-draw gap, surface flushing (~5ms), and
-  dirty-rect present handling (~3.3ms); IPC round trips are no longer the
-  main term. Full trail, numbers, and next levers in
-  [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md).
+- **~56fps GUI steady state, ~1.2ms short of 60** — CPU-bound, and the
+  frame is now mostly measured rather than guessed: of the 17.9ms budget,
+  the top terms are a 5.1ms per-pixel full-window framebuffer blit
+  (`fb_blit_loop` — the #1 target; a memcpy/NEON row copy should clear
+  60fps alone), a 6.5ms untimed paint-path residue, ~3ms of app-side
+  drawing, and 2.5ms of redraw-to-paint dispatch gap. IPC is off the list
+  entirely (3.0 round trips/frame at ~0.01ms each; the old "~14ms floor"
+  was diagnostic logging, and scheduler wakes measure ~7µs). Full trail
+  in [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md).
 - **`GetTickCount`/`GetTickCount64` are frozen for PE apps** — the shared
   user data page's `TickCount` is never written on this port (the
   wineserver poll loop that updates it in real Wine never runs here). The
@@ -352,18 +352,15 @@ wine-nx-probe/source/jit_smoke.c
 
 ## Next Milestones
 
-1. **Paint-pipeline performance** — the compositor is no longer the open
-   question (deko3d is hardware-confirmed, in isolation and as the real
-   backend via `wine-nx-runtime-deko3d`), and the "~14ms IPC floor" theory
-   is settled (it was diagnostic-logging overhead; scheduler wakes measure
-   ~7µs). At ~50fps the scoped next levers are: sub-ms timers for the
-   ~6.6ms/frame untimed app-draw gap and the ~5ms surface flush (the two
-   largest remaining terms), a batching-toggles A/B (measured 5.2 IPC
-   round trips/frame; calibrated projection ~52–59fps, worth doing as a
-   measurement as much as a win), and the recurring 27–53ms single-paint
-   spike class in DC/region acquisition — see
-   [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md) for
-   what's been tried, ruled out, and measured.
+1. **Paint-pipeline performance: the last 1.2ms to 60fps** — batching is
+   live (3.0 IPC round trips/frame, get_visible_region eliminated) and
+   the frame is measured at µs resolution. Ranked levers: replace the
+   5.1ms per-pixel full-window blit with a memcpy/NEON row copy (clears
+   60fps alone), bracket the 6.5ms untimed paint-path residue with the
+   next timer pass, and test moving the per-second stats dump off the
+   paint path (the leading suspect for the rare ~20–60ms stall class).
+   See [wine-nx-probe/perf-lab-log.md](wine-nx-probe/perf-lab-log.md)
+   for what's been tried, ruled out, and measured.
 2. **Substrate correctness** — real blocking waits/timeouts, a timer
    expiry engine, thread/process exit tracking, and unfreezing the
    PE-visible tick count (see Known Limitations).

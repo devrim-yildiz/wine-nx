@@ -1102,6 +1102,7 @@ static struct
 {
     char key[32];
     char value[64];
+    int used;
 } wine_nx_config_entries[WINE_NX_CONFIG_MAX_ENTRIES];
 static int wine_nx_config_entry_count;
 static int wine_nx_config_loaded;
@@ -1152,8 +1153,36 @@ static const char *wine_nx_config_get( const char *key )
 
     wine_nx_config_load();
     for (i = 0; i < wine_nx_config_entry_count; i++)
-        if (!strcasecmp( wine_nx_config_entries[i].key, key )) return wine_nx_config_entries[i].value;
+        if (!strcasecmp( wine_nx_config_entries[i].key, key ))
+        {
+            wine_nx_config_entries[i].used = 1;
+            return wine_nx_config_entries[i].value;
+        }
     return NULL;
+}
+
+/* Called once after the boot-time *_select() block: any config.txt entry
+ * nothing has looked up by then is almost certainly a typo'd key, and a
+ * typo'd key is a SILENT no-op -- the 2026-07-19 run 3 deploy shipped
+ * skipredundantupdate=1 (real key: skipupdatecheck) and the toggle just
+ * quietly stayed off, contaminating an A/B run. Keys consumed later than
+ * the select block are whitelisted here; extend the list when adding one. */
+static void wine_nx_config_warn_unused(void)
+{
+    static const char *const late_keys[] = { "target", "args", "deko3d" };
+    int i;
+    unsigned int j;
+
+    for (i = 0; i < wine_nx_config_entry_count; i++)
+    {
+        int later = 0;
+        if (wine_nx_config_entries[i].used) continue;
+        for (j = 0; j < sizeof(late_keys) / sizeof(late_keys[0]); j++)
+            if (!strcasecmp( wine_nx_config_entries[i].key, late_keys[j] )) { later = 1; break; }
+        if (!later)
+            log_line( "[NXCONF] WARNING: config.txt key '%s' matches no known toggle -- typo? (value '%s' ignored)",
+                      wine_nx_config_entries[i].key, wine_nx_config_entries[i].value );
+    }
 }
 
 static int wine_nx_config_get_bool( const char *key )
@@ -1871,6 +1900,7 @@ int main( int argc, char **argv )
     wine_nx_fast_flush_period_select();
     wine_nx_batch_redraw_updatenow_select();
     wine_nx_neon_blit_select();
+    wine_nx_config_warn_unused();
 
     if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
     else

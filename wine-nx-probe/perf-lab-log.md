@@ -669,4 +669,65 @@ Plan: stage the built .fon set (50 files in build-host-sim-linux/fonts/; build-s
 2. Sub-ms timers; then attack the 6.6ms untimed gap and 5.03ms surface_funcs_flush.
 3. .fon staging + *.fon scan query + missing 2 .fon builds; drop the 7 intermediate TTFs.
 4. Stage curl, make pe-real-run honor argv, add the 7 KERNEL32 + 5 CRT console shims.
-5. Spike-capture trace for the 27–53ms class; per-run gui_timing; build sha in the manifest.
+5. Spike-capture trace for the 27–53ms class; per-run gui_timing; build sha in the manifest.## 2026-07-19 — Third deploy: batching live, the frame finally measured (build b22a96e)
+
+Provenance: runtime-manifest.txt git=b22a96e @ 2026-07-19T19:37:25Z, sha256 on all 5 NROs. Config intent: painttrace=1, batchpaint=1, skipredundantupdate=1, batchredrawupdatenow=1. **Reality: 3 of 4** — skipredundantupdate never engaged (both logs: `source=default`). Root cause found post-run: the staged config.txt used the wrong key name (`skipredundantupdate`; the toggle's real key is `skipupdatecheck`) and unknown keys were silently ignored. The parser was fine; the config was typo'd. Fixed both ways since: the staged config uses the real key, and the runtime now logs a `[NXCONF] WARNING` for any config.txt key nothing consumed. Zero [EXC], both runs clean HUD-Minus exits.
+
+### FPS trajectory
+
+| run | build | presents/sec steady | frame ms |
+|---|---|---|---|
+| 0 (pre-lab) | — | 8 | 125 |
+| 1 | 2e4af89 | 34.4 | 29.1 |
+| 2 | b9a76d6 | 50.06 (47-51) | 19.98 |
+| **3** | **b22a96e** | **55.97 (53-58, stdev 1.25, 88 windows)** | **17.87** |
+
+Ramp 11/32/52 then steady; mode 57 (35 windows); 5020 presents over ~92.3s. App-side gui_timing.log independently agrees: 55.92. Landed inside the run-2 batching projection band (52-59).
+
+### Batching A/B — round trips confirmed at the protocol level
+
+| IPC call | run 2 /frame | run 3 /frame |
+|---|---|---|
+| get_update_region | 3.13 | 2.000 (10104 total) |
+| get_visible_region | 1.04 | **0 — 5 calls in the whole run, all boot** |
+| redraw_window | 1.04 | 1.000 (5052 total) |
+| **total** | **5.22** | **3.00** |
+
+get_paint_regions prefetch: ACTIVE at L1201, 100% hit after boot (2 invalidations, both boot WM_NCPAINT; zero miss lines in either binary). Delta attribution is clean: ncpaint 1.03→0.05, erase 1.06→0.04 (the vis_rgn IPC stalls inside them are gone) = -2.00 of the -2.11ms frame delta. Batching is ~100% of the gain, cost the server nothing (NXWAKE 6.97us over 106,002 wakes ≈ run 2's 7.02us; 58/58 HZPAINT err=0), and introduced zero spikes. Caveat: protocols 311/312 never appear under their own [NXIPC][TIMING] labels — folded under legacy names; verify in source. IPC is now ~0.03ms/frame. **Off the list.**
+
+### The frame, at us resolution (steady n-weighted, deko3d)
+
+| phase | ms | notes |
+|---|---|---|
+| redraw_to_paintregions_gap | 2.480 | max 30.35 — spike home #1 |
+| ncpaint + erase | 0.090 | was 2.09 — batching collapse |
+| app_draw_gap | 3.019 | NEW — run 2's "~6.6 inferred" was overstated; app-owned |
+| flush_surfaces | 0.723 | |
+| present_dirty | 4.943 | run 2's "3.30" was truncation lying |
+| — fb_blit_loop | **5.080** | NEW — 99% of surface_funcs_flush interior |
+| check_for_events + rest | 0.075 | locks/rect_math/getdcex all ~0 |
+| **accounted** | **11.33** | nesting identities verified ±0.01 in both binaries |
+| **residue** | **6.54** | identical on libnx (6.33) → CPU-side, not backend |
+
+fb_blit_loop: always 921600px full-window, 5046-5053us, ~5.5ns/px — a per-pixel loop, not memcpy; dirty rects can't help (dirty=full on all 58 flushes). **60fps needs -1.2ms; blit→2ms clears it alone.** Rank: (1) blit, (2) instrument the residue, (3) gap 2.48, (4) app_draw_gap is the app's, (5) IPC done.
+
+### Spike forensics (capture worked: 8 deko3d + 7 libnx = 11 events)
+
+Boot one-offs (4): fb_lock_call 111.86/44.01ms = lazy backend init inside first lock (L1179-1194); app_draw_gap 304.71/310.59ms = first WM_PAINT incl. 79 first-time Tahoma glyph rasterizations. Steady class (~1 per 15s, 6 of 90 windows): redraw_to_paintregions_gap 27-55ms amid all-0ms IPC + rare 20-60ms flush stalls with flat interior timers — run 2's 27-53ms mystery class, now located, and **not server latency**. New suspect: in both binaries a spike lands on the exact sample after an [NXPAINT][AVG] dump (L2749→2750, libnx L1720→1721) — our own ~1.5KB SD write in the paint path. Cap gripe: 8-line budget spent by ~40s; windows 56/63/71/91 stalls have no context line. Per-phase caps or steady re-arm next time.
+
+### Fonts: 14 face_fail → 0
+
+172 face_ok per binary (50 .fon + 6 TTF + 6 shared, 2.56MB mapped), zero glyph errors. **Payoff: 'System' resolves to a real bitmap .fon** (fs=00080000, cache cap holding) — Tahoma substitution gone. But it picked the KOREAN hvgasys.fon: select_family is charset-blind first-match on FAT order and hvgasys enumerates at idx 4; the correct vgasys.fon (cp1252) is loaded and ignored. Fixedsys/Small Fonts have the same collision armed. Only 'System' was exercised — Fixedsys/Courier/Sans Serif never requested. Still missing from the plan: vgaoem.fon, serife.fon (1252/437 set is 6 of 8). Manifest hole: all 50 .fon files absent from [fonts] (TTF-only glob). Scan cost untimed, ~100-300ms by ramp evidence.
+
+### curl.exe scoping (pe-real-report vs real binary)
+
+Loader: 3.4MB ARM64, 7 sections, 10803/10803 relocs, protections, IAT/loadcfg/pdata located, loader_failures=0 — **zero loader risk left**. run_blockers=2: imports + TLS. unresolved=276 is dishonest — the report resolves against nothing; all 43 run-shim exports are used by curl, so the true gap is **233** exports (CRT is 127/276 of imports; ~65 can be bind-time stubs). TLS machinery already exists in pe-real-run. Work-list: flip target.txt (still gui_smoke!), fix report resolution, 233 exports (--version hot path real, rest stubs), run 2 TLS callbacks, GS cookie + unwind. Or: run curl under the main runtime against the 611 staged DLLs and skip shim growth — decide before building.
+
+### Anomalies
+- skipredundantupdate silent no-op (above) — fix the key name.
+- 3 torn [NXIPC][TIMING]/[EXIT] lines at teardown (L17115 etc.) — still no exit-path newline.
+- libnx binary: 42.8/s, entire deficit is fb_present 4.70 + fb_lock 1.27 vs deko3d 0.52/0.00; blit identical. deko3d ships.
+- gui_timing.log append fix verified (2 headers) — note header embeds qpc_ms, grep 'run start'.
+
+### Next
+1. Blit → memcpy/NEON (the 60fps move). 2. Fix skipredundantupdate key, re-run 4-of-4. 3. Bracket the 6.5ms residue. 4. fsCsb-aware select_family + bitmap-family smoke. 5. vgaoem/serife + .fon manifest glob. 6. curl: target.txt flip + shim-vs-main-runtime decision. 7. AVG dumps off the paint path; SPIKE re-arm; exit newline. 8. Confirm 311/312 on the wire.
