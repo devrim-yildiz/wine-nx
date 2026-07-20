@@ -2601,6 +2601,22 @@ void toggle_caret( HWND hwnd )
     RECT r;
     int hidden = 0;
 
+#ifdef __SWITCH__
+    /* Hardware-confirmed on this port: the WM_SYSTIMER/SYSTEM_TIMER_CARET
+     * message keeps arriving and toggle_caret() keeps paying a full
+     * set_caret_info IPC round trip (this platform's own README documents
+     * a ~14ms floor per such call) even in processes that never call
+     * NtUserCreateCaret at all -- 90 of these in one ~5-second, 5-frame
+     * capture of a small test app that never touches a caret, a full
+     * quarter of all IPC traffic in that window, competing directly with
+     * that same app's own PeekMessage/paint loop for time. caret.bitmap is
+     * only ever set by NtUserCreateCaret and cleared by NtUserDestroyCaret
+     * (both further down in this file) -- a cheap, local, always-correct
+     * signal for "does any caret actually exist to toggle", available
+     * without asking the server. */
+    if (!caret.bitmap) return;
+#endif
+
     SERVER_START_REQ( set_caret_info )
     {
         req->flags  = SET_CARET_STATE;

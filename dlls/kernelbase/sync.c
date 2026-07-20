@@ -181,8 +181,25 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetSystemTimes( FILETIME *idle, FILETIME *kernel, 
  */
 ULONG WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
 {
+#ifdef __SWITCH__
+    /* user_shared_data->TickCount is only ever written by set_current_time()
+     * (server/fd.c), itself only called from wineserver's poll loop
+     * (main_loop()). This Switch port never runs that loop -- server/ isn't
+     * even part of this build's link closure, this port's entire
+     * wineserver role is played by dlls/ntdll/unix/horizon.c instead --
+     * so that field stays at its zero-initialized value forever, and any
+     * app relying on GetTickCount for timers/animation pacing/elapsed-time
+     * checks sees a permanently frozen clock (documented in README.md,
+     * "GetTickCount/GetTickCount64 Are Frozen (Platform-Wide)").
+     * NtGetTickCount() (dlls/ntdll/unix/sync.c) already has a working
+     * __SWITCH__ implementation backed by a real clock source -- it just
+     * was never wired up to this guest-facing entry point apps actually
+     * call. Use it directly instead of the dead shared-memory field. */
+    return NtGetTickCount();
+#else
     /* note: we ignore TickCountMultiplier */
     return user_shared_data->TickCount.LowPart;
+#endif
 }
 
 
@@ -191,6 +208,16 @@ ULONG WINAPI DECLSPEC_HOTPATCH GetTickCount(void)
  */
 ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
 {
+#ifdef __SWITCH__
+    /* Same reasoning as GetTickCount() above. NtGetTickCount() truncates to
+     * 32 bits (matching its real signature), so this loses the wraparound-
+     * safety GetTickCount64 exists for -- acceptable here: a real 32-bit
+     * rollover needs ~49.7 days of continuous uptime, far beyond any
+     * realistic session on this platform, and a real, advancing clock that
+     * wraps eventually is a strict improvement over one that never moves
+     * at all. */
+    return (ULONGLONG)NtGetTickCount();
+#else
     ULONG high, low;
 
     do
@@ -201,6 +228,7 @@ ULONGLONG WINAPI DECLSPEC_HOTPATCH GetTickCount64(void)
     while (high != user_shared_data->TickCount.High2Time);
     /* note: we ignore TickCountMultiplier */
     return (ULONGLONG)high << 32 | low;
+#endif
 }
 
 

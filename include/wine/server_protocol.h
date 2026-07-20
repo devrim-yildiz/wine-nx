@@ -1187,6 +1187,10 @@ struct init_first_thread_request
     int          debug_level;
     int          reply_fd;
     int          wait_fd;
+#ifdef __SWITCH__
+    unsigned short machine;    /* wine-nx: target PE's IMAGE_FILE_HEADER.Machine (WowBox64
+                                   Phase 1). See server/protocol.def for the full rationale. */
+#endif
     /* VARARG(cpu_override,cpu_topology_override); */
 };
 struct init_first_thread_reply

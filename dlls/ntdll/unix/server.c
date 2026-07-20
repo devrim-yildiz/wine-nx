@@ -114,6 +114,21 @@ sigset_t server_block_set;  /* signals to block during server calls */
 static int fd_socket = -1;  /* socket to exchange file descriptors with the server */
 static int initial_cwd = -1;
 static pid_t server_pid;
+
+#ifdef __SWITCH__
+/* WowBox64 Phase 1: the target executable's declared machine type, set by
+ * runtime.c's pre-flight PE read before server_init_process() runs (that
+ * function's signature can't grow a parameter -- it's also called,
+ * unmodified, from real Wine's own loader.c). Distinct from native_machine
+ * below, which is the *host's* architecture as reported back by the server;
+ * this is what the client sends the server about the *target*. */
+static unsigned short wine_nx_target_machine = IMAGE_FILE_MACHINE_ARM64;
+
+void wine_nx_set_target_machine( unsigned short machine )
+{
+    wine_nx_target_machine = machine;
+}
+#endif
 pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #ifdef __SWITCH__
@@ -1877,6 +1892,9 @@ size_t server_init_process(void)
         req->reply_fd    = reply_pipe;
         req->wait_fd     = data->wait_fd[1];
         req->debug_level = (TRACE_ON(server) != 0);
+#ifdef __SWITCH__
+        req->machine     = wine_nx_target_machine;
+#endif
         wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
         if (!(ret = wine_server_call( req )))
         {
@@ -1887,6 +1905,15 @@ size_t server_init_process(void)
             info_size         = reply->info_size;
             server_start_time = reply->server_start;
             supported_machines_count = wine_server_reply_size( reply ) / sizeof(*supported_machines);
+#ifdef __SWITCH__
+            wine_nx_server_call_trace( "[SYSCALL] init_first_thread supported_machines_count=%u "
+                                       "[0]=%04x [1]=%04x [2]=%04x target=%04x",
+                                       supported_machines_count,
+                                       supported_machines_count > 0 ? supported_machines[0] : 0,
+                                       supported_machines_count > 1 ? supported_machines[1] : 0,
+                                       supported_machines_count > 2 ? supported_machines[2] : 0,
+                                       wine_nx_target_machine );
+#endif
             if (reply->inproc_device == FSYNC_USED_BY_SERVER)
             {
                 inproc_device_fd = FSYNC_USED_BY_SERVER;
@@ -1900,6 +1927,21 @@ size_t server_init_process(void)
         }
     }
     SERVER_END_REQ;
+
+#ifdef __SWITCH__
+    /* wine-nx skips the standard WoW64 prefix setup entirely, so wineserver's
+     * own init_supported_machines() (server/registry.c) never learns this
+     * environment supports i386-as-WoW64 -- hardware-confirmed: the reply
+     * above comes back as exactly one entry, native ARM64, with no I386
+     * slot at all, regardless of what machine the target actually is. This
+     * is a single-process, bespoke environment; the client already knows
+     * the real answer, so force it here rather than keep chasing
+     * wineserver's state. */
+    supported_machines_count = 2;
+    supported_machines[0] = IMAGE_FILE_MACHINE_ARM64;
+    supported_machines[1] = IMAGE_FILE_MACHINE_I386;
+#endif
+
     close( reply_pipe );
 
     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );

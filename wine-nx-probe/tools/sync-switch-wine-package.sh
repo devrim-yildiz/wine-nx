@@ -49,7 +49,12 @@ if [ ! -d "$SD_ROOT" ]; then
 fi
 
 mkdir -p "$SD_ROOT/switch"
-rsync -a --delete "$PACKAGE_DIR/" "$DEST_DIR/"
+# --exclude keeps externally-installed games (placed directly on the SD card,
+# never part of this repo's local staging tree) safe from --delete's mirror
+# cleanup -- without it, anything under drive_c on the SD card that isn't
+# also in $PACKAGE_DIR gets deleted, wiping out drive_c/openttd (or any future
+# external app placed the same way).
+rsync -a --delete --exclude='drive_c/openttd' "$PACKAGE_DIR/" "$DEST_DIR/"
 
 missing=0
 for dll in "${REQUIRED_SYSTEM_DLLS[@]}"; do

@@ -26,11 +26,21 @@
  * PART of a Jit buffer ever corrupt or crash execution of a DIFFERENT,
  * already-stable part of the SAME buffer running concurrently on another
  * thread -- the actual hazard a multi-threaded JIT like Box64's dynarec
- * would hit if it shared one cache region across threads. Phase 2 only
- * runs if phase 1 fully passed (testing concurrency first, before knowing
- * the basic mechanism even works, would just produce uninterpretable
- * results). Still not covered by either phase: sustained high-frequency
- * transitions under real memory pressure, and more than two threads.
+ * would hit if it shared one cache region across threads. Phase 2
+ * hardware-confirmed ALL PASS. Phase 3 answers a different, narrower
+ * question raised while scoping Box64's ARM64 dynarec patches: Box64
+ * emits AArch64 LDR (literal) instructions that read embedded data
+ * (jump targets, table64 constants) from within the same region they
+ * execute out of -- a plain data read through the RX alias, which
+ * neither phase 1 nor phase 2 ever exercised (both only fetched and
+ * executed instructions through rx_addr). If Horizon's CodeMemory RX
+ * mapping turns out to be Execute-Only rather than Read-Execute, that
+ * class of instruction takes a Data Abort the instant it runs. All three
+ * phases only run in sequence if phase 1 fully passed (testing anything
+ * further before knowing the basic mechanism works would just produce
+ * uninterpretable results). Still not covered by any phase: sustained
+ * high-frequency transitions under real memory pressure, and more than
+ * two threads.
  */
 #include <switch.h>
 #include <pthread.h>
@@ -261,6 +271,96 @@ static void run_phase2( void )
     printf( "%s\n", (g_phase2_writer_fail == 0 && g_phase2_reader_fail == 0) ? "ALL PASS" : "SEE jit_smoke.log FOR FAILURES" );
 }
 
+/* ---------- Phase 3: is the RX alias actually READABLE, not just executable? ----------
+ *
+ * CreateJmpNext()/Table64() in Box64's ARM64 dynarec both emit AArch64
+ * LDR (literal) instructions that read an embedded value from within the
+ * same code region they execute from -- a data read through the RX alias,
+ * not an instruction fetch. If Horizon's CodeMemory RX mapping is
+ * Execute-Only (X) rather than Read-Execute (RX), that LDR takes a Data
+ * Abort the instant it runs. Phases 1 and 2 above only ever fetched and
+ * executed instructions through rx_addr -- neither one proves a plain data
+ * read through that same pointer is safe. This phase tests exactly that,
+ * in isolation, before any Box64 patch relies on it. */
+#define PHASE3_DATA_OFFSET 0x100
+#define PHASE3_MAGIC        0xFEEDFACECAFEBEEFULL
+
+static void run_phase3( void )
+{
+    Jit jit;
+    Result rc;
+    volatile uint64_t *rw;
+    volatile uint64_t *rx;
+    uint64_t readback;
+
+    log_line( "[JIT][P3] RX-alias readability test starting" );
+    printf( "\nPhase 3: RX alias data-read test...\n" );
+    consoleUpdate( NULL );
+
+    rc = jitCreate( &jit, 0x1000 );
+    if (R_FAILED(rc))
+    {
+        log_line( "[JIT][P3] jitCreate FAILED rc=0x%x -- SKIPPING phase 3", rc );
+        printf( "Phase 3 jitCreate FAILED, skipping\n" );
+        return;
+    }
+    log_line( "[JIT][P3] jitCreate OK type=%d rw_addr=%p rx_addr=%p",
+             (int)jit.type, jitGetRwAddr( &jit ), jitGetRxAddr( &jit ) );
+
+    rc = jitTransitionToWritable( &jit );
+    if (R_FAILED(rc))
+    {
+        log_line( "[JIT][P3] jitTransitionToWritable FAILED rc=0x%x -- ABORTING phase 3", rc );
+        jitClose( &jit );
+        return;
+    }
+
+    rw = (volatile uint64_t *)((uint8_t *)jitGetRwAddr( &jit ) + PHASE3_DATA_OFFSET);
+    *rw = PHASE3_MAGIC;
+    log_line( "[JIT][P3] wrote magic=0x%016llx via RW at offset 0x%x",
+             (unsigned long long)PHASE3_MAGIC, PHASE3_DATA_OFFSET );
+
+    rc = jitTransitionToExecutable( &jit );
+    if (R_FAILED(rc))
+    {
+        log_line( "[JIT][P3] jitTransitionToExecutable FAILED rc=0x%x -- ABORTING phase 3", rc );
+        jitClose( &jit );
+        return;
+    }
+
+    rx = (volatile uint64_t *)((uint8_t *)jitGetRxAddr( &jit ) + PHASE3_DATA_OFFSET);
+
+    /* This is the moment of truth: if Horizon's CodeMemory RX mapping is
+     * Execute-Only, this dereference takes a Data Abort right here. Log
+     * and flush immediately before, so the log file itself pinpoints the
+     * crash site even if the process dies without unwinding any further --
+     * log_line() already fflush()es every line, so this survives a hard
+     * crash on the very next instruction. */
+    log_line( "[JIT][P3] about to dereference rx_addr+0x%x as data -- if this is the last "
+             "line in the log, the RX alias faulted on a plain data read", PHASE3_DATA_OFFSET );
+    printf( "Reading rx_addr as data now (crash here = Execute-Only)...\n" );
+    consoleUpdate( NULL );
+
+    readback = *rx;
+
+    if (readback == PHASE3_MAGIC)
+    {
+        log_line( "[JIT][P3] PASS: read 0x%016llx back through the RX alias, matches what was written via RW",
+                 (unsigned long long)readback );
+        printf( "PASS: RX alias is readable (0x%016llx)\n", (unsigned long long)readback );
+    }
+    else
+    {
+        log_line( "[JIT][P3] FAIL: RX alias readable but value MISMATCH expected=0x%016llx got=0x%016llx",
+                 (unsigned long long)PHASE3_MAGIC, (unsigned long long)readback );
+        printf( "FAIL: value mismatch, expected 0x%016llx got 0x%016llx\n",
+               (unsigned long long)PHASE3_MAGIC, (unsigned long long)readback );
+    }
+
+    jitClose( &jit );
+    log_line( "[JIT][P3] jitClose done" );
+}
+
 int main( int argc, char *argv[] )
 {
     Jit jit;
@@ -340,9 +440,12 @@ int main( int argc, char *argv[] )
     log_line( "[JIT] jitClose done" );
 
     if (fail == 0 && pass == rounds)
+    {
         run_phase2();
+        run_phase3();
+    }
     else
-        log_line( "[JIT] phase 1 did not fully pass -- SKIPPING phase 2 (would be uninterpretable)" );
+        log_line( "[JIT] phase 1 did not fully pass -- SKIPPING phase 2/3 (would be uninterpretable)" );
 
 wait_exit:
     printf( "\nPress + to exit\n" );

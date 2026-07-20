@@ -1,0 +1,3 @@
+[submodule "wine-nx-probe/third_party/box64"]
+	path = wine-nx-probe/third_party/box64
+	url = https://github.com/ptitSeb/box64.git

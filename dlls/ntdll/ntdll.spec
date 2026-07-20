@@ -1751,6 +1751,10 @@
 @ cdecl wine_server_fd_to_handle(long long long ptr)
 @ cdecl wine_server_handle_to_fd(long long ptr ptr)
 
+# WowBox64 bridge (wine-nx)
+@ cdecl wine_nx_jit_allocate(int64 ptr ptr)
+@ cdecl wine_nx_jit_free(ptr int64)
+
 # Unix interface
 @ stdcall __wine_unix_call(int64 long ptr) compat___wine_unix_call
 @ stdcall __wine_unix_spawnvp(long ptr)

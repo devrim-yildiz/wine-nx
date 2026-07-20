@@ -1880,7 +1880,21 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
             (status = UNIX_CALL( process_attach, &params )))
         {
             ERR( "Failed to load unixlib, status %#lx\n", status );
+#ifdef __SWITCH__
+            /* No real OpenGL driver exists on Horizon/Switch (graphics go
+             * through deko3d/NVN instead) -- this unixlib load always fails
+             * here, and it's a hard, load-time (not delay-loaded) DLL_INIT
+             * failure that kills the whole process before it ever runs a
+             * line of its own code, even for apps (like this one) that only
+             * link opengl32.dll as one of several optional video-driver
+             * choices and never actually call into it at runtime. Let the
+             * DLL attach anyway; any actual OpenGL call later fails on its
+             * own terms instead of preventing the process from starting at
+             * all. */
+            break;
+#else
             return FALSE;
+#endif
         }
 
         /* fallthrough */
@@ -1888,7 +1902,11 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
         if ((status = UNIX_CALL( thread_attach, NtCurrentTeb() )))
         {
             WARN( "Failed to initialize thread, status %#lx\n", status );
+#ifdef __SWITCH__
+            break;
+#else
             return FALSE;
+#endif
         }
         break;
 

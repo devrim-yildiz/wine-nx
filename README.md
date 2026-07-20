@@ -817,6 +817,63 @@ Real applications will need more work in:
 - clipboard, IME, keyboard, and controller input;
 - audio, networking, and multi-process behavior as later milestones.
 
+### 32-bit WOW64 Guest Boot: From Immediate Crash To A Real App On Screen
+
+This branch (`wowbox64-scoping`) took a real, statically-linked 32-bit
+Windows game (OpenTTD, no bundled DLLs) as the actual target, instead of a
+purpose-built smoke test — the goal was proving the whole WOW64/box64 CPU
+backend end to end, not just its individual pieces in isolation. That
+surfaced a chain of boot-sequence bugs that a synthetic test could plausibly
+have never exercised, each hiding the next until the previous one was fixed:
+
+- `__SWITCH__` was never defined when building the PE-format (Windows-target)
+  DLLs, only for the native-static build — every `#ifdef __SWITCH__` block in
+  the loader, including the SD-card DLL search itself, was silently absent
+  from the guest's own ntdll the whole time.
+- The guest's initial thread context never had `Eax`/`Ebx`/`Eip` set at all
+  (only `Esp`/segment registers/`EFlags`/FPU state were) — real Wine gets
+  these from the native OS's own thread-creation path before
+  `LdrInitializeThunk` ever runs, which this port's handoff bypasses
+  entirely. The guest's real entry point was always a dead zero.
+- Once that was fixed, `Esp` landed exactly on `StackBase` with no headroom,
+  so `RtlUserThreadStart`'s first instruction write-faulted immediately.
+- `TlsSlots[WOW64_TLS_USERCALLBACKDATA]` was never explicitly cleared,
+  unlike a real freshly-created thread's TEB — a `longjmp()` inside stock
+  Wine's own `wow64_NtCallbackReturn` read garbage from it.
+- The native `NtContinue`/`NtContinueEx` → `signal_set_full_context()` path
+  was an unconditional stub returning `STATUS_NOT_IMPLEMENTED` — the guest's
+  own `NtContinue` calls (thread start, callback returns) were silently
+  no-ops the entire time.
+- Wine's own `longjmp` (NTDLL.@) goes through `RtlUnwind()` for SEH-correct
+  unwinding, which needs `.pdata`/`.xdata` metadata for every native frame
+  it crosses — box64's own JIT/dispatch call frames have none, so the walk
+  silently failed to jump at all. Reimplemented as a direct register
+  restore for this platform, matching `_setjmpex`'s own save sequence.
+- `GetTickCount`/`GetTickCount64` were wired to `NtGetTickCount()`, which
+  already had a working clock backing it natively but was never connected
+  to the guest-facing entry points apps actually call (see "GetTickCount/
+  GetTickCount64 Are Frozen" above, now fixed for `__SWITCH__`).
+
+With all of the above fixed, the guest boots, loads its DLLs, creates real
+windows, and paints real GDI content — confirmed with both OpenTTD (a real
+message-box dialog rendered on screen, buttons and all) and `cube32`
+(`wine-nx-probe/samples/cube32/`, a new, deliberately i686-w64-mingw32
+smoke test — the existing `gui_smoke.c` demo is aarch64-windows native and
+never touches the WOW64/box64 path at all, so it couldn't have caught any
+of the bugs above).
+
+**Not yet fixed:** presentation is still extremely slow on this specific
+32-bit guest path — `cube32` alone measured around 1fps, not the WOW64-
+independent numbers reported earlier in this document. One concrete,
+fixed contributor: a caret-blink system timer was paying a full IPC round
+trip every tick even in processes that never create a caret at all (~25%
+of all IPC traffic in one short capture). Text rendering also appears
+inconsistent in some contexts (a dialog box's own message text rendered
+blank while its title and one button label did not) — not yet root-caused,
+plausibly related to font loading/glyph rasterization rather than the
+GDI blit path itself (which is otherwise confirmed working). Both need
+further investigation before this is a usable app-launch path.
+
 ## Build
 
 ### Host System Setup
@@ -911,6 +968,20 @@ mkdir -p "$PE_BUILD_DIR"
 
 After configure, the normal Switch package build will compile the missing
 Notepad executable and DLLs from that tree.
+
+For WoW64 (aarch64 native + i386 guest, scoped for the WowBox64
+integration -- see `wine-nx-probe/wowbox64-scoping.md`) instead, change
+`--enable-archs=aarch64` above to `--enable-archs=aarch64,i386` (not
+`i686` -- `configure.ac` only accepts `{i386,x86_64,arm,aarch64}`).
+Host-verified working: with a newer bison on `PATH` ahead of macOS's
+stock 2.3 (`brew install bison` provides 3.8.2; 3.0+ is required), this
+configures and `make -C dlls/wow64` / `make -C dlls/wow64win` both
+produce real aarch64 `wow64.dll`/`wow64win.dll` PE binaries.
+`dlls/wow64cpu` deliberately does *not* build for an aarch64 host --
+`configure.ac` hardcodes it to the `x86_64` architecture only. That's by
+design, not a gap: Wine expects a third-party emulator (Box64's WowBox64,
+in this project's case) to provide the CPU-backend DLL for an emulated
+host/guest pairing, not its own `dlls/wow64cpu`.
 
 From the repository root:
 

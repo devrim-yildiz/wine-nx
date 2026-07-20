@@ -210,9 +210,18 @@ static WINE_MODREF *last_failed_modref;
 static LDR_DDAG_NODE *node_ntdll, *node_kernel32;
 
 /* real-time progress trace: loader.c has no log sink of its own, so route
- * milestone lines to runtime.c's flushed log while fixup_imports() runs. */
+ * milestone lines to runtime.c's flushed log while fixup_imports() runs.
+ * runtime.c (and its wine_nx_runtime_trace symbol) only exists in the
+ * native-static build linked directly into wine-nx-runtime.elf -- the PE
+ * (aarch64-windows/i386-windows) ntdll.dll builds compile this same source
+ * file too but have no way to link against it, so this must be weak there
+ * (never actually called from PE-compiled code paths in practice). */
 #ifdef __SWITCH__
+#ifdef __WINE_PE_BUILD
+extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+#else
 extern void wine_nx_runtime_trace( const char *msg );
+#endif
 #endif
 
 static void wine_nx_trace( const char *fmt, ... )
@@ -225,7 +234,11 @@ static void wine_nx_trace( const char *fmt, ... )
     vsnprintf( buf, sizeof(buf) - 1, fmt, args );
     va_end( args );
 #ifdef __SWITCH__
+#ifdef __WINE_PE_BUILD
+    if (&wine_nx_runtime_trace) wine_nx_runtime_trace( buf );
+#else
     wine_nx_runtime_trace( buf );
+#endif
 #else
     {
         size_t len = strlen( buf );
@@ -262,6 +275,21 @@ static NTSTATUS wine_nx_last_import_status;
 static char wine_nx_last_open_path[640];
 static NTSTATUS wine_nx_last_open_status;
 static char wine_nx_export_diag[1024];
+/* wine_nx_trace()/wine_nx_runtime_trace() are weak-linked no-ops when this
+ * source file executes as guest x86 code (the i386-windows PE build), since
+ * that symbol only resolves in the native-static ELF -- confirmed
+ * hardware-side: no [TR]/[LDR] trace line from guest-executed code has ever
+ * appeared in any log. Same workaround as wine_nx_last_import_dll etc.
+ * above: a plain global buffer at a fixed, known RVA (see
+ * `objdump -t ntdll.dll | grep wine_nx_dllmain_fail_name`), read directly out
+ * of guest memory (ntdll base + RVA) from the unix-side NtTerminateProcess
+ * syscall trace in signal_arm64.c, which reliably prints regardless of
+ * caller bitness. */
+/* Not static: a write-only (from this translation unit's perspective)
+ * static global is legal for the optimizer to eliminate entirely at -O2,
+ * and it did (confirmed: absent from `objdump -t` after the first attempt).
+ * External linkage keeps the compiler from assuming it's unobserved. */
+char wine_nx_dllmain_fail_name[64];
 
 const char *wine_nx_loader_last_import_dll(void)
 {
@@ -537,12 +565,23 @@ __ASM_GLOBAL_FUNC(call_dll_entry_point,
 static inline BOOL call_dll_entry_point( DLLENTRYPROC proc, void *module,
                                          UINT reason, void *reserved )
 {
+    /* wine_nx_set_active_pe_teb lives in runtime.c, part of the native-static
+     * build linked into wine-nx-runtime.elf only -- the PE ntdll.dll builds
+     * (this same source file, compiled separately) have no way to link
+     * against it. wine-nx patches this PE ntdll's own dispatcher stubs to
+     * redirect into the native-static copy instead, so this specific
+     * function's own code never actually runs from within the PE build in
+     * practice; weak it there rather than leaving it unresolved. */
+#ifdef __WINE_PE_BUILD
+    extern void wine_nx_set_active_pe_teb( TEB *teb ) __attribute__((weak));
+#else
     extern void wine_nx_set_active_pe_teb( TEB *teb );
+#endif
     uintptr_t ret;
     uintptr_t teb = (uintptr_t)NtCurrentTeb();
     uintptr_t reason_ptr = reason;
 
-    wine_nx_set_active_pe_teb( (TEB *)teb );
+    if (&wine_nx_set_active_pe_teb) wine_nx_set_active_pe_teb( (TEB *)teb );
     __asm__ volatile(
         "mov x16, %[func]\n\t"
         "mov x17, %[teb]\n\t"
@@ -1380,6 +1419,23 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
 }
 
 #ifdef __SWITCH__
+#ifdef __WINE_PE_BUILD
+/* This PE build's minimal libc (libmusl.a, linked with -nodefaultlibs) has
+ * no file I/O -- real upstream Wine PE-side code never needs it (always
+ * goes through NT file APIs instead), only this fopen-based raw-file
+ * export-table fallback below does, and it was only ever exercised from
+ * the native-static build until __SWITCH__ started being defined for the
+ * PE targets too. Stub these to always "fail" (matching what already
+ * happens whenever the real file can't be opened) rather than leave them
+ * unresolved -- every call site below already handles that outcome as
+ * "fallback unavailable, fall through to the normal export-not-found
+ * path", so this doesn't change behavior, just avoids a link error. */
+#define fopen(path, mode) ((FILE *)NULL)
+#define fclose(f) ((void)(f))
+#define fseek(f, off, whence) (-1)
+#define ftell(f) (-1L)
+#define fread(ptr, sz, n, f) ((size_t)0)
+#endif
 struct wine_nx_file_exports
 {
     void                         *data;
@@ -4260,6 +4316,129 @@ static WINE_MODREF *wine_nx_find_ntdll_bruteforce(void)
     return NULL;
 }
 
+/* dlls/wow64/syscall.c's process_init() later overwrites *syscall_dispatcher
+ * and *unix_call_dispatcher through a 32-bit (ULONG*) write --
+ * *p__wine_syscall_dispatcher = PtrToUlong(pBTCpuGetBopCode()) -- matching
+ * real Wine's own convention, where the slot's upper 32 bits are always zero
+ * because nothing on real hardware ever writes a genuine 64-bit value there
+ * first. If we write our own native dispatcher's real (>4GB, ELF-loaded)
+ * address directly into that same slot, process_init()'s later 32-bit write
+ * only clears the lower half, leaving our address's upper 32 bits stuck
+ * there -- hardware-confirmed: the crash PC's upper 32 bits exactly matched
+ * the previously-patched dispatcher address's upper 32 bits, across two
+ * independent runs. Fix: point the slot at a tiny trampoline allocated
+ * strictly below 4GB (same fix shape as wowbox64.dll's own ImageBase) so
+ * its address safely fits in 32 bits with naturally-zero upper bits, same
+ * as Box64's own bopcode address -- no more collision. */
+static void *wine_nx_make_low_trampoline( void *target )
+{
+    SIZE_T size = 0x1000;
+    void *mem = NULL;
+    NTSTATUS status;
+    ULONG old_prot;
+    UINT32 *code;
+
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &mem, 0xffffffff, &size,
+                                      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    if (status)
+    {
+        wine_nx_trace( "[LDR] low trampoline alloc failed status=%08x", (unsigned)status );
+        return NULL;
+    }
+
+    code = (UINT32 *)mem;
+    code[0] = 0x58000050;  /* ldr x16, #8 */
+    code[1] = 0xd61f0200;  /* br x16 */
+    *(UINT64 *)(code + 2) = (UINT64)(ULONG_PTR)target;
+
+    if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &mem, &size, PAGE_EXECUTE_READ, &old_prot )))
+    {
+        wine_nx_trace( "[LDR] low trampoline protect failed status=%08x", (unsigned)status );
+        return NULL;
+    }
+    NtFlushInstructionCache( NtCurrentProcess(), mem, 16 );
+
+    wine_nx_trace( "[LDR] low trampoline at %p -> %p", mem, target );
+    return mem;
+}
+
+/* Lets dlls/ntdll/unix/signal_arm64.c (a separate translation unit, same ELF
+ * binary) tell whether an address falls inside the real PE ntdll.dll's own
+ * mapped image -- used to distinguish a native wine-nx syscall stub's return
+ * address (always inside ntdll.dll) from a guest/Box64-dynarec syscall trap's
+ * return address (never inside ntdll.dll) when both land on the exact same
+ * __wine_syscall_dispatcher slot value. */
+void *wine_nx_get_pe_ntdll_range( SIZE_T *size )
+{
+    if (!wine_nx_pe_ntdll_module)
+    {
+        if (size) *size = 0;
+        return NULL;
+    }
+    if (size) *size = wine_nx_pe_ntdll_module->ldr.SizeOfImage;
+    return wine_nx_pe_ntdll_module->ldr.DllBase;
+}
+
+/* pWow64PrepareForException (dlls/ntdll/loader.c's _WIN64 branch, never built
+ * or run by this handoff path) is a plain internal global, not an ntdll.dll
+ * export -- RtlFindExportedRoutineByName can't locate it by name the way
+ * LdrSystemDllInitBlock's fields are found above. But KiUserExceptionDispatcher's
+ * own asm (dlls/ntdll/signal_arm64.c) references it via a fixed, compiler-
+ * emitted "adrp x16, pWow64PrepareForException / ldr x16, [x16, #:lo12:...]"
+ * pair as its very first two instructions (.seh_context/.seh_endprologue are
+ * directives, not code). Decoding those two instructions -- already resolved
+ * and mapped at pKiUserExceptionDispatcher's runtime address -- computes the
+ * variable's real address without a hardcoded offset that would go stale on
+ * the next rebuild. Verified bit-for-bit against this build's own disassembly
+ * before writing this. */
+static void *wine_nx_decode_adrp_ldr_target( const void *adrp_instr )
+{
+    const UINT32 *p = (const UINT32 *)adrp_instr;
+    UINT32 adrp = p[0], ldr = p[1];
+    INT64 imm21;
+    UINT64 page, off;
+    ULONG_PTR pc = (ULONG_PTR)adrp_instr;
+
+    if ((adrp >> 31) != 1 || ((adrp >> 24) & 0x1f) != 0x10)
+    {
+        wine_nx_trace( "[LDR] adrp decode: unexpected encoding %08x at %p", adrp, adrp_instr );
+        return NULL;
+    }
+    if (((ldr >> 30) & 0x3) != 0x3 || ((ldr >> 24) & 0x3f) != 0x39 || ((ldr >> 22) & 0x3) != 0x1)
+    {
+        wine_nx_trace( "[LDR] ldr decode: unexpected encoding %08x at %p", ldr, adrp_instr );
+        return NULL;
+    }
+
+    imm21 = (INT64)((((UINT64)adrp >> 5) & 0x7ffff) << 2 | ((adrp >> 29) & 0x3));
+    if (imm21 & (1 << 20)) imm21 -= (1 << 21);
+    page = (pc & ~(ULONG_PTR)0xfff) + ((UINT64)imm21 << 12);
+    off = (((UINT64)ldr >> 10) & 0xfff) * 8;
+
+    return (void *)(page + off);
+}
+
+/* Cached PE ntdll.dll slot addresses for __wine_syscall_dispatcher/
+ * __wine_unix_call_dispatcher, set once below. dlls/ntdll/unix/signal_arm64.c
+ * (same ELF binary, separate translation unit) reads these slots' *current*
+ * values at fault time -- after dlls/wow64/syscall.c's process_init()
+ * overwrites them with Box64's bopcode/unxcode trap addresses, both slots
+ * point at the same non-executable trap page, so a native wine-nx syscall
+ * stub's blr through this slot faults exactly like a genuine guest trap. */
+static void **wine_nx_pe_syscall_dispatcher_slot;
+static void **wine_nx_pe_unix_call_dispatcher_slot;
+
+void *wine_nx_get_pe_syscall_dispatcher_slot(void) { return wine_nx_pe_syscall_dispatcher_slot; }
+void *wine_nx_get_pe_unix_call_dispatcher_slot(void) { return wine_nx_pe_unix_call_dispatcher_slot; }
+
+/* Patches the *native, aarch64-windows* PE ntdll after wine-nx's own native
+ * bootstrap loads it, using inline ARM64 asm (blr through resolved export
+ * addresses) to call into it from unix-side/native-static code. Only ever
+ * invoked from wine_nx_wow64_handoff() (itself native-static-bootstrap-only),
+ * and the asm below is unconditionally ARM64 -- it cannot compile for the
+ * i386-windows target (a 32-bit toolchain with no x0-x18 registers) at all,
+ * only ever mattered for the aarch64/_WIN64 case in the first place. */
+#ifdef _WIN64
 static void wine_nx_patch_ntdll_dispatchers(void)
 {
     static BOOL patched;
@@ -4268,6 +4447,7 @@ static void wine_nx_patch_ntdll_dispatchers(void)
     void **unix_call_dispatcher;
     void **pe_teb;
     unixlib_handle_t *unixlib_handle;
+    void *syscall_trampoline, *unix_call_trampoline;
 
     if (patched) return;
     ntdll = wine_nx_pe_ntdll_module;
@@ -4293,10 +4473,14 @@ static void wine_nx_patch_ntdll_dispatchers(void)
         return;
     }
 
-    *syscall_dispatcher = __wine_syscall_dispatcher;
-    *unix_call_dispatcher = __wine_unix_call_dispatcher;
+    syscall_trampoline = wine_nx_make_low_trampoline( __wine_syscall_dispatcher );
+    unix_call_trampoline = wine_nx_make_low_trampoline( __wine_unix_call_dispatcher );
+    *syscall_dispatcher = syscall_trampoline ? syscall_trampoline : __wine_syscall_dispatcher;
+    *unix_call_dispatcher = unix_call_trampoline ? unix_call_trampoline : __wine_unix_call_dispatcher;
     *unixlib_handle = __wine_unixlib_handle;
     if (pe_teb) *pe_teb = NtCurrentTeb();
+    wine_nx_pe_syscall_dispatcher_slot = syscall_dispatcher;
+    wine_nx_pe_unix_call_dispatcher_slot = unix_call_dispatcher;
     patched = TRUE;
 
     wine_nx_trace( "[LDR] PE ntdll dispatchers patched syscall=%p unix=%p handle=%p teb=%p",
@@ -4304,6 +4488,38 @@ static void wine_nx_patch_ntdll_dispatchers(void)
                    (void *)(ULONG_PTR)*unixlib_handle, pe_teb ? *pe_teb : NULL );
     if (!pe_teb)
         wine_nx_trace( "[LDR] WARNING: PE ntdll lacks wine_nx_pe_teb; replace system32/ntdll.dll with the packaged build" );
+
+    /* pKiUserExceptionDispatcher (dlls/ntdll/unix/loader.c) is a unix-side
+     * global -- same shared ELF binary as this function, so a direct write
+     * reaches it, unlike the PE-side globals above. It's the address
+     * wine_nx_dispatch_hardware_exception() (signal_arm64.c) redirects
+     * execution to once it's built an EXCEPTION_RECORD/CONTEXT; normally set
+     * during LdrInitializeThunk's own init_wow64()-adjacent setup, which
+     * this bootstrap never runs, so it defaults to NULL and stays there
+     * without this. KiUserExceptionDispatcher itself is a real, exported
+     * ntdll function (ntdll.spec), resolved the same way as everything
+     * else here. */
+    {
+        /* This whole function patches the aarch64-windows PE ntdll's OWN
+         * exports after wine-nx's native bootstrap loads it -- it's only
+         * ever invoked from the native-static build (runtime.c), never
+         * from within PE-compiled code itself, but this same source file
+         * still gets compiled for the PE targets too, so the symbol needs
+         * to at least link there even though it's dead code in that
+         * context. Weak (defaults to a NULL address for an unresolved
+         * weak data symbol) plus a guard avoids a null-pointer write if
+         * that assumption is ever wrong. */
+#ifdef __WINE_PE_BUILD
+        extern void *pKiUserExceptionDispatcher __attribute__((weak));
+#else
+        extern void *pKiUserExceptionDispatcher;
+#endif
+        void *ki_user_exception_dispatcher = RtlFindExportedRoutineByName( ntdll->ldr.DllBase,
+                                                                           "KiUserExceptionDispatcher" );
+        if (ki_user_exception_dispatcher && &pKiUserExceptionDispatcher)
+            pKiUserExceptionDispatcher = ki_user_exception_dispatcher;
+        wine_nx_trace( "[LDR] unix-side pKiUserExceptionDispatcher=%p", ki_user_exception_dispatcher );
+    }
 
     /* The bootstrap path set peb->ProcessHeap via the shim in ntdll_pe_compat.c
      * (returns sentinel 0x1000). That's fine for our internal loader code which
@@ -4371,14 +4587,18 @@ static void wine_nx_patch_ntdll_dispatchers(void)
      * via x18, so it needs the same wrapper as RtlCreateHeap.
      *
      * Preferred: lookup via the export table (requires version_init in ntdll.spec and a
-     * PE ntdll rebuild). Fallback: hardcoded offset 0x76d24 of `version_init` inside the
-     * prebuilt aarch64 ntdll.dll currently shipped. The fallback is fragile across PE
-     * ntdll rebuilds — update if `llvm-objdump -t ntdll.dll | grep version_init` differs. */
+     * PE ntdll rebuild). Fallback: hardcoded offset 0x7a644 of `version_init` inside the
+     * prebuilt aarch64 ntdll.dll currently shipped (re-derived after the __SWITCH__
+     * PE-build fix shifted every offset in this file -- this fallback path isn't
+     * actually exercised right now since the export lookup succeeds, but keep it
+     * current anyway). The fallback is fragile across PE ntdll rebuilds — update if
+     * `objdump -t ntdll.dll | grep -w version_init` differs (RVA = section VMA -
+     * ImageBase + symbol's in-section offset from objdump -h/-t). */
     {
         void *version_init_fn = RtlFindExportedRoutineByName( ntdll->ldr.DllBase, "version_init" );
         if (!version_init_fn)
         {
-            version_init_fn = (char *)ntdll->ldr.DllBase + 0x76d24;
+            version_init_fn = (char *)ntdll->ldr.DllBase + 0x7a644;
             wine_nx_trace( "[LDR] version_init export missing; falling back to hardcoded offset %p", version_init_fn );
         }
         if (version_init_fn)
@@ -4447,11 +4667,18 @@ static void wine_nx_patch_ntdll_dispatchers(void)
      * ntdll_pe_compat.c uses DJB2, which would index different buckets and
      * leave lookups missing.
      *
-     * Offset 0xc2410 is the .data offset of `hash_table` symbol in the
-     * prebuilt aarch64 ntdll.dll — verify with `llvm-objdump -t | grep hash_table`
-     * if PE ntdll is ever rebuilt. */
+     * Offset 0xd2b80 is the RVA of the `hash_table` symbol in the prebuilt
+     * aarch64 ntdll.dll (re-derived after the __SWITCH__ PE-build fix shifted
+     * every offset in this binary -- hardware-confirmed root cause of a write
+     * fault right after locale_init(), since the old 0xc2410 pointed at
+     * whatever now happens to sit there instead). This one IS exercised
+     * unconditionally, unlike version_init's fallback above, so getting it
+     * wrong is a guaranteed crash, not a latent one. Re-verify with
+     * `objdump -t ntdll.dll | grep -w hash_table` (RVA = section VMA -
+     * ImageBase + symbol's in-section offset from objdump -h/-t) any time PE
+     * ntdll is rebuilt. */
     {
-        LIST_ENTRY *pe_hash_table = (LIST_ENTRY *)((char *)ntdll->ldr.DllBase + 0xc2410);
+        LIST_ENTRY *pe_hash_table = (LIST_ENTRY *)((char *)ntdll->ldr.DllBase + 0xd2b80);
         PEB *peb_local = NtCurrentTeb()->Peb;
         LIST_ENTRY *head, *cursor;
         unsigned int i, inserted = 0;
@@ -4483,6 +4710,14 @@ static void wine_nx_patch_ntdll_dispatchers(void)
                 }
                 bucket = &pe_hash_table[hash % 32];
 
+                {
+                    WINE_MODREF *wm_for_trace = CONTAINING_RECORD( mod, WINE_MODREF, ldr );
+                    char name_ascii[64];
+                    wine_nx_trace( "[HASH] Inserting: %s, system=%d, flags=%x",
+                                   wine_nx_us_ascii( &mod->BaseDllName, name_ascii, sizeof(name_ascii) ),
+                                   wm_for_trace->system, mod->Flags );
+                }
+
                 /* Re-link mod->HashLinks into PE bucket. This corrupts our
                  * unix-side hash_table (where this entry was previously linked),
                  * but nothing walks unix-side hash_table after dispatcher patch. */
@@ -4495,8 +4730,53 @@ static void wine_nx_patch_ntdll_dispatchers(void)
         }
         wine_nx_trace( "[LDR] PE ntdll hash_table initialized (32 buckets at %p, %u modules inserted)",
                        pe_hash_table, inserted );
+
+        {
+            static const WCHAR ntdll_name[] = L"ntdll.dll";
+            ULONG hash = 0;
+            LIST_ENTRY *bucket, *entry;
+            BOOL found = FALSE;
+            const WCHAR *p;
+
+            for (p = ntdll_name; *p; p++)
+            {
+                WCHAR c = *p;
+                if (c >= 'a' && c <= 'z') c -= 0x20;
+                hash = hash * 65599 + c;
+            }
+            bucket = &pe_hash_table[hash % 32];
+            for (entry = bucket->Flink; entry != bucket; entry = entry->Flink)
+            {
+                LDR_DATA_TABLE_ENTRY *found_mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, HashLinks );
+                WINE_MODREF *found_wm = CONTAINING_RECORD( found_mod, WINE_MODREF, ldr );
+
+                /* Replicate the exact guard the real (non-__SWITCH__) PE
+                 * find_basename_module() applies -- our own __SWITCH__ build
+                 * skips the !mod->system check entirely, so a plain name
+                 * match here would be a false positive: it wouldn't prove
+                 * the real PE ntdll.dll's own compiled find_basename_module()
+                 * -- which DOES have this check -- would actually accept
+                 * this entry. */
+                if (!found_wm->system && !(found_mod->Flags & LDR_REDIRECTED)
+                    && !_wcsicmp( found_mod->BaseDllName.Buffer, ntdll_name ))
+                {
+                    found = TRUE;
+                    break;
+                }
+            }
+            if (found)
+                wine_nx_trace( "[HASH] Read-back SUCCESS" );
+            else
+                wine_nx_trace( "[HASH] Read-back FAILED: offset stale" );
+        }
     }
 }
+#else
+static void wine_nx_patch_ntdll_dispatchers(void)
+{
+    /* Never called on i386-windows -- see the comment above. */
+}
+#endif
 
 static WINE_MODREF *wine_nx_build_main_module( const UNICODE_STRING *nt_name )
 {
@@ -4506,7 +4786,14 @@ static WINE_MODREF *wine_nx_build_main_module( const UNICODE_STRING *nt_name )
     void *module = NtCurrentTeb()->Peb->ImageBaseAddress;
 
     NtQueryInformationProcess( GetCurrentProcess(), ProcessImageInformation, &info, sizeof(info), NULL );
+    /* convert_to_pe64() (above, real upstream Wine code) is itself gated
+     * #ifdef _WIN64 -- this function is only ever called from the native
+     * (64-bit ARM64) bootstrap path in practice, but this same source file
+     * also compiles for the 32-bit i386-windows target, which has no such
+     * function at all. */
+#ifdef _WIN64
     if (!convert_to_pe64( module, &info )) return NULL;
+#endif
 
     status = build_module( NULL, nt_name, &module, &info, NULL, LDR_DONT_RESOLVE_REFS, FALSE,
                            FALSE, &wm );
@@ -5098,6 +5385,27 @@ static NTSTATUS load_dll( const WCHAR *load_path, const WCHAR *libname, DWORD fl
     BOOL redirected;
     void *prev;
 
+#ifdef __SWITCH__
+    /* Unconditional per-call trace (not just on failure) -- covers cases
+     * where the eventual STATUS_DLL_NOT_FOUND process exit isn't actually
+     * coming from this function's own done: label at all, so we can see
+     * the full, in-order sequence of every module load_dll() was ever
+     * asked for, from whichever ntdll instance (native or WOW64 guest)
+     * calls it, right up to whatever happens last before termination. */
+    {
+        char ascii[160];
+        unsigned int i, len = 0;
+        while (libname[len] && len < sizeof(ascii) - 1) len++;
+        for (i = 0; i < len; i++)
+        {
+            WCHAR c = libname[i];
+            ascii[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+        }
+        ascii[len] = 0;
+        wine_nx_trace( "[LDR] load_dll enter name='%s' system=%d", ascii, (int)system );
+    }
+#endif
+
     TRACE( "looking for %s in %s\n", debugstr_w(libname), debugstr_w(load_path) );
 
     if (system && system_dll_path.Buffer)
@@ -5144,7 +5452,23 @@ done:
     if (nts == STATUS_SUCCESS)
         TRACE("Loaded module %s at %p\n", debugstr_us(&nt_name), (*pwm)->ldr.DllBase);
     else
+    {
         WARN("Failed to load module %s; status=%lx\n", debugstr_w(libname), nts);
+#ifdef __SWITCH__
+        {
+            char ascii[160];
+            unsigned int i, len = 0;
+            while (libname[len] && len < sizeof(ascii) - 1) len++;
+            for (i = 0; i < len; i++)
+            {
+                WCHAR c = libname[i];
+                ascii[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+            }
+            ascii[len] = 0;
+            wine_nx_trace( "[LDR] load_dll FAILED name='%s' status=%lx", ascii, (unsigned long)nts );
+        }
+#endif
+    }
 
     if (mapping) NtClose( mapping );
     RtlFreeUnicodeString( &nt_name );
@@ -5201,6 +5525,38 @@ NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
 unsigned int CDECL wine_server_call( void *req_ptr )
 {
     return WINE_UNIX_CALL( unix_wine_server_call, req_ptr );
+}
+
+
+/***********************************************************************
+ *           wine_nx_jit_allocate
+ *
+ * WowBox64 bridge: allocates dual-alias (simultaneously writable and
+ * executable) memory for Box64's dynarec via libnx's jitCreate(), reached
+ * through the native Horizon-side implementation in
+ * dlls/ntdll/unix/horizon.c -- this (PE) compilation of ntdll can't call
+ * jitCreate() directly, see that file's unixcall_wine_nx_jit_allocate()
+ * for why. On success, *rw_addr is always-writable and *rx_addr is
+ * always-executable for the same underlying memory; no permission
+ * transition is needed or possible between them.
+ */
+NTSTATUS __cdecl wine_nx_jit_allocate( SIZE_T size, PVOID *rx_addr, PVOID *rw_addr )
+{
+    struct wine_nx_jit_allocate_params params = { size, rx_addr, rw_addr };
+    return WINE_UNIX_CALL( unix_wine_nx_jit_allocate, &params );
+}
+
+
+/***********************************************************************
+ *           wine_nx_jit_free
+ *
+ * Counterpart to wine_nx_jit_allocate(). rw_addr must be the exact
+ * pointer that call returned via *rw_addr; size must match.
+ */
+NTSTATUS __cdecl wine_nx_jit_free( PVOID rw_addr, SIZE_T size )
+{
+    struct wine_nx_jit_free_params params = { rw_addr, size };
+    return WINE_UNIX_CALL( unix_wine_nx_jit_free, &params );
 }
 
 
@@ -6232,6 +6588,241 @@ static void init_wow64( CONTEXT *context )
 #endif
 
 
+/* Entirely native-static-bootstrap-only (called once from runtime.c's
+ * main()) and unconditionally ARM64 (inline asm using x0-x18, Wow64Ldrp
+ * Initialize/wow64.dll concepts) -- never meant for the 32-bit
+ * i386-windows target, which this same source file also compiles for. */
+#if defined(__SWITCH__) && defined(_WIN64)
+/***********************************************************************
+ *           wine_nx_wow64_handoff
+ *
+ * wine-nx bypasses the standard LdrInitializeThunk path this project's
+ * own init_wow64() (the _WIN64 branch above) is normally reached from, so
+ * it's never called. This is that function's own logic (load wow64.dll,
+ * resolve Wow64LdrpInitialize), pulled out into its own callable entry
+ * point for wine-nx-probe/source/runtime.c's main() to invoke directly,
+ * right where it would otherwise jump straight to the guest's entry point.
+ *
+ * Not simply exposing init_wow64() itself: its own call to
+ * pWow64LdrpInitialize(context) is a plain C call with no x18 handling.
+ * On real Wine that's fine -- ntdll itself is PE-compiled there, so x18
+ * already holds the current TEB throughout the whole process by the
+ * platform ABI's own calling convention. Here, this file is compiled for
+ * aarch64-none-elf (same toolchain as runtime.c, linked directly into
+ * wine-nx-runtime.nro), which doesn't reserve x18 for anything -- calling
+ * into actual PE-compiled machine code (which Wow64LdrpInitialize, resolved
+ * from the real, mapped wow64.dll, is) needs the same explicit x18
+ * save/set/restore wrapper runtime.c's own call_pe_entry_point() already
+ * uses for the exact same reason. load_dll()/RtlFindExportedRoutineByName()
+ * are wine-nx's own native ELF code, not PE code -- safe to call directly,
+ * no wrapper needed for those two.
+ *
+ * context is NULL: confirmed by reading Wow64LdrpInitialize's own body
+ * (dlls/wow64/syscall.c) that it's never dereferenced there --
+ * RtlRunOnceExecuteOnce/thread_init/cpu_simulate, none of which reference
+ * it. It exists purely for calling-convention symmetry with how real
+ * Windows reaches this function.
+ *
+ * cpu_simulate(), the last thing Wow64LdrpInitialize does, blocks running
+ * the guest's CPU context via the BTCpu* vtable until the guest thread
+ * exits or faults -- this call *is* the WoW64 equivalent of jumping to
+ * entry, not a step that happens before it.
+ */
+NTSTATUS wine_nx_wow64_handoff(void)
+{
+    static const WCHAR wow64_path[] = L"C:\\windows\\system32\\wow64.dll";
+    HMODULE wow64;
+    WINE_MODREF *wm;
+    NTSTATUS status;
+    void *pWow64LdrpInitialize;
+    uintptr_t teb;
+
+    if ((status = load_dll( NULL, wow64_path, 0, &wm, FALSE )))
+    {
+        ERR( "wine_nx: could not load %s, status %lx\n", debugstr_w(wow64_path), status );
+        return status;
+    }
+    wow64 = wm->ldr.DllBase;
+
+    if (!(pWow64LdrpInitialize = RtlFindExportedRoutineByName( wow64, "Wow64LdrpInitialize" )))
+    {
+        ERR( "wine_nx: failed to resolve Wow64LdrpInitialize\n" );
+        return STATUS_ENTRYPOINT_NOT_FOUND;
+    }
+
+    /* Normally done by real Wine's start_main_thread() before it ever reaches
+     * load_wow64_ntdll()/init_wow64() -- this handoff path replaces that whole
+     * sequence, so it's never called either, leaving TlsSlots[WOW64_TLS_CPURESERVED]
+     * NULL. Hardware-confirmed: get_cpu_area() (dlls/ntdll/unix/thread.c) derefs
+     * that slot's ->Machine field (offset 2) unconditionally, faulting at
+     * far=0x2 exactly -- reached via NtQueryInformationThread(ThreadWow64Context)
+     * during Wow64LdrpInitialize's own bootstrap. init_thread_stack() is a real,
+     * generic (non-arch-specific) Wine function that also allocates the guest's
+     * own 32-bit stack, so it's called here rather than reimplemented. */
+    {
+        /* Declared in dlls/ntdll/unix/loader.c's unix_private.h, which this
+         * dual-compiled file doesn't include. Both are unix-side (real
+         * init_thread_stack) or native-static-only (wine_nx_init_wow64_
+         * initial_context, in horizon.c) -- unreachable from the PE
+         * (aarch64-windows/i386-windows) builds of this same source file.
+         * wine_nx_wow64_handoff() as a whole is only ever invoked once,
+         * from runtime.c's native bootstrap, so this is dead code in the
+         * PE context; weak plus a guard keeps that assumption from turning
+         * into a null-call crash if it's ever wrong. */
+#ifdef __WINE_PE_BUILD
+        extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size ) __attribute__((weak));
+        extern NTSTATUS wine_nx_init_wow64_initial_context(void) __attribute__((weak));
+#else
+        extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size );
+        extern NTSTATUS wine_nx_init_wow64_initial_context(void);
+#endif
+        NTSTATUS stack_status = (&init_thread_stack) ? init_thread_stack( NtCurrentTeb(), 0, 0, 0 ) : STATUS_NOT_IMPLEMENTED;
+        NTSTATUS ctx_status;
+        if (stack_status)
+            wine_nx_trace( "[LDR] init_thread_stack failed status=%08x", (unsigned)stack_status );
+        /* init_thread_stack() only allocates the 32-bit stack and sets
+         * cpu->Machine -- on real Wine, something in NtCreateThreadEx/process
+         * creation always populates the initial Esp before a thread's first
+         * pBTCpuGetContext() call; this handoff path bypasses that entirely,
+         * so it's done explicitly here instead. See
+         * wine_nx_init_wow64_initial_context()'s own comment (horizon.c) for
+         * the hardware-confirmed crash this fixes. */
+        ctx_status = (&wine_nx_init_wow64_initial_context) ? wine_nx_init_wow64_initial_context() : STATUS_NOT_IMPLEMENTED;
+        if (!ctx_status)
+            wine_nx_trace( "[LDR] wow64 initial context Esp set" );
+        else
+            wine_nx_trace( "[LDR] wine_nx_init_wow64_initial_context failed status=%08x", (unsigned)ctx_status );
+    }
+
+    /* Normally done by wine_nx_loader_fixup_main_imports()/attach_main(), which
+     * this WoW64 path skips entirely -- without this, the real ntdll.dll's
+     * __wine_syscall_dispatcher/__wine_unix_call_dispatcher/__wine_unixlib_handle
+     * stay NULL, and Wow64LdrpInitialize's first syscall attempt faults at pc=0. */
+    wine_nx_patch_ntdll_dispatchers();
+
+    /* Normally set by init_wow64() (the _WIN64 branch above, never called by
+     * this handoff path) -- and even there, ntdll_handle itself is left as a
+     * bare comment, never actually assigned. dlls/wow64/syscall.c's
+     * process_init() reads LdrSystemDllInitBlock.ntdll_handle expecting the
+     * real ntdll.dll's module handle; left at 0, it passes NULL into
+     * init_image_mapping() -> RtlFindExportedRoutineByName(NULL, "Wow64Transition")
+     * -> RtlImageNtHeader(NULL), a hardware-confirmed crash. LdrSystemDllInitBlock
+     * is a real, exported (non-static) symbol, so its address in the mapped PE
+     * ntdll.dll can be resolved directly -- no hardcoded offset needed, unlike
+     * the hash_table poke above. */
+    if (wine_nx_pe_ntdll_module)
+    {
+        SYSTEM_DLL_INIT_BLOCK *pe_init_block = RtlFindExportedRoutineByName(
+            wine_nx_pe_ntdll_module->ldr.DllBase, "LdrSystemDllInitBlock" );
+        if (pe_init_block)
+        {
+            void *base64 = wine_nx_pe_ntdll_module->ldr.DllBase;
+
+            /* Real Wine's load_ntdll_wow64_functions() (dlls/ntdll/unix/loader.c)
+             * resolves every one of these fields -- including ntdll_handle itself --
+             * against the *32-bit* ntdll.dll (loaded from syswow64), not the 64-bit
+             * one hosting the LdrSystemDllInitBlock struct. Getting this wrong (as an
+             * earlier version of this handoff did, using base64 for everything) sets
+             * the guest's initial Eip to the 64-bit ntdll's own (ARM64) LdrInitializeThunk
+             * address truncated to 32 bits -- hardware-confirmed: the guest then executes
+             * whatever zero-filled/garbage bytes happen to sit at that truncated address
+             * and immediately faults on a NULL dereference. */
+            static const WCHAR ntdll32_path[] = L"C:\\windows\\syswow64\\ntdll.dll";
+            WINE_MODREF *wm32;
+            void *base;
+
+            if ((status = load_dll( NULL, ntdll32_path, 0, &wm32, FALSE )))
+            {
+                ERR( "wine_nx: could not load 32-bit %s, status %lx\n", debugstr_w(ntdll32_path), status );
+                return status;
+            }
+            base = wm32->ldr.DllBase;
+
+            pe_init_block->ntdll_handle = (ULONG64)(ULONG_PTR)base;
+
+            /* Same fields init_wow64() sets via its SET_INIT_BLOCK macro (skipping
+             * pRtlpQueryProcessDebugInformationRemote/pRtlpFreezeTimeBias, which real
+             * Wine's own init_wow64() leaves commented out too). thread_init() sets
+             * the guest's own initial Eip/Pc to pLdrInitializeThunk -- left at 0, the
+             * guest CPU context would jump to address 0 the moment cpu_simulate()
+             * starts running it, and the exception/APC/callback dispatchers are
+             * equally load-bearing the first time the guest hits any of those paths. */
+#define SET_PE_INIT_BLOCK(field, name) \
+    { void *p = RtlFindExportedRoutineByName( base, name ); \
+      if (p) pe_init_block->field = (ULONG64)(ULONG_PTR)p; }
+            SET_PE_INIT_BLOCK( pKiUserApcDispatcher, "KiUserApcDispatcher" );
+            SET_PE_INIT_BLOCK( pKiUserExceptionDispatcher, "KiUserExceptionDispatcher" );
+            SET_PE_INIT_BLOCK( pLdrInitializeThunk, "LdrInitializeThunk" );
+            SET_PE_INIT_BLOCK( pRtlUserThreadStart, "RtlUserThreadStart" );
+            SET_PE_INIT_BLOCK( pKiUserCallbackDispatcher, "KiUserCallbackDispatcher" );
+            SET_PE_INIT_BLOCK( pLdrSystemDllInitBlock, "LdrSystemDllInitBlock" );
+#undef SET_PE_INIT_BLOCK
+            /* also populate the 32-bit ntdll's own LdrSystemDllInitBlock copy,
+             * mirroring load_ntdll_wow64_functions()'s own trailing memcpy --
+             * 32-bit code that reads its own copy directly (no WOW64 transition
+             * needed) expects it to already be populated. */
+            if (pe_init_block->pLdrSystemDllInitBlock)
+                memcpy( (void *)(ULONG_PTR)pe_init_block->pLdrSystemDllInitBlock,
+                        pe_init_block, sizeof(*pe_init_block) );
+
+            /* pWow64PrepareForException stays NULL forever on this handoff path
+             * (real Wine's init_wow64() is the only thing that ever sets it, and
+             * this path replaces init_wow64() entirely) -- so KiUserExceptionDispatcher
+             * always skips straight to dispatch_exception's generic SEH walk, which
+             * has no idea what to do with a PC inside Box64/WowBox64's own bopcode
+             * trap region (not part of any PE module's unwind tables) and ends up
+             * calling through a garbage handler pointer. Wow64PrepareForException
+             * (wow64.dll) -> pBTCpuResetToConsistentState is exactly Box64's hook to
+             * fix the context up first; wiring it in is required, not optional.
+             *
+             * Unlike the SET_PE_INIT_BLOCK fields above, this KiUserExceptionDispatcher
+             * lookup must stay against the 64-bit ntdll (base64): it's wine-nx's own
+             * hand-written ARM64 implementation (signal_arm64.c), and
+             * wine_nx_decode_adrp_ldr_target() only knows how to decode ARM64
+             * ADRP+LDR instruction pairs, not x86 machine code. */
+            {
+                void *ki_user_exception_dispatcher =
+                    RtlFindExportedRoutineByName( base64, "KiUserExceptionDispatcher" );
+                void *wow64_prepare_for_exception =
+                    RtlFindExportedRoutineByName( wow64, "Wow64PrepareForException" );
+
+                if (ki_user_exception_dispatcher && wow64_prepare_for_exception)
+                {
+                    void **slot = wine_nx_decode_adrp_ldr_target( ki_user_exception_dispatcher );
+
+                    if (slot)
+                    {
+                        *slot = wow64_prepare_for_exception;
+                        wine_nx_trace( "[LDR] pWow64PrepareForException at %p <- %p",
+                                       slot, wow64_prepare_for_exception );
+                    }
+                    else wine_nx_trace( "[LDR] failed to decode pWow64PrepareForException slot" );
+                }
+                else wine_nx_trace( "[LDR] failed to resolve KiUserExceptionDispatcher/Wow64PrepareForException" );
+            }
+        }
+    }
+
+    teb = (uintptr_t)NtCurrentTeb();
+    __asm__ volatile(
+        "mov x16, %[func]\n\t"
+        "mov x17, %[teb]\n\t"
+        "mov x9, x18\n\t"          /* save current x18 */
+        "mov x18, x17\n\t"         /* set PE TEB register */
+        "mov x0, xzr\n\t"          /* context = NULL */
+        "blr x16\n\t"
+        "mov x18, x9\n\t"          /* restore x18 (only reached if cpu_simulate ever returns) */
+        :
+        : [func] "r"(pWow64LdrpInitialize), [teb] "r"(teb)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+          "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18",
+          "x30", "memory", "cc" );
+
+    return STATUS_SUCCESS;
+}
+#endif
+
+
 /* release some address space once dlls are loaded*/
 static void release_address_space(void)
 {
@@ -6352,6 +6943,22 @@ void loader_init( CONTEXT *context, void **entry )
         {
             ERR( "Importing dlls for %s failed, status %lx\n",
                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
+#ifdef __SWITCH__
+            /* ERR()/wine_dbg_log go to a debug channel this build never
+             * routes anywhere -- these getters are populated by import_dll()
+             * regardless of which of the three ways this file compiles, so
+             * they work here too (same translation unit, no cross-linking
+             * needed unlike wine_nx_runtime_trace itself). */
+            wine_nx_trace( "[LDR] fixup_imports(main module) failed status=%08x", (unsigned)status );
+            if (wine_nx_loader_last_import_dll()[0])
+                wine_nx_trace( "[LDR] last failed import/export=%s status=%08x",
+                               wine_nx_loader_last_import_dll(), (unsigned)wine_nx_loader_last_import_status() );
+            if (wine_nx_loader_last_export_diag()[0])
+                wine_nx_trace( "[LDR] export diag=%s", wine_nx_loader_last_export_diag() );
+            if (wine_nx_loader_last_open_path()[0])
+                wine_nx_trace( "[LDR] last dll open=%s status=%08x",
+                               wine_nx_loader_last_open_path(), (unsigned)wine_nx_loader_last_open_status() );
+#endif
             NtTerminateProcess( GetCurrentProcess(), status );
         }
         imports_fixup_done = TRUE;
@@ -6404,11 +7011,54 @@ void loader_init( CONTEXT *context, void **entry )
                      debugstr_w(last_failed_modref->ldr.BaseDllName.Buffer) + 1 );
             ERR( "Initializing dlls for %s failed, status %lx\n",
                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
+#ifdef __SWITCH__
+            if (last_failed_modref)
+                wine_nx_us_ascii( &last_failed_modref->ldr.BaseDllName, wine_nx_dllmain_fail_name,
+                                  sizeof(wine_nx_dllmain_fail_name) );
+            else
+                snprintf( wine_nx_dllmain_fail_name, sizeof(wine_nx_dllmain_fail_name), "<unknown>" );
+#endif
             NtTerminateProcess( GetCurrentProcess(), status );
         }
         release_address_space();
         if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_PROCESS_ATTACH );
         if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
+
+#if defined(__SWITCH__) && !defined(_WIN64)
+        /* Guarded to i386 only: CONTEXT here is the ARM64 type when this
+         * file compiles for the aarch64-windows (64-bit host/wow64.dll)
+         * target, which has no Eax/Ebx/Eip fields at all -- this fixup is
+         * only meaningful for the 32-bit guest's own initial context.
+         *
+         * wine_nx_init_wow64_initial_context() (dlls/ntdll/unix/horizon.c)
+         * sets up Esp/SegCs/SegDs/SegEs/SegFs/SegGs/SegSs/EFlags/FPU state
+         * for the initial context, copied verbatim from the real
+         * init_syscall_frame() (dlls/ntdll/unix/signal_arm64.c) -- but never
+         * sets Eax/Ebx/Eip, since on real Wine/Windows those are set by
+         * init_syscall_frame() itself, called from the native OS's own
+         * thread-creation path *before* LdrInitializeThunk ever runs, where
+         * the real entry point is already known. wine-nx's handoff
+         * (wine_nx_wow64_handoff()) bypasses that mechanism entirely and
+         * kicks off LdrInitializeThunk by temporarily repurposing this same
+         * Eip slot -- but dlls/wow64/syscall.c's thread_init() (unmodified
+         * Wine code) saves whatever Eip held *before* that repurposing onto
+         * the guest stack (the very `context` LdrInitializeThunk itself
+         * receives), for signal_start_thread()'s final NtContinue() call to
+         * resume at, once this function returns. Since nothing ever set a
+         * real value there, that save-and-restore preserves 0 --
+         * hardware-confirmed: signal_start_thread()'s NtContinue(context,1)
+         * resumes at Eip=0, an immediate guest-code NULL-pointer read fault
+         * inside box64's dynarec (native_pass0), the very last thing that
+         * happens before the process silently hangs/crashes, with nothing
+         * of the guest program ever having run. Now that build_main_module()
+         * has actually loaded the main image, its real entry point is
+         * known -- set the same three fields init_syscall_frame() would
+         * have, directly on the context LdrInitializeThunk will hand back
+         * to signal_start_thread(). */
+        context->Eax = (DWORD)(ULONG_PTR)wm->ldr.EntryPoint;
+        context->Ebx = (DWORD)(ULONG_PTR)NtCurrentTeb()->Peb;
+        context->Eip = (DWORD)(ULONG_PTR)RtlUserThreadStart;
+#endif
 
         NtQueryInformationProcess( GetCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL );
         if (port) process_breakpoint();

@@ -1506,6 +1506,26 @@ const char * wine_debuginfostr_pc( void *pc )
     return __wine_dbg_strdup( buffer );
 }
 
+#ifndef __SWITCH__
+/* wine_nx_jit_allocate/free's real implementation lives in horizon.c,
+ * whose entire body is #ifdef __SWITCH__ -- on a non-Switch build (e.g.
+ * this file's other compilation, as part of the host-side ntdll.so built
+ * alongside the Windows-PE ntdll.dll this project stages onto the SD
+ * card), horizon.c compiles to nothing, so these link-completeness stubs
+ * live here instead. Never reached in practice: nothing on a non-Switch
+ * target would call wine_nx_jit_allocate(), since it exists specifically
+ * to bridge to a libnx primitive that only exists on Switch. */
+NTSTATUS unixcall_wine_nx_jit_allocate( void *args )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS unixcall_wine_nx_jit_free( void *args )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+#endif
+
 static const unixlib_entry_t unix_call_funcs[] =
 {
     load_so_dll,
@@ -1522,6 +1542,8 @@ static const unixlib_entry_t unix_call_funcs[] =
     steamclient_setup_trampolines,
     debugstr_pc,
     unixcall_compat_wine_nt_to_unix_file_name,
+    unixcall_wine_nx_jit_allocate,
+    unixcall_wine_nx_jit_free,
 };
 
 #ifdef __SWITCH__
