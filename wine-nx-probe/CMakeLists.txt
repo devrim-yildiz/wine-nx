@@ -948,3 +948,85 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_target(wine-nx-runtime-deko3d-nro ALL DEPENDS "${RUNTIME_DEKO3D_NRO_FILE}")
 endif()
+
+# --- WowBox64 (Box64's WOW64 CPU-backend build) -----------------------------
+# Opt-in, independent of the devkitA64 NRO build above: this drives Box64's
+# OWN, complete wine/wow64 CMake project (its "-DWOW64=ON -DARM_DYNAREC=ON"
+# target) with our pinned llvm-mingw toolchain, producing wowbox64.dll -- a
+# real ARM64 Windows PE DLL. Verified by an actual build on 2026-07-17
+# (unmodified upstream Box64 at commit 86f3d6d): "wowbox64.dll: PE32+
+# executable (DLL) (GUI) Aarch64, for MS Windows", 4.6MB. This only builds
+# the CPU-backend DLL itself -- it does not touch the dual-alias allocator
+# (that's the os_horizon.c addition below) or wire it into wine-nx's own
+# loader; it exists so that piece can be iterated on independently of the
+# devkitA64 toolchain used for the rest of this project.
+option(WINE_NX_BUILD_WOWBOX64 "Build wowbox64.dll from the vendored Box64 submodule" OFF)
+
+if(WINE_NX_BUILD_WOWBOX64)
+    include(ExternalProject)
+
+    set(WOWBOX64_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64")
+    if(NOT EXISTS "${WOWBOX64_SRC_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "WINE_NX_BUILD_WOWBOX64 is ON but ${WOWBOX64_SRC_DIR} is empty. "
+            "Run: git submodule update --init wine-nx-probe/third_party/box64")
+    endif()
+
+    # Same LLVM_MINGW_DIR convention build-switch.sh already uses for the
+    # PE-DLL rebuild path (README.md's --enable-archs=aarch64,i386 section) --
+    # reused here rather than inventing a second toolchain variable.
+    set(WOWBOX64_LLVM_MINGW_DIR "$ENV{LLVM_MINGW_DIR}"
+        CACHE PATH "llvm-mingw root (defaults to the pinned toolchain under wine-nx-probe/toolchains)")
+    if(NOT WOWBOX64_LLVM_MINGW_DIR)
+        set(WOWBOX64_LLVM_MINGW_DIR "${CMAKE_CURRENT_SOURCE_DIR}/toolchains/llvm-mingw-20260505-ucrt-macos-universal")
+    endif()
+    set(WOWBOX64_LLVM_MINGW_BIN "${WOWBOX64_LLVM_MINGW_DIR}/bin")
+    if(NOT EXISTS "${WOWBOX64_LLVM_MINGW_BIN}/aarch64-w64-mingw32-clang")
+        message(FATAL_ERROR
+            "WINE_NX_BUILD_WOWBOX64 is ON but no aarch64-w64-mingw32-clang under "
+            "${WOWBOX64_LLVM_MINGW_BIN}. Set LLVM_MINGW_DIR or fetch the pinned "
+            "toolchain per README.md.")
+    endif()
+
+    # ExternalProject_Add configures Box64's REAL root CMakeLists.txt (not a
+    # copy) with -DWOW64=ON -DARM_DYNAREC=ON, which is what makes it emit the
+    # "wowbox64" ExternalProject target internally -- see CMakeLists.txt:1610
+    # in the submodule. That inner target uses Box64's own
+    # wine/toolchain_mingw.cmake, which references the mingw binaries by bare
+    # name (relying on PATH); we prepend our pinned bin dir for both the
+    # configure and build steps so it resolves to the exact toolchain this
+    # project already pins, not whatever happens to be on PATH.
+    ExternalProject_Add(
+        wowbox64_external
+        SOURCE_DIR "${WOWBOX64_SRC_DIR}"
+        CONFIGURE_COMMAND "${CMAKE_COMMAND}" -E env "PATH=${WOWBOX64_LLVM_MINGW_BIN}:$ENV{PATH}"
+            "${CMAKE_COMMAND}" -S "${WOWBOX64_SRC_DIR}" -B "<BINARY_DIR>"
+            -DWOW64=ON -DARM_DYNAREC=ON -DCMAKE_BUILD_TYPE=Release
+        BUILD_COMMAND "${CMAKE_COMMAND}" -E env "PATH=${WOWBOX64_LLVM_MINGW_BIN}:$ENV{PATH}"
+            "${CMAKE_COMMAND}" --build "<BINARY_DIR>" --target wowbox64
+        INSTALL_COMMAND ""
+        TEST_COMMAND ""
+        BUILD_ALWAYS ON
+        BUILD_BYPRODUCTS "<BINARY_DIR>/wowbox64-prefix/src/wowbox64-build/wowbox64.dll"
+    )
+
+    ExternalProject_Get_Property(wowbox64_external BINARY_DIR)
+    set(WOWBOX64_DLL "${BINARY_DIR}/wowbox64-prefix/src/wowbox64-build/wowbox64.dll")
+
+    # build-switch.sh (and anything else staging this DLL) shouldn't need to
+    # know ExternalProject's nested scratch layout -- stage a copy at a
+    # fixed, predictable path once the real build produces it.
+    set(WOWBOX64_OUTPUT_DIR "${CMAKE_BINARY_DIR}/wowbox_out")
+    set(WOWBOX64_DLL_OUT "${WOWBOX64_OUTPUT_DIR}/wowbox64.dll")
+
+    add_custom_command(
+        OUTPUT "${WOWBOX64_DLL_OUT}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${WOWBOX64_OUTPUT_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${WOWBOX64_DLL}" "${WOWBOX64_DLL_OUT}"
+        DEPENDS wowbox64_external "${WOWBOX64_DLL}"
+        COMMENT "Staging wowbox64.dll to a predictable, top-level output path"
+        VERBATIM
+    )
+
+    add_custom_target(wowbox64-dll ALL DEPENDS "${WOWBOX64_DLL_OUT}")
+endif()
