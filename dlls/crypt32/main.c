@@ -55,9 +55,19 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, PVOID pvReserved)
             DisableThreadLibraryCalls(hInst);
             init_empty_store();
             crypt_oid_init();
+#ifdef __SWITCH__
+            /* Same rationale as opengl32.dll/ws2_32.dll: don't let a failed
+             * unix-side load turn into a hard, load-time DLL_INIT failure
+             * that kills every process importing crypt32.dll -- let it
+             * attach, and any actual crypto call fails on its own terms
+             * later instead. */
+            if (!__wine_init_unix_call())
+                CRYPT32_CALL( process_attach, NULL );
+#else
             if (__wine_init_unix_call())
                 return FALSE;
             CRYPT32_CALL( process_attach, NULL );
+#endif
             break;
         case DLL_PROCESS_DETACH:
             if (pvReserved) break;

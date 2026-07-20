@@ -627,7 +627,20 @@ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+#ifdef __SWITCH__
+        /* Same rationale as opengl32.dll: __wine_init_unix_call() loading
+         * ws2_32's unix-side counterpart is a hard load-time DLL_INIT
+         * failure that kills the whole process before it runs any of its
+         * own code, even though real socket support isn't needed just to
+         * start (only once the app actually calls WSAStartup/etc). Let it
+         * attach; any actual networking call fails on its own terms later
+         * instead of preventing every app that imports ws2_32.dll from
+         * starting at all. */
+        __wine_init_unix_call();
+        return TRUE;
+#else
         return !__wine_init_unix_call();
+#endif
 
     case DLL_THREAD_DETACH:
         free_per_thread_data();
