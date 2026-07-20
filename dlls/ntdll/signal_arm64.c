@@ -893,6 +893,48 @@ __ASM_GLOBAL_FUNC( NTDLL__setjmpex,
 /*******************************************************************
  *		longjmp (NTDLL.@)
  */
+#ifdef __SWITCH__
+/* Real Wine's longjmp goes through RtlUnwind() for proper SEH-aware
+ * unwinding (running destructors/__finally blocks) along the way to the
+ * target frame -- which means virtual_unwind() must walk every native
+ * frame between here and the target using each one's PE .pdata/.xdata
+ * unwind metadata. wine-nx's execution model interleaves this native
+ * call stack with box64's own JIT-compiled guest code and internal
+ * dispatch/dynarec frames, which have no such metadata at all (they're
+ * not part of any loaded PE image's exception directory). Hardware-
+ * confirmed root cause of a crash chased across several rounds:
+ * wow64_NtCallbackReturn's longjmp() call (dlls/wow64/syscall.c, stock
+ * Wine code, escaping a nested guest callback back out through
+ * Wow64KiUserCallbackDispatcher's own setjmp()) silently failed to
+ * actually jump -- RtlUnwind's stack walk broke down somewhere in that
+ * chain and returned normally instead, falling straight through into
+ * the compiler's own noreturn safety-net trap (a `brk` instruction),
+ * reported as STATUS_NONCONTINUABLE_EXCEPTION.
+ *
+ * Skip RtlUnwind's stack walk entirely: just restore the callee-saved
+ * registers/Sp from the jmp_buf and branch directly to Lr, exactly
+ * mirroring NTDLL__setjmpex's own store sequence above. This drops
+ * proper SEH cleanup for anything unwound past, but wine-nx has no
+ * working SEH dispatch across this boundary to begin with, and
+ * Wow64KiUserCallbackDispatcher's use of it (escaping a nested callback)
+ * needs nothing more than a plain, working longjmp. */
+__ASM_GLOBAL_FUNC( NTDLL_longjmp,
+                   "ldr x2,        [x0, #0x70]\n\t" /* jmp_buf->Sp */
+                   "mov sp, x2\n\t"
+                   "ldp x19, x20,  [x0, #0x10]\n\t"
+                   "ldp x21, x22,  [x0, #0x20]\n\t"
+                   "ldp x23, x24,  [x0, #0x30]\n\t"
+                   "ldp x25, x26,  [x0, #0x40]\n\t"
+                   "ldp x27, x28,  [x0, #0x50]\n\t"
+                   "ldp x29, x30,  [x0, #0x60]\n\t" /* Fp, Lr */
+                   "ldp d8,  d9,   [x0, #0x80]\n\t"
+                   "ldp d10, d11,  [x0, #0x90]\n\t"
+                   "ldp d12, d13,  [x0, #0xa0]\n\t"
+                   "ldp d14, d15,  [x0, #0xb0]\n\t"
+                   "cmp w1, #0\n\t"
+                   "csinc w0, w1, wzr, ne\n\t" /* retval = retval ? retval : 1 */
+                   "br x30" )
+#else
 void __cdecl NTDLL_longjmp( _JUMP_BUFFER *buf, int retval )
 {
     EXCEPTION_RECORD rec;
@@ -907,6 +949,7 @@ void __cdecl NTDLL_longjmp( _JUMP_BUFFER *buf, int retval )
     rec.ExceptionInformation[0] = (DWORD_PTR)buf;
     RtlUnwind( (void *)buf->Frame, (void *)buf->Lr, &rec, IntToPtr(retval) );
 }
+#endif
 
 
 /***********************************************************************

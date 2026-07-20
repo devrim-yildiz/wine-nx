@@ -4297,6 +4297,18 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
 
     TRACE( "(0x%08x,%p,%u,%p,%u,%p) stub\n", class, query, query_len, info, size, ret_size );
 
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            char buf[64];
+            snprintf( buf, sizeof(buf), "[SYSCALL] NtQuerySystemInformationEx class=%d", class );
+            wine_nx_runtime_trace( buf );
+        }
+    }
+#endif
+
     pthread_once( &logical_proc_init_once, init_logical_proc_info );
 
     switch (class)
@@ -4383,6 +4395,7 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
         process = *(HANDLE *)query;
         if (process)
         {
+#ifndef __SWITCH__
             SERVER_START_REQ( get_process_info )
             {
                 req->handle = wine_server_obj_handle( process );
@@ -4390,7 +4403,36 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
             }
             SERVER_END_REQ;
             if (ret) return ret;
+#else
+            /* wine-nx's custom bootstrap skips NtCreateUserProcess entirely, so
+             * wineserver's process record never learns the mapped image's real
+             * machine type and always reports the native default (process->machine
+             * is set to native_machine at creation in server/process.c and only
+             * ever updated by a request our bootstrap never sends). The
+             * get_process_info round trip is therefore useless here -- bypass it
+             * entirely and answer from what we actually mapped instead, a
+             * single-process environment where this is always our own process.
+             * Without this, process_init() in dlls/wow64/syscall.c resolves the
+             * wrong current_machine and get_cpu_dll_name() rejects it, calling
+             * RtlExitUserProcess(1). */
+            machine = main_image_info.Machine;
+            ret = STATUS_SUCCESS;
+#endif
         }
+
+#ifdef __SWITCH__
+        {
+            extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+            if (&wine_nx_runtime_trace)
+            {
+                char buf[96];
+                snprintf( buf, sizeof(buf),
+                          "[SYSCALL] SystemSupportedProcessorArchitectures resolved machine=%04x ret=%x",
+                          machine, ret );
+                wine_nx_runtime_trace( buf );
+            }
+        }
+#endif
 
         len = (supported_machines_count + 1) * sizeof(*machines);
         if (size < len)

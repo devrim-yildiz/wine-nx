@@ -759,7 +759,14 @@ static const WCHAR *get_cpu_dll_name(void)
     {
     case IMAGE_FILE_MACHINE_I386:
         RtlInitUnicodeString( &nameW, L"\\Registry\\Machine\\Software\\Microsoft\\Wow64\\x86" );
-        ret = (native_machine == IMAGE_FILE_MACHINE_ARM64 ? L"libwow64fex.dll" : L"wow64cpu.dll");
+        /* wine-nx: use our own WowBox64 CPU backend (Box64 compiled as an
+         * ARM64 Windows PE DLL implementing the same BTCpu* interface) in
+         * place of FEX -- resolved dynamically against the BTCpu* vtable
+         * exactly like any other CPU backend here, no FEX-specific
+         * initialization exists in this file to route around (confirmed by
+         * reading process_init()/thread_init() in full: everything goes
+         * through the generic pBTCpu* function pointers). */
+        ret = (native_machine == IMAGE_FILE_MACHINE_ARM64 ? L"wowbox64.dll" : L"wow64cpu.dll");
         break;
     case IMAGE_FILE_MACHINE_ARMNT:
         RtlInitUnicodeString( &nameW, L"\\Registry\\Machine\\Software\\Microsoft\\Wow64\\arm" );

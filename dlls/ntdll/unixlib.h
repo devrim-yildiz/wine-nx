@@ -108,6 +108,27 @@ struct compat_wine_nt_to_unix_file_name_params
     unsigned int disposition;
 };
 
+/* WowBox64 bridge (see dlls/ntdll/loader.c's wine_nx_jit_allocate/free and
+ * dlls/ntdll/unix/horizon.c's unixcall_wine_nx_jit_allocate/free): Box64's
+ * WOW64 CPU backend (wowbox64.dll) can't link libnx directly -- it's built
+ * via aarch64-w64-mingw32-clang (Windows PE/COFF), while libnx is built for
+ * aarch64-none-elf (ELF/newlib), confirmed link-incompatible by an actual
+ * build attempt. These two calls let it reach the native, ELF-side
+ * jitCreate()-based dual-alias allocator through this project's existing
+ * __wine_unix_call bridge instead. */
+struct wine_nx_jit_allocate_params
+{
+    SIZE_T size;
+    PVOID *rx_addr;
+    PVOID *rw_addr;
+};
+
+struct wine_nx_jit_free_params
+{
+    PVOID  rw_addr;
+    SIZE_T size;
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -124,6 +145,8 @@ enum ntdll_unix_funcs
     unix_steamclient_setup_trampolines,
     unix_debugstr_pc,
     unix_compat_wine_nt_to_unix_file_name,
+    unix_wine_nx_jit_allocate,
+    unix_wine_nx_jit_free,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

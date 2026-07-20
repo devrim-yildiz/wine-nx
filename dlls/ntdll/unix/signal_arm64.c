@@ -47,8 +47,29 @@ void set_process_instrumentation_callback( void *callback )
 
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
-    (void)context;
-    return STATUS_NOT_IMPLEMENTED;
+    /* NtContinueEx (dlls/ntdll/unix/server.c, unmodified Wine code) calls
+     * this to actually apply a new context and resume. Hardware-confirmed
+     * root cause of the wow64_NtCallbackReturn/longjmp trap crash chased
+     * across several rounds: the guest's own 32-bit _signal_start_thread /
+     * win32k-callback-return code calls NtContinue, which traps through
+     * wine-nx's bopcode mechanism straight into the *native* 64-bit
+     * NtContinue (dlls/ntdll/unix/server.c) -- NOT through wow64_NtContinueEx
+     * (dlls/wow64/syscall.c), which is where real Wine's WOW64 architecture
+     * would normally route a 32-bit caller's context-sized structure. That
+     * native NtContinue then called this stub, which unconditionally failed
+     * with STATUS_NOT_IMPLEMENTED -- so the guest's callback/thread-start
+     * code never actually got its new Eip/Esp applied, then tried to
+     * recover via RtlRaiseException, cascading into the unrelated-looking
+     * longjmp crash several syscalls later.
+     *
+     * wine-nx only ever runs a single 32-bit WOW64 process (there is no
+     * genuine native 64-bit caller on this platform at all), so `context`
+     * reaching this function is always actually a 32-bit guest's
+     * I386_CONTEXT, not a native ARM64_NT_CONTEXT -- route it through
+     * set_thread_wow64_context() (this same file), the already-working
+     * mechanism BTCpuSetContext() uses, instead of NtSetContextThread's
+     * own (also-stubbed) native path. */
+    return set_thread_wow64_context( GetCurrentThread(), context, sizeof(I386_CONTEXT) );
 }
 
 void *get_native_context( CONTEXT *context )
@@ -76,20 +97,257 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
     return STATUS_NOT_IMPLEMENTED;
 }
 
+/* Ported verbatim from the real (non-__SWITCH__) implementation further down
+ * this file -- get_cpu_area()/get_thread_context()/set_thread_context() are
+ * all real, cross-platform Wine functions (dlls/ntdll/unix/thread.c), not
+ * arch- or __SWITCH__-specific, so this needed no translation. Confirmed
+ * necessary, not optional: BTCpuThreadInit()/Wow64LdrpInitialize's own
+ * bootstrap calls NtQueryInformationThread(GetCurrentThread(),
+ * ThreadWow64Context, ...) to fetch the guest's initial 32-bit CPU context --
+ * the bare STATUS_NOT_IMPLEMENTED stub this replaces was hardware-confirmed
+ * as exactly what blocked that call from ever getting real data. */
 NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
 {
-    (void)handle;
-    (void)ctx;
-    (void)size;
-    return STATUS_NOT_IMPLEMENTED;
+    BOOL self = (handle == GetCurrentThread());
+    USHORT machine;
+    void *frame;
+
+    switch (size)
+    {
+    case sizeof(I386_CONTEXT): machine = IMAGE_FILE_MACHINE_I386; break;
+    case sizeof(ARM_CONTEXT): machine = IMAGE_FILE_MACHINE_ARMNT; break;
+    default: return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    if (!self)
+    {
+        NTSTATUS ret = set_thread_context( handle, ctx, &self, machine );
+        if (ret || !self) return ret;
+    }
+
+    if (!(frame = get_cpu_area( machine ))) return STATUS_INVALID_PARAMETER;
+
+    switch (machine)
+    {
+    case IMAGE_FILE_MACHINE_I386:
+    {
+        I386_CONTEXT *wow_frame = frame;
+        const I386_CONTEXT *context = ctx;
+        DWORD flags = context->ContextFlags & ~CONTEXT_i386;
+
+        if (flags & CONTEXT_I386_INTEGER)
+        {
+            wow_frame->Eax = context->Eax;
+            wow_frame->Ebx = context->Ebx;
+            wow_frame->Ecx = context->Ecx;
+            wow_frame->Edx = context->Edx;
+            wow_frame->Esi = context->Esi;
+            wow_frame->Edi = context->Edi;
+        }
+        if (flags & CONTEXT_I386_CONTROL)
+        {
+            WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+
+            wow_frame->Esp    = context->Esp;
+            wow_frame->Ebp    = context->Ebp;
+            wow_frame->Eip    = context->Eip;
+            wow_frame->EFlags = context->EFlags;
+            wow_frame->SegCs  = context->SegCs;
+            wow_frame->SegSs  = context->SegSs;
+            cpu->Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
+        }
+        if (flags & CONTEXT_I386_SEGMENTS)
+        {
+            wow_frame->SegDs = context->SegDs;
+            wow_frame->SegEs = context->SegEs;
+            wow_frame->SegFs = context->SegFs;
+            wow_frame->SegGs = context->SegGs;
+        }
+        if (flags & CONTEXT_I386_DEBUG_REGISTERS)
+        {
+            wow_frame->Dr0 = context->Dr0;
+            wow_frame->Dr1 = context->Dr1;
+            wow_frame->Dr2 = context->Dr2;
+            wow_frame->Dr3 = context->Dr3;
+            wow_frame->Dr6 = context->Dr6;
+            wow_frame->Dr7 = context->Dr7;
+        }
+        if (flags & CONTEXT_I386_EXTENDED_REGISTERS)
+        {
+            memcpy( &wow_frame->ExtendedRegisters, context->ExtendedRegisters, sizeof(context->ExtendedRegisters) );
+        }
+        if (flags & CONTEXT_I386_FLOATING_POINT)
+        {
+            memcpy( &wow_frame->FloatSave, &context->FloatSave, sizeof(context->FloatSave) );
+        }
+        /* FIXME: CONTEXT_I386_XSTATE */
+        break;
+    }
+
+    case IMAGE_FILE_MACHINE_ARMNT:
+    {
+        ARM_CONTEXT *wow_frame = frame;
+        const ARM_CONTEXT *context = ctx;
+        DWORD flags = context->ContextFlags & ~CONTEXT_ARM;
+
+        if (flags & CONTEXT_INTEGER)
+        {
+            wow_frame->R0  = context->R0;
+            wow_frame->R1  = context->R1;
+            wow_frame->R2  = context->R2;
+            wow_frame->R3  = context->R3;
+            wow_frame->R4  = context->R4;
+            wow_frame->R5  = context->R5;
+            wow_frame->R6  = context->R6;
+            wow_frame->R7  = context->R7;
+            wow_frame->R8  = context->R8;
+            wow_frame->R9  = context->R9;
+            wow_frame->R10 = context->R10;
+            wow_frame->R11 = context->R11;
+            wow_frame->R12 = context->R12;
+        }
+        if (flags & CONTEXT_CONTROL)
+        {
+            wow_frame->Sp = context->Sp;
+            wow_frame->Lr = context->Lr;
+            wow_frame->Pc = context->Pc & ~1;
+            wow_frame->Cpsr = context->Cpsr;
+            if (context->Cpsr & 0x20) wow_frame->Pc |= 1; /* thumb */
+        }
+        if (flags & CONTEXT_FLOATING_POINT)
+        {
+            wow_frame->Fpscr = context->Fpscr;
+            memcpy( wow_frame->D, context->D, sizeof(context->D) );
+        }
+        break;
+    }
+
+    }
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 {
-    (void)handle;
-    (void)ctx;
-    (void)size;
-    return STATUS_NOT_IMPLEMENTED;
+    BOOL self = (handle == GetCurrentThread());
+    USHORT machine;
+    void *frame;
+
+    switch (size)
+    {
+    case sizeof(I386_CONTEXT): machine = IMAGE_FILE_MACHINE_I386; break;
+    case sizeof(ARM_CONTEXT): machine = IMAGE_FILE_MACHINE_ARMNT; break;
+    default: return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    if (!self)
+    {
+        NTSTATUS ret = get_thread_context( handle, ctx, &self, machine );
+        if (ret || !self) return ret;
+    }
+
+    if (!(frame = get_cpu_area( machine ))) return STATUS_INVALID_PARAMETER;
+
+    switch (machine)
+    {
+    case IMAGE_FILE_MACHINE_I386:
+    {
+        I386_CONTEXT *wow_frame = frame, *context = ctx;
+        DWORD needed_flags = context->ContextFlags & ~CONTEXT_i386;
+
+        if (needed_flags & CONTEXT_I386_INTEGER)
+        {
+            context->Eax = wow_frame->Eax;
+            context->Ebx = wow_frame->Ebx;
+            context->Ecx = wow_frame->Ecx;
+            context->Edx = wow_frame->Edx;
+            context->Esi = wow_frame->Esi;
+            context->Edi = wow_frame->Edi;
+            context->ContextFlags |= CONTEXT_I386_INTEGER;
+        }
+        if (needed_flags & CONTEXT_I386_CONTROL)
+        {
+            context->Esp    = wow_frame->Esp;
+            context->Ebp    = wow_frame->Ebp;
+            context->Eip    = wow_frame->Eip;
+            context->EFlags = wow_frame->EFlags;
+            context->SegCs  = wow_frame->SegCs;
+            context->SegSs  = wow_frame->SegSs;
+            context->ContextFlags |= CONTEXT_I386_CONTROL;
+        }
+        if (needed_flags & CONTEXT_I386_SEGMENTS)
+        {
+            context->SegDs = wow_frame->SegDs;
+            context->SegEs = wow_frame->SegEs;
+            context->SegFs = wow_frame->SegFs;
+            context->SegGs = wow_frame->SegGs;
+            context->ContextFlags |= CONTEXT_I386_SEGMENTS;
+        }
+        if (needed_flags & CONTEXT_I386_EXTENDED_REGISTERS)
+        {
+            memcpy( context->ExtendedRegisters, &wow_frame->ExtendedRegisters, sizeof(context->ExtendedRegisters) );
+            context->ContextFlags |= CONTEXT_I386_EXTENDED_REGISTERS;
+        }
+        if (needed_flags & CONTEXT_I386_FLOATING_POINT)
+        {
+            memcpy( &context->FloatSave, &wow_frame->FloatSave, sizeof(context->FloatSave) );
+            context->ContextFlags |= CONTEXT_I386_FLOATING_POINT;
+        }
+        if (needed_flags & CONTEXT_I386_DEBUG_REGISTERS)
+        {
+            context->Dr0 = wow_frame->Dr0;
+            context->Dr1 = wow_frame->Dr1;
+            context->Dr2 = wow_frame->Dr2;
+            context->Dr3 = wow_frame->Dr3;
+            context->Dr6 = wow_frame->Dr6;
+            context->Dr7 = wow_frame->Dr7;
+        }
+        /* FIXME: CONTEXT_I386_XSTATE */
+        set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
+        break;
+    }
+
+    case IMAGE_FILE_MACHINE_ARMNT:
+    {
+        ARM_CONTEXT *wow_frame = frame, *context = ctx;
+        DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM;
+
+        if (needed_flags & CONTEXT_INTEGER)
+        {
+            context->R0  = wow_frame->R0;
+            context->R1  = wow_frame->R1;
+            context->R2  = wow_frame->R2;
+            context->R3  = wow_frame->R3;
+            context->R4  = wow_frame->R4;
+            context->R5  = wow_frame->R5;
+            context->R6  = wow_frame->R6;
+            context->R7  = wow_frame->R7;
+            context->R8  = wow_frame->R8;
+            context->R9  = wow_frame->R9;
+            context->R10 = wow_frame->R10;
+            context->R11 = wow_frame->R11;
+            context->R12 = wow_frame->R12;
+            context->ContextFlags |= CONTEXT_INTEGER;
+        }
+        if (needed_flags & CONTEXT_CONTROL)
+        {
+            context->Sp   = wow_frame->Sp;
+            context->Lr   = wow_frame->Lr;
+            context->Pc   = wow_frame->Pc;
+            context->Cpsr = wow_frame->Cpsr;
+            context->ContextFlags |= CONTEXT_CONTROL;
+        }
+        if (needed_flags & CONTEXT_FLOATING_POINT)
+        {
+            context->Fpscr = wow_frame->Fpscr;
+            memcpy( context->D, wow_frame->D, sizeof(wow_frame->D) );
+            context->ContextFlags |= CONTEXT_FLOATING_POINT;
+        }
+        set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
+        break;
+    }
+
+    }
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
@@ -346,10 +604,121 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
 
     if (trace_syscall)
     {
-        char buf[128];
-        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x t=%u f=%u args=%u handler=%p",
-                  syscall_id, table_idx, func_idx, arg_bytes, handler );
+        /* WOW64_TLS_EMU (box64's x64emu_t* for the current thread) lives at
+         * TEB64.TlsSlots[17] (WOW64_TLS_MAX_NUMBER-2, with
+         * WOW64_TLS_MAX_NUMBER==19 per real Wine's wow64.dll internal
+         * numbering -- see the reserved-slots comment in wowbox64.c). Read
+         * the guest EIP directly out of it (x64emu_t.ip is at offset 0x88,
+         * confirmed earlier this session via an actual offsetof() build,
+         * not guessed) so every syscall trace line shows which x86
+         * instruction issued it -- this file is unix-side and always
+         * resolves wine_nx_runtime_trace correctly, unlike the PE-side
+         * loader.c trace helper which silently no-ops for guest (WOW64)
+         * code since it has no way to link against the native runtime. */
+        ULONG_PTR guest_eip = 0;
+        void *emu_ptr = NtCurrentTeb()->TlsSlots[17];
+        if (emu_ptr) guest_eip = *(ULONG_PTR *)((char *)emu_ptr + 0x88);
+        char buf[160];
+        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x t=%u f=%u args=%u handler=%p eip=0x%lx",
+                  syscall_id, table_idx, func_idx, arg_bytes, handler, guest_eip );
         wine_nx_runtime_trace( buf );
+
+        /* Hardware-confirmed tight loop: NtQueryInformationFile (0x11) /
+         * NtSetInformationFile (0x27) alternate 1700+ times with identical
+         * Esp/Ebp (a genuine guest-code retry loop, not stack corruption),
+         * right after RtlUserThreadStart finally started running for real
+         * (the Eax/Ebx/Eip + Esp-headroom fixes both landed). x4 is
+         * FileInformationClass for both calls; get the actual x86 caller's
+         * address the same way the NtTerminateProcess case below does
+         * (x9, saved by the syscall stub before blr clobbered x30) so it
+         * can be cross-referenced against this log's own "addJumpTableIfDefault64"
+         * lines to identify which guest function is looping. */
+        if ((syscall_id == 0x0011 || syscall_id == 0x0027) && guest_eip)
+        {
+            void *frame1 = __builtin_frame_address(1);
+            ULONG_PTR caller_native_ret = frame1 ? ((ULONG_PTR *)frame1)[1] : 0;
+            char buf4[160];
+            snprintf( buf4, sizeof(buf4), "[SYSCALL] file-info-loop id=0x%04x class=0x%lx caller_native_ret=0x%lx",
+                      syscall_id, x4, caller_native_ret );
+            wine_nx_runtime_trace( buf4 );
+        }
+
+        /* NtTerminateProcess(self, STATUS_DLL_NOT_FOUND) -- dump the actual
+         * x86 bytes around the call site so we can disassemble what decided
+         * on this specific status, instead of continuing to guess from
+         * sparse box64 EmuRun snapshots that only fire on cross-block jumps. */
+        if (syscall_id == 0x002c && guest_eip)
+        {
+            uint8_t *code = (uint8_t *)(guest_eip - 32);
+            char hex[160]; int pos = 0;
+            for (int i = 0; i < 48 && pos < 150; i++)
+                pos += snprintf( hex + pos, sizeof(hex) - pos, "%02x ", code[i] );
+            char buf2[256];
+            snprintf( buf2, sizeof(buf2), "[SYSCALL] NtTerminateProcess call site eip-32..eip+16: %s", hex );
+            wine_nx_runtime_trace( buf2 );
+            snprintf( buf2, sizeof(buf2), "[SYSCALL] NtTerminateProcess args handle=0x%lx exit_code=0x%lx", x0, x1 );
+            wine_nx_runtime_trace( buf2 );
+
+            /* STATUS_DLL_INIT_FAILED (0xc0000142): loader.c's _loader_init
+             * writes the failing module's name into wine_nx_dllmain_fail_name
+             * (a plain global, not static -- a static one was silently
+             * eliminated by the optimizer since nothing in that translation
+             * unit ever reads it back) right before this exact
+             * NtTerminateProcess call. wine_nx_trace()/wine_nx_runtime_trace()
+             * itself no-ops from guest-executed i386-windows code (confirmed:
+             * no [TR]/[LDR] line from guest code has ever appeared in any
+             * log), so read the guest global directly out of memory instead
+             * -- ntdll's image base is fixed at 0x7bc00000 every run
+             * (confirmed throughout this session), and the symbol's RVA
+             * (0x8e6b0) was read via `objdump -t` on the actual built binary. */
+            if (x1 == 0xc0000142)
+            {
+                char *name = (char *)(uintptr_t)0x7bc8e6b0;
+                char safe[68]; int i;
+                for (i = 0; i < 64 && name[i]; i++) safe[i] = (name[i] >= 0x20 && name[i] < 0x7f) ? name[i] : '?';
+                safe[i] = 0;
+                snprintf( buf2, sizeof(buf2), "[SYSCALL] STATUS_DLL_INIT_FAILED module='%s'", safe );
+                wine_nx_runtime_trace( buf2 );
+            }
+
+            /* Previous test read x64emu_t.regs[] (edx/esp) and dumped a
+             * backward code window, both dead ends: regs[] held box64's own
+             * Wow64Transition jump-table plumbing, not caller state, and
+             * ntdll packs its entire syscall-stub table contiguously (every
+             * neighboring 16 bytes was just another stub for an adjacent
+             * syscall ID), so there's no caller code physically nearby to
+             * find by scanning backward.
+             *
+             * __wine_syscall_dispatcher's own comment says it best: "Stub
+             * saved the real PE caller's LR into x9 before the blr" and
+             * "str x9, [sp, #8]" immediately preserves it, followed by
+             * "mov x29, sp" -- so the trampoline's own frame (one level up
+             * from this C function, i.e. __builtin_frame_address(1)) has
+             * the ORIGINAL x9 sitting at [x29+8]. x9 is a native ARM64 code
+             * address inside box64's JIT buffer, not an x86 address, but it
+             * can be cross-referenced against this same log's own
+             * "addJumpTableIfDefault64 ... jmp_rx=..." lines to find which
+             * x86 block (and hence which x86 CALL instruction) it belongs
+             * to -- no need to link against box64's own dynablock lookup
+             * from this file to get a usable answer. */
+            {
+                void *frame1 = __builtin_frame_address(1);
+                ULONG_PTR caller_native_ret = frame1 ? ((ULONG_PTR *)frame1)[1] : 0;
+                snprintf( buf2, sizeof(buf2),
+                          "[SYSCALL] trampoline frame1=%p caller_native_ret=0x%lx",
+                          frame1, caller_native_ret );
+                wine_nx_runtime_trace( buf2 );
+                if (caller_native_ret)
+                {
+                    uint32_t *p = (uint32_t *)(uintptr_t)(caller_native_ret - 64);
+                    char hex[210]; int pos = 0;
+                    for (int i = 0; i < 24 && pos < 200; i++)
+                        pos += snprintf( hex + pos, sizeof(hex) - pos, "%08x ", p[i] );
+                    snprintf( buf2, sizeof(buf2), "[SYSCALL] native words ending at caller_native_ret: %s", hex );
+                    wine_nx_runtime_trace( buf2 );
+                }
+            }
+        }
     }
 
     /*
@@ -366,6 +735,31 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
                                         ULONG_PTR,ULONG_PTR,ULONG_PTR,ULONG_PTR,
                                         ULONG_PTR,ULONG_PTR,ULONG_PTR,ULONG_PTR,
                                         ULONG_PTR,ULONG_PTR,ULONG_PTR,ULONG_PTR);
+
+    /* NtQueryInformationProcess(ProcessDebugPort) (dlls/ntdll/loader.c's
+     * loader_init(), last thing it does before returning to
+     * LdrInitializeThunk -> signal_start_thread -> NtContinue) is
+     * hardware-confirmed as STATUS_NOT_IMPLEMENTED on wine-nx. The very next
+     * NtContinue call (same shared WOW64_CPURESERVED-adjacent I386_CONTEXT
+     * that get_cpu_area()/BTCpuSimulate/BTCpuGetContext/BTCpuSetContext all
+     * read and write) has Eip=0, Esp=<the low-trampoline address> instead of
+     * the Eip=pLdrInitializeThunk it started with -- i.e. something
+     * clobbers this *shared, persistent* context storage between those two
+     * points, not a private per-call copy. Bracket this specific syscall
+     * with a direct read of that shared context to see whether the
+     * corruption is already present beforehand (a bug earlier in
+     * loader_init) or happens as a side effect of this exact syscall's own
+     * dispatch. */
+    if (syscall_id == 0x0019 && trace_syscall)
+    {
+        WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+        I386_CONTEXT *ictx = cpu ? (I386_CONTEXT *)(cpu + 1) : NULL;
+        char buf3[128];
+        snprintf( buf3, sizeof(buf3), "[SYSCALL] pre-NtQueryInformationProcess shared-ctx cpu=%p Eip=0x%lx Esp=0x%lx Eax=0x%lx",
+                  (void *)cpu, ictx ? (unsigned long)ictx->Eip : 0, ictx ? (unsigned long)ictx->Esp : 0,
+                  ictx ? (unsigned long)ictx->Eax : 0 );
+        wine_nx_runtime_trace( buf3 );
+    }
 
     if (arg_bytes <= 64)
     {
@@ -390,12 +784,44 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
                                            a8,a9,a10,a11,a12,a13,a14,a15);
     }
 
+    if (syscall_id == 0x0019 && trace_syscall)
+    {
+        WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+        I386_CONTEXT *ictx = cpu ? (I386_CONTEXT *)(cpu + 1) : NULL;
+        char buf3[128];
+        snprintf( buf3, sizeof(buf3), "[SYSCALL] post-NtQueryInformationProcess shared-ctx cpu=%p Eip=0x%lx Esp=0x%lx Eax=0x%lx",
+                  (void *)cpu, ictx ? (unsigned long)ictx->Eip : 0, ictx ? (unsigned long)ictx->Esp : 0,
+                  ictx ? (unsigned long)ictx->Eax : 0 );
+        wine_nx_runtime_trace( buf3 );
+    }
+
     if (trace_syscall)
     {
         char buf[128];
         snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x done status=0x%08x",
                   syscall_id, (unsigned)result );
         wine_nx_runtime_trace( buf );
+
+        /* NtMapViewOfSection (table 0, func 0x28): BaseAddress (x2) and
+         * ViewSize (x6) are IN/OUT pointers -- on success the callee has
+         * written the actual mapped base/size back through them. None of
+         * the guest-loaded system DLLs (kernel32, kernelbase, wowbox64.dll,
+         * etc., all sharing preferred base 0x10000000) ever get an
+         * [LDR] alloc_module trace, since that's guest-executed i386-windows
+         * PE code where wine_nx_trace()/wine_nx_runtime_trace() silently
+         * no-ops -- leaving every one of their *rebased* runtime addresses
+         * otherwise unknowable from this log. This call always goes through
+         * the unix-side syscall dispatcher regardless of caller, so it's a
+         * reliable place to recover them instead. */
+        if (syscall_id == 0x0028 && result == STATUS_SUCCESS)
+        {
+            void *base = *(void **)x2;
+            SIZE_T size = *(SIZE_T *)x6;
+            char buf2[128];
+            snprintf( buf2, sizeof(buf2), "[SYSCALL] NtMapViewOfSection base=%p size=0x%zx section=0x%lx",
+                      base, (size_t)size, x0 );
+            wine_nx_runtime_trace( buf2 );
+        }
     }
 
     return result;
@@ -526,6 +952,242 @@ __asm__(
     ".size wine_nx_pe_unix_call_dispatcher, . - wine_nx_pe_unix_call_dispatcher\n"
 );
 
+#include <switch.h>
+
+/* stack layout when calling KiUserExceptionDispatcher; must match the
+ * PE-side KiUserExceptionDispatcher assembly (dlls/ntdll/signal_arm64.c),
+ * which is shared, unmodified Wine code regardless of __SWITCH__. */
+struct exc_stack_layout
+{
+    CONTEXT              context;        /* 000 */
+    CONTEXT_EX           context_ex;     /* 390 */
+    EXCEPTION_RECORD     rec;            /* 3b0 */
+    ULONG64              align;          /* 448 */
+    ULONG64              sp;             /* 450 */
+    ULONG64              pc;             /* 458 */
+    ULONG64              redzone[2];     /* 460 */
+};
+C_ASSERT( offsetof(struct exc_stack_layout, rec) == 0x3b0 );
+C_ASSERT( sizeof(struct exc_stack_layout) == 0x470 );
+
+static inline void context_init_empty_xstate( CONTEXT *context, void *xstate_buffer )
+{
+    CONTEXT_EX *xctx;
+
+    xctx = (CONTEXT_EX *)(context + 1);
+    xctx->Legacy.Length = sizeof(CONTEXT);
+    xctx->Legacy.Offset = -(LONG)sizeof(CONTEXT);
+    xctx->XState.Length = 0;
+    xctx->XState.Offset = (BYTE *)xstate_buffer - (BYTE *)xctx;
+    xctx->All.Length = sizeof(CONTEXT) + xctx->XState.Offset + xctx->XState.Length;
+    xctx->All.Offset = -(LONG)sizeof(CONTEXT);
+}
+
+/***********************************************************************
+ *           wine_nx_dispatch_hardware_exception
+ *
+ * Horizon has no signal-based fault delivery -- __libnx_exception_handler()
+ * (dlls/ntdll/unix/horizon.c) gets a ThreadExceptionDump instead of a POSIX
+ * ucontext_t/siginfo_t, and virtual_handle_fault() alone only covers guard
+ * pages/write-watch/JIT-exec-protection. This mirrors what segv_handler()
+ * does on real Wine (handle_syscall_fault, then setup_exception), field-
+ * for-field translated from ThreadExceptionDump (libnx's
+ * switch/arm/thread_context.h) instead of a ucontext_t. Without this, any
+ * fault Wine expects KiUserExceptionDispatcher's own VEH/SEH chain to catch
+ * -- including Box64's own bopcode syscall-trap mechanism -- gets reported
+ * fatal instead of dispatched.
+ */
+NTSTATUS wine_nx_dispatch_hardware_exception( ThreadExceptionDump *ctx, EXCEPTION_RECORD *rec )
+{
+    extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+    CONTEXT context;
+    struct exc_stack_layout *stack;
+    void *stack_ptr;
+    unsigned int i;
+    char buf[128];
+
+    if (&wine_nx_runtime_trace)
+    {
+        snprintf( buf, sizeof(buf), "[EXC2] dispatch entered: sp=%p pc=%p pKiUserExceptionDispatcher=%p",
+                  (void *)ctx->sp.x, (void *)ctx->pc.x, pKiUserExceptionDispatcher );
+        wine_nx_runtime_trace( buf );
+    }
+
+    if (!pKiUserExceptionDispatcher) return STATUS_ACCESS_VIOLATION;
+
+    /* Confirm pWow64PrepareForException's slot (same adrp+ldr decode used to
+     * write it in wine_nx_wow64_handoff()) still holds a live value at the
+     * moment of the fault, and reports what BTCpuResetToConsistentState's
+     * dynarec-context fixup actually did to context.Pc/Sp -- the crash further
+     * downstream in dispatch_exception's SEH walk is unchanged after wiring
+     * this pointer, so this narrows down whether the call happens at all. */
+    if (&wine_nx_runtime_trace)
+    {
+        const UINT32 *p = (const UINT32 *)pKiUserExceptionDispatcher;
+        UINT32 adrp = p[0], ldr = p[1];
+        INT64 imm21 = (INT64)((((UINT64)adrp >> 5) & 0x7ffff) << 2 | ((adrp >> 29) & 0x3));
+        UINT64 page, off, slot;
+        if (imm21 & (1 << 20)) imm21 -= (1 << 21);
+        page = ((ULONG_PTR)pKiUserExceptionDispatcher & ~(ULONG_PTR)0xfff) + ((UINT64)imm21 << 12);
+        off = (((UINT64)ldr >> 10) & 0xfff) * 8;
+        slot = page + off;
+        snprintf( buf, sizeof(buf), "[EXC2] pWow64PrepareForException slot=%p value=%p",
+                  (void *)slot, *(void **)slot );
+        wine_nx_runtime_trace( buf );
+    }
+
+    if (is_inside_syscall( ctx->sp.x ))
+    {
+        struct syscall_frame *frame = get_syscall_frame();
+
+        if (ntdll_get_thread_data()->jmp_buf)
+        {
+            ctx->cpu_gprs[0].x = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+            ctx->cpu_gprs[1].x = 1;
+            ctx->pc.x = (ULONG_PTR)longjmp;
+            ntdll_get_thread_data()->jmp_buf = NULL;
+        }
+        else
+        {
+            ctx->cpu_gprs[0].x = rec->ExceptionCode;
+            ctx->cpu_gprs[18].x = (ULONG_PTR)NtCurrentTeb();
+            ctx->sp.x = (ULONG_PTR)frame;
+            ctx->pc.x = (ULONG_PTR)__wine_syscall_dispatcher_return;
+        }
+        return STATUS_SUCCESS;
+    }
+
+    /* dlls/wow64/syscall.c's process_init() overwrites __wine_syscall_dispatcher/
+     * __wine_unix_call_dispatcher's PE-ntdll slots with Box64's bopcode/unxcode
+     * trap addresses -- correct for the 32-bit guest's own syscalls (serviced by
+     * Box64's x86 emulator via EmitInterruptionImpl, never a hardware fault at
+     * all). But wine-nx has no separate native syscall path the way real Wine's
+     * "svc" instruction does; every native ntdll Zw* stub also reads this same
+     * slot, so any native 64-bit syscall made after process_init() runs (e.g.
+     * wow64.dll's own NtQueryInformationThread during its bootstrap) also jumps
+     * into the same non-exec trap page and faults here -- hardware-confirmed:
+     * the very first such fault's lr landed exactly on ZwQueryInformationThread's
+     * own `ret`, right after its `blr x16` into this slot. Disambiguate from a
+     * genuine guest/Box64-dynarec trap (whose return address would be inside
+     * Box64's own JIT buffer, never inside ntdll.dll) by checking whether lr
+     * falls inside the mapped PE ntdll.dll image, and service it directly with
+     * the same wine_nx_do_syscall()/__wine_unix_call_dispatcher_impl() logic
+     * the low trampolines use, instead of falling through to dispatch_exception's
+     * SEH walk (which has no unwind info for this address either way). */
+    {
+        extern void *wine_nx_get_pe_syscall_dispatcher_slot(void);
+        extern void *wine_nx_get_pe_unix_call_dispatcher_slot(void);
+        extern void *wine_nx_get_pe_ntdll_range( SIZE_T *size );
+        void **syscall_slot = wine_nx_get_pe_syscall_dispatcher_slot();
+        void **unix_call_slot = wine_nx_get_pe_unix_call_dispatcher_slot();
+        void *ntdll_base;
+        SIZE_T ntdll_size;
+        BOOL lr_in_ntdll;
+
+        ntdll_base = wine_nx_get_pe_ntdll_range( &ntdll_size );
+        lr_in_ntdll = ntdll_base && (ULONG_PTR)ctx->lr.x >= (ULONG_PTR)ntdll_base &&
+                      (ULONG_PTR)ctx->lr.x < (ULONG_PTR)ntdll_base + ntdll_size;
+
+        if (lr_in_ntdll && syscall_slot && ctx->pc.x == (ULONG_PTR)*syscall_slot)
+        {
+            ULONG_PTR *stack_args = (ULONG_PTR *)ctx->sp.x;
+            unsigned int syscall_id = (unsigned int)ctx->cpu_gprs[8].x;
+            NTSTATUS result = wine_nx_do_syscall( stack_args,
+                                                   ctx->cpu_gprs[0].x, ctx->cpu_gprs[1].x,
+                                                   ctx->cpu_gprs[2].x, ctx->cpu_gprs[3].x,
+                                                   ctx->cpu_gprs[4].x, ctx->cpu_gprs[5].x,
+                                                   ctx->cpu_gprs[6].x, ctx->cpu_gprs[7].x,
+                                                   syscall_id );
+            if (&wine_nx_runtime_trace)
+            {
+                snprintf( buf, sizeof(buf), "[EXC2] native syscall via bopcode slot: id=0x%x x9=%p lr=%p status=0x%08x",
+                          syscall_id, (void *)ctx->cpu_gprs[9].x, (void *)ctx->lr.x, (unsigned)result );
+                wine_nx_runtime_trace( buf );
+            }
+            ctx->cpu_gprs[0].x = (ULONG64)result;
+            ctx->cpu_gprs[18].x = (ULONG64)NtCurrentTeb();
+            /* NOT ctx->lr.x: blr x16 (the instruction that faulted) sets x30
+             * to the address of the very next instruction -- the stub's own
+             * `ret` -- as an intrinsic side effect, regardless of whether the
+             * branch target then faults on fetch. Resuming at that `ret`
+             * makes it jump to x30 again, i.e. straight back to itself: an
+             * infinite, syscall-free, fault-free loop, hardware-confirmed
+             * (log showed this exact syscall complete successfully, then
+             * total silence forever after -- not even one more syscall,
+             * which a genuinely continuing process would always produce).
+             * x9 holds the real caller's return address instead, saved by
+             * the stub's own `mov x9, x30` specifically because it knows the
+             * upcoming blr is about to clobber x30 -- see this file's
+             * existing __wine_syscall_dispatcher trampoline comment above,
+             * which relies on the exact same x9 convention. */
+            ctx->pc.x = ctx->cpu_gprs[9].x;
+            return STATUS_SUCCESS;
+        }
+
+        if (lr_in_ntdll && unix_call_slot && ctx->pc.x == (ULONG_PTR)*unix_call_slot)
+        {
+            /* Resuming at ctx->lr.x here is UNVERIFIED -- this path has never
+             * been hit on hardware yet. __wine_unix_call (dlls/ntdll/loader.c)
+             * is a plain C call, not a hand-written asm stub like Zw* syscall
+             * stubs; if its own generated code reaches this dispatcher slot
+             * via a tail-call-style branch (not blr), x30 would never get
+             * clobbered and ctx->lr.x would already be correct. If this path
+             * ever loops silently the same way the syscall_dispatcher case
+             * did, check whether it needs the same x9-based fix above. */
+            unixlib_handle_t handle = (unixlib_handle_t)ctx->cpu_gprs[0].x;
+            NTSTATUS result = __wine_unix_call_dispatcher_impl( handle, (unsigned int)ctx->cpu_gprs[1].x,
+                                                                 (void *)ctx->cpu_gprs[2].x );
+            if (&wine_nx_runtime_trace)
+            {
+                snprintf( buf, sizeof(buf), "[EXC2] native unix_call via unxcode slot: lr=%p status=0x%08x",
+                          (void *)ctx->lr.x, (unsigned)result );
+                wine_nx_runtime_trace( buf );
+            }
+            ctx->cpu_gprs[0].x = (ULONG64)result;
+            ctx->cpu_gprs[18].x = (ULONG64)NtCurrentTeb();
+            ctx->pc.x = ctx->lr.x;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    rec->ExceptionAddress = (void *)ctx->pc.x;
+
+    context.ContextFlags = CONTEXT_FULL;
+    context.Cpsr = ctx->pstate;
+    context.Fp   = ctx->fp.x;
+    context.Lr   = ctx->lr.x;
+    context.Sp   = ctx->sp.x;
+    context.Pc   = ctx->pc.x;
+    for (i = 0; i <= 28; i++) context.X[i] = ctx->cpu_gprs[i].x;
+    /* ThreadExceptionDump has no fpcr/fpsr fields (only ThreadContext does);
+     * Horizon's exception dump doesn't capture them. */
+    context.Fpcr = 0;
+    context.Fpsr = 0;
+    memcpy( context.V, ctx->fpu_gprs, sizeof(context.V) );
+
+    if (rec->ExceptionCode == (DWORD)STATUS_BREAKPOINT) context.Pc -= 4;
+
+    stack_ptr = (void *)(ctx->sp.x & ~15);
+    stack = virtual_setup_exception( stack_ptr, sizeof(*stack), rec );
+    if (&wine_nx_runtime_trace)
+    {
+        snprintf( buf, sizeof(buf), "[EXC2] virtual_setup_exception(%p) -> %p", stack_ptr, (void *)stack );
+        wine_nx_runtime_trace( buf );
+    }
+    stack->rec = *rec;
+    stack->context = context;
+    context_init_empty_xstate( &stack->context, stack->redzone );
+    stack->sp = stack->context.Sp;
+    stack->pc = stack->context.Pc;
+
+    ctx->sp.x = (ULONG64)stack;
+    ctx->pc.x = (ULONG64)pKiUserExceptionDispatcher;
+    ctx->cpu_gprs[18].x = (ULONG64)NtCurrentTeb();
+
+    if (&wine_nx_runtime_trace) wine_nx_runtime_trace( "[EXC2] dispatch redirect set up, returning SUCCESS" );
+
+    return STATUS_SUCCESS;
+}
 
 #else /* __SWITCH__ */
 

@@ -75,6 +75,7 @@ static inline TEB64 *NtCurrentTeb64(void) { return (TEB64 *)NtCurrentTeb()->GdiB
 extern WOW_PEB *wow_peb;
 extern ULONG_PTR user_space_wow_limit;
 extern SECTION_IMAGE_INFORMATION main_image_info;
+extern void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params );
 
 static inline WOW_TEB *get_wow_teb( TEB *teb )
 {
@@ -255,6 +256,9 @@ extern int wine_server_receive_fd( obj_handle_t *handle );
 extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
 extern size_t server_init_process(void);
 extern void server_init_process_done(void);
+#ifdef __SWITCH__
+extern void wine_nx_set_target_machine( unsigned short machine );
+#endif
 extern void server_init_thread( void *entry_point, BOOL *suspend );
 extern int server_pipe( int fd[2] );
 
@@ -403,6 +407,8 @@ extern NTSTATUS unixcall_wine_server_call( void *args );
 extern NTSTATUS unixcall_wine_server_fd_to_handle( void *args );
 extern NTSTATUS unixcall_wine_server_handle_to_fd( void *args );
 extern NTSTATUS unixcall_wine_spawnvp( void *args );
+extern NTSTATUS unixcall_wine_nx_jit_allocate( void *args );
+extern NTSTATUS unixcall_wine_nx_jit_free( void *args );
 #ifdef _WIN64
 extern NTSTATUS wow64_wine_dbg_write( void *args );
 extern NTSTATUS wow64_wine_server_call( void *args );

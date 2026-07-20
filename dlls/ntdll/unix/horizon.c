@@ -349,7 +349,9 @@ struct horizon_fd_queue
 #define HORIZON_STATUS_NO_MORE_FILES 0x80000006u
 #define HORIZON_STATUS_NOT_SAME_OBJECT 0xc00001acu
 #define HORIZON_IMAGE_FILE_MACHINE_ARM64 0xaa64
+#define HORIZON_IMAGE_FILE_MACHINE_I386 0x014c
 #define HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
+#define HORIZON_IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x10b
 #define HORIZON_IMAGE_FILE_DLL 0x2000
 #define HORIZON_IMAGE_SCN_CNT_CODE 0x00000020
 #define HORIZON_IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE 0x0040
@@ -574,6 +576,10 @@ struct horizon_init_first_thread_request
     int debug_level;
     int reply_fd;
     int wait_fd;
+    unsigned short machine; /* WowBox64 Phase 1: target PE's Machine, sent by the client's
+                                pre-flight read in runtime.c. Mirrors the __SWITCH__-only
+                                field added to server_protocol.h's real init_first_thread_request
+                                -- both describe the same wire bytes, kept in sync by hand. */
 };
 
 struct horizon_init_first_thread_reply
@@ -2094,6 +2100,10 @@ struct horizon_server_connection
     int wait_fd;
     unsigned int pid;
     unsigned int tid;
+    unsigned short machine; /* WowBox64 Phase 1: target's Machine, received and stored here
+                                from init_first_thread. Not yet acted on -- the reply below
+                                still always advertises ARM64 as the only supported machine;
+                                this is state only, not the dual-TEB allocation. */
 };
 
 struct horizon_server_object
@@ -3066,6 +3076,15 @@ static unsigned int horizon_round_up_u32( unsigned int value, unsigned int align
     return (value + align - 1) & ~(align - 1);
 }
 
+/* IMAGE_OPTIONAL_HEADER32 and ...64 share identical byte offsets from Magic
+ * (0) through DllCharacteristics (70, 2 bytes, ending at 72) -- BaseOfData(4)
+ * +ImageBase(4) in the 32-bit layout occupies the same 8 bytes ImageBase(8)
+ * alone does in the 64-bit layout, so everything up to and including
+ * DllCharacteristics lines up. Only ImageBase itself, the three
+ * SizeOf{Stack,Heap}{Reserve,Commit} fields, and everything from
+ * LoaderFlags/NumberOfRvaAndSizes/DataDirectory onward actually move. This
+ * function only reads ImageBase, SizeOfStackReserve/Commit and LoaderFlags
+ * from that divergent region -- see the is_pe32 branch below. */
 static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe_image_info *info )
 {
     unsigned char dos[64], nt[24];
@@ -3075,6 +3094,7 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     unsigned int size_of_image, section_alignment, size_of_headers;
     unsigned int i;
     unsigned short machine, characteristics, dll_charact;
+    int is_pe32;
     struct stat st;
 
     memset( info, 0, sizeof(*info) );
@@ -3099,9 +3119,10 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     opt_size = horizon_get_le16( nt + 20 );
     characteristics = horizon_get_le16( nt + 22 );
 
-    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64)
+    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 && machine != HORIZON_IMAGE_FILE_MACHINE_I386)
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
-    if (!section_count || section_count > 128 || opt_size < 112)
+    is_pe32 = machine == HORIZON_IMAGE_FILE_MACHINE_I386;
+    if (!section_count || section_count > 128 || opt_size < (is_pe32 ? 96 : 112))
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
     if (opt_size > 4096 || section_count > (0x10000 - opt_size) / 40)
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
@@ -3115,12 +3136,16 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     status = horizon_server_read_exact_at( fd, pe_offset + sizeof(nt), headers, headers_size );
     if (status) goto done;
 
-    if (horizon_get_le16( headers ) != HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    if (horizon_get_le16( headers ) !=
+        (is_pe32 ? HORIZON_IMAGE_NT_OPTIONAL_HDR32_MAGIC : HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC))
     {
         status = HORIZON_STATUS_INVALID_IMAGE_FORMAT;
         goto done;
     }
 
+    /* Magic through DllCharacteristics (offsets 0-72) is identical between
+     * IMAGE_OPTIONAL_HEADER32 and ...64 -- see the comment above this
+     * function -- so these reads are bitness-agnostic already. */
     section_alignment = horizon_get_le32( headers + 32 );
     size_of_image = horizon_get_le32( headers + 56 );
     size_of_headers = horizon_get_le32( headers + 60 );
@@ -3132,9 +3157,23 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
         goto done;
     }
 
-    info->base = horizon_get_le64( headers + 24 );
-    info->stack_size = horizon_get_le64( headers + 72 );
-    info->stack_commit = horizon_get_le64( headers + 80 );
+    /* ImageBase, the stack size fields, and LoaderFlags sit at different
+     * offsets and widths past the point the two layouts diverge (see the
+     * comment above this function). */
+    if (is_pe32)
+    {
+        info->base = horizon_get_le32( headers + 28 );
+        info->stack_size = horizon_get_le32( headers + 72 );
+        info->stack_commit = horizon_get_le32( headers + 76 );
+        info->loader_flags = horizon_get_le32( headers + 88 );
+    }
+    else
+    {
+        info->base = horizon_get_le64( headers + 24 );
+        info->stack_size = horizon_get_le64( headers + 72 );
+        info->stack_commit = horizon_get_le64( headers + 80 );
+        info->loader_flags = horizon_get_le32( headers + 104 );
+    }
     info->entry_point = horizon_get_le32( headers + 16 );
     info->map_size = size_of_image;
     info->alignment = section_alignment;
@@ -3147,7 +3186,6 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     info->image_charact = characteristics;
     info->dll_charact = dll_charact;
     info->machine = machine;
-    info->loader_flags = horizon_get_le32( headers + 104 );
     info->header_size = size_of_headers;
     info->header_map_size = horizon_round_up_u32( size_of_headers, 0x1000 );
     info->file_size = st.st_size > 0xffffffffll ? 0xffffffffu : (unsigned int)st.st_size;
@@ -3892,9 +3930,15 @@ static int horizon_server_handle_init_first_thread( struct horizon_server_connec
     reply.session_id = 1;
     connection->pid = reply.pid;
     connection->tid = reply.tid;
+    /* WowBox64 Phase 1: store the target's declared machine, received from the
+     * client's pre-flight PE read (runtime.c). Stored only -- the reply below
+     * is unchanged, still always advertising ARM64 as the sole supported
+     * machine, per the explicit instruction not to implement the dual-TEB
+     * allocation this handles for yet. */
+    connection->machine = request->machine;
 
-    TRACE( "Horizon server init_first_thread pid %u tid %u reply fd %d/%d wait fd %d/%d.\n",
-           reply.pid, reply.tid, reply_fd, request->reply_fd, wait_fd, request->wait_fd );
+    TRACE( "Horizon server init_first_thread pid %u tid %u machine 0x%x reply fd %d/%d wait fd %d/%d.\n",
+           reply.pid, reply.tid, connection->machine, reply_fd, request->reply_fd, wait_fd, request->wait_fd );
     return horizon_server_write_reply( connection->reply_fd, &reply, sizeof(reply),
                                        &machine, sizeof(machine) );
 }
@@ -8845,6 +8889,154 @@ __attribute__((weak)) NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void
     return STATUS_ACCESS_VIOLATION;
 }
 
+__attribute__((weak)) NTSTATUS wine_nx_dispatch_hardware_exception( ThreadExceptionDump *ctx, EXCEPTION_RECORD *rec )
+{
+    (void)ctx;
+    (void)rec;
+    return STATUS_ACCESS_VIOLATION;
+}
+
+/* Real definition lives in dlls/ntdll/unix/loader.c (linked as wine-loader-unix-real
+ * into wine-nx-runtime); narrower executables like the smoke tests link
+ * wine-signal-arm64-real (which now reads this) without the full loader object,
+ * so provide a weak fallback here to satisfy the link. */
+__attribute__((weak)) void *pKiUserExceptionDispatcher = NULL;
+
+/* wine_nx_dispatch_hardware_exception's native-syscall-via-bopcode-slot
+ * interception (dlls/ntdll/unix/signal_arm64.c) calls wine_nx_do_syscall(),
+ * which references these; both have their real, strong definitions outside
+ * wine-loader-unix-real (wine_nx_syscall_trace_enabled in
+ * wine-nx-probe/source/runtime.c, KeServiceDescriptorTable in
+ * dlls/ntdll/unix/loader.c), so narrower executables need weak fallbacks too. */
+__attribute__((weak)) int wine_nx_syscall_trace_enabled = 0;
+__attribute__((weak)) SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];
+
+/* Real definitions in dlls/ntdll/loader.c (wine-ntdll-loader-real); same
+ * narrower-executable gap as above. Returning NULL/0 here just makes the
+ * native-syscall-via-bopcode-slot check in wine_nx_dispatch_hardware_exception
+ * evaluate false, falling back to the pre-existing KiUserExceptionDispatcher
+ * redirect path unchanged. */
+__attribute__((weak)) void *wine_nx_get_pe_syscall_dispatcher_slot(void) { return NULL; }
+__attribute__((weak)) void *wine_nx_get_pe_unix_call_dispatcher_slot(void) { return NULL; }
+__attribute__((weak)) void *wine_nx_get_pe_ntdll_range( SIZE_T *size ) { if (size) *size = 0; return NULL; }
+
+/* On real Wine, a freshly created thread's initial WOW64 context (Esp/Eip)
+ * gets set as part of NtCreateThreadEx/process creation, before the thread
+ * ever runs -- by the time dlls/wow64/syscall.c's thread_init() calls
+ * pBTCpuGetContext() expecting a sane initial Esp, something has always
+ * already populated it. wine-nx's own bootstrap (wine_nx_wow64_handoff())
+ * bypasses that whole mechanism, so init_thread_stack() (dlls/ntdll/unix/
+ * thread.c, called from wine_nx_wow64_handoff()) only allocates the 32-bit
+ * stack and sets cpu->Machine -- the context storage get_cpu_area() points
+ * at stays all-zero. Hardware-confirmed: thread_init() read Esp=0 from
+ * pBTCpuGetContext(), computed ctx_ptr = 0 - sizeof(I386_CONTEXT), and
+ * *ctx_ptr = ctx faulted writing to address -0x2cc exactly.
+ *
+ * Only Esp is set here (to the newly-allocated 32-bit stack's top, matching
+ * a real freshly-created thread's initial stack pointer) -- thread_init()
+ * unconditionally overwrites Eip with pLdrInitializeThunk regardless of
+ * whatever value it started as, so there is nothing to set there. */
+NTSTATUS wine_nx_init_wow64_initial_context(void)
+{
+    WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+    void *frame;
+
+    if (!wow_teb) return STATUS_SUCCESS;  /* not a WOW64 process */
+    if (main_image_info.Machine != IMAGE_FILE_MACHINE_I386) return STATUS_SUCCESS;
+
+    /* On real Wine, a fresh thread's WOW TEB (NT_TIB32 at Tib) gets its
+     * Self/ExceptionList fields populated as part of the normal TEB-creation
+     * sequence, long before any guest code runs. wine-nx's handoff bypasses
+     * that too -- init_thread_stack() (called from wine_nx_wow64_handoff())
+     * only sets StackBase/StackLimit (it's a generic, non-WOW64-aware Wine
+     * function), leaving Self and ExceptionList at whatever the freshly
+     * committed page happened to contain. This is a real, independent gap
+     * (confirmed fixed: read-back trace showed Self=0x7ffc2000 landing
+     * correctly) -- but it turned out NOT to be the cause of the persistent
+     * far=0xf78b6964 fault; see the SegCs comment below for the actual root
+     * cause. Self must point at the WOW TEB itself; ExceptionList is the
+     * standard SEH chain terminator for a thread with no frames registered
+     * yet, matching what a real freshly-created thread's TIB always has. */
+    wow_teb->Tib.Self = (ULONG)(ULONG_PTR)wow_teb;
+    wow_teb->Tib.ExceptionList = ~0u;
+
+    /* Same category of gap as Self/ExceptionList above: on real Wine,
+     * TlsSlots[WOW64_TLS_USERCALLBACKDATA] (5) starts NULL as part of the
+     * normal TEB-creation sequence, and only ever becomes non-NULL via
+     * Wow64KiUserCallbackDispatcher() (dlls/wow64/syscall.c) pushing a
+     * genuine, setjmp()-captured frame right before invoking a real
+     * kernel-initiated user-mode callback (e.g. a window procedure).
+     * wine-nx has no real kernel/wineserver to ever initiate that call in
+     * the first place, so wow64_NtCallbackReturn() (also stock, unmodified
+     * Wine code) can end up reading this slot's raw, never-explicitly-
+     * cleared contents: non-NULL (its own not-guaranteed-zeroed page, same
+     * class of issue as Self/ExceptionList), so its own NULL check passes,
+     * but the "frame" it then dereferences has a garbage jmpbuf --
+     * longjmp() falls through instead of actually jumping, straight into
+     * the compiler's own noreturn safety-net trap right after the call.
+     * Hardware-confirmed: STATUS_NONCONTINUABLE_EXCEPTION at exactly that
+     * trap instruction, first and only hardware exception in the whole
+     * run. Explicitly starting this NULL removes the ambiguity regardless
+     * of what the underlying page happened to contain. */
+    NtCurrentTeb()->TlsSlots[WOW64_TLS_USERCALLBACKDATA] = NULL;
+
+    if (!(frame = get_cpu_area( IMAGE_FILE_MACHINE_I386 ))) return STATUS_INVALID_PARAMETER;
+    /* -16, matching init_syscall_frame()'s own convention exactly (dlls/
+     * ntdll/unix/signal_arm64.c: "i386_context->Esp = ...StackBase - 16").
+     * This Esp is what actually reaches RtlUserThreadStart once it runs:
+     * dlls/wow64/syscall.c's thread_init() saves whatever this field held
+     * *before* its own repurposing, onto the guest stack, for
+     * signal_start_thread()'s final NtContinue() call to resume with --
+     * the same save-and-restore mechanism that lost Eax/Ebx/Eip (fixed
+     * separately in dlls/ntdll/loader.c's loader_init()). Hardware-
+     * confirmed: with Eip fixed, execution now genuinely reaches
+     * RtlUserThreadStart's first instruction ("movl %ebx,0x8(%esp)"), which
+     * immediately write-faults at exactly Esp+8 -- Esp landed on StackBase
+     * itself, leaving zero headroom above it for RtlUserThreadStart's own
+     * entry/arg writes at [esp+4]/[esp+8]. */
+    ((I386_CONTEXT *)frame)->Esp = wow_teb->Tib.StackBase - 16;
+
+    /* Root cause of far=0xf78b6964 (hardware-confirmed via disassembling the
+     * exact faulting dynablock): ntdll32's _loader_init compiles a `cmp byte
+     * ptr [0x7bc8add8], 1` -- an absolute-addressed (mod=00,rm=101) 32-bit
+     * operand. Box64's geted() (dynarec_arm64_helper.c) decides how to
+     * materialize that address based on rex.is32bits: for 32-bit code it's
+     * MOV32w(ret, tmp) (the constant, used as-is); for 64-bit code the same
+     * encoding means RIP-relative, so it computes tmp+addr+delta instead.
+     * rex.is32bits threads all the way back to `R_CS == 0x23` in LinkNext()/
+     * EmuRun() (dynarec.c) -- i.e. it depends on SegCs actually being the
+     * standard WOW64 32-bit code selector. 0xf78b6964 - 0x7bc8add8 =
+     * 0x7bc2bb8c, exactly the address of the very next instruction in this
+     * block -- textbook evidence of the 64-bit RIP-relative path being taken
+     * for what should have been a flat 32-bit absolute address, meaning
+     * SegCs read as something other than 0x23 (almost certainly 0, since
+     * nothing ever set it).
+     *
+     * Real Wine's init_syscall_frame() (dlls/ntdll/unix/signal_arm64.c) is
+     * the actual function that populates a fresh WOW64 thread's SegCs/SegDs/
+     * SegEs/SegFs/SegGs/SegSs/EFlags/FPU control state -- wine-nx's handoff
+     * never calls it (or anything equivalent) at all, so every one of these
+     * fields was left at whatever the freshly committed I386_CONTEXT page
+     * contained (zero). Values below are copied verbatim from that function
+     * -- this is not a guess, it's what a real freshly-created WOW64 thread's
+     * context always has. */
+    {
+        I386_CONTEXT *ctx = (I386_CONTEXT *)frame;
+        XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)ctx->ExtendedRegisters;
+        ctx->SegCs = 0x23;
+        ctx->SegDs = 0x2b;
+        ctx->SegEs = 0x2b;
+        ctx->SegFs = 0x53;
+        ctx->SegGs = 0x2b;
+        ctx->SegSs = 0x2b;
+        ctx->EFlags = 0x202;
+        fpu->ControlWord = 0x27f;
+        fpu->MxCsr = 0x1f80;
+        fpux_to_fpu( &ctx->FloatSave, fpu );
+    }
+    return STATUS_SUCCESS;
+}
+
 void __libnx_exception_handler( ThreadExceptionDump *ctx )
 {
     EXCEPTION_RECORD rec = { 0 };
@@ -8874,8 +9066,25 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
               (unsigned long long)ctx->cpu_gprs[2].x, (unsigned long long)ctx->cpu_gprs[3].x,
               (unsigned long long)ctx->cpu_gprs[18].x );
     wine_nx_runtime_trace( buf );
+    /* Full register dump for the current exec-fault investigation: pc==far
+     * (0x7ae2aeb648) matched none of x0-x3/x18/lr, meaning whatever register
+     * held the RW jump target (instead of the correct RX alias) is somewhere
+     * in x4-x17/x19-x30 that the trace above never covered. Print everything
+     * this once rather than guessing which register to add next. */
+    {
+        char buf2[512]; int p = 0;
+        for (int i = 4; i <= 17 && p < 480; i++)
+            p += snprintf( buf2+p, sizeof(buf2)-p, "x%d=%llx ", i, (unsigned long long)ctx->cpu_gprs[i].x );
+        wine_nx_runtime_trace( buf2 );
+        p = 0;
+        for (int i = 19; i <= 28 && p < 480; i++)
+            p += snprintf( buf2+p, sizeof(buf2)-p, "x%d=%llx ", i, (unsigned long long)ctx->cpu_gprs[i].x );
+        snprintf( buf2+p, sizeof(buf2)-p, "fp=%llx", (unsigned long long)ctx->fp.x );
+        wine_nx_runtime_trace( buf2 );
+    }
 
     status = virtual_handle_fault( &rec, (void *)ctx->sp.x );
+    if (status) status = wine_nx_dispatch_hardware_exception( ctx, &rec );
     if (status)
     {
         snprintf( buf, sizeof(buf), "[EXC] unhandled status=0x%08x; parking thread", (unsigned)status );
@@ -9767,5 +9976,125 @@ int horizon_madvise( void *start, size_t size, int advice )
     TRACE( "madvise(%p, %zu, %#x) ignored.\n", start, size, advice );
     return 0;
 }
+
+/* Everything below needs unixlib.h's real params structs and ntstatus.h's
+ * real STATUS_* constants -- neither exists under HORIZON_STANDALONE_SYNTAX
+ * (horizon_syntax_shim.h's lightweight stand-ins, used by the wine-nx-probe
+ * smoke-test binary). That binary doesn't link unix/loader.c's
+ * unix_call_funcs[] dispatch table at all (confirmed: its CMakeLists.txt
+ * entry is just source/main.cpp + wine-horizon, nothing else), so nothing
+ * ever references unixcall_wine_nx_jit_allocate/free there -- safe to
+ * compile this out entirely rather than fight the shim. */
+#ifndef HORIZON_STANDALONE_SYNTAX
+
+#define HORIZON_JIT_MAX_ALLOCATIONS 64
+
+struct horizon_jit_allocation
+{
+    Jit    jit;
+    void  *rw_addr;
+    size_t size;
+    int    used;
+};
+
+static struct horizon_jit_allocation horizon_jit_allocations[HORIZON_JIT_MAX_ALLOCATIONS];
+static pthread_mutex_t horizon_jit_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* WowBox64 bridge: real, native implementation reached via __wine_unix_call
+ * from wine_nx_jit_allocate()/wine_nx_jit_free() in dlls/ntdll/loader.c --
+ * that (PE, aarch64-w64-mingw32) compilation of ntdll can't call jitCreate()
+ * directly (libnx only exists for the aarch64-none-elf/newlib toolchain
+ * this file itself is built with), so it reaches this via the same
+ * __wine_unix_call bridge wine_server_call() already uses.
+ *
+ * Deliberately uses jitCreate() (JitType_CodeMemory), not the raw
+ * svcMapProcessCodeMemory/svcSetProcessMemoryPermission pair
+ * protect_code_mapping() above uses: that pair only supports a
+ * single-address unmap+remap permission TOGGLE, unsafe for a dynarec that
+ * may execute already-compiled code on one thread while compiling more on
+ * another. jitCreate()'s CodeMemory backend keeps rw_addr and rx_addr
+ * simultaneously valid for the same physical memory -- matching what
+ * wine-nx-probe/source/jit_smoke.c hardware-verified this session,
+ * including under exactly that concurrent read(execute)-while-write
+ * pattern (its Phase 2 test). */
+NTSTATUS unixcall_wine_nx_jit_allocate( void *args )
+{
+    struct wine_nx_jit_allocate_params *params = args;
+    struct horizon_jit_allocation *slot = NULL;
+    Result rc;
+    int i;
+
+    if (!params->size || !params->rx_addr || !params->rw_addr)
+        return STATUS_INVALID_PARAMETER;
+
+    pthread_mutex_lock( &horizon_jit_mutex );
+
+    for (i = 0; i < HORIZON_JIT_MAX_ALLOCATIONS; i++)
+        if (!horizon_jit_allocations[i].used) { slot = &horizon_jit_allocations[i]; break; }
+    if (!slot)
+    {
+        pthread_mutex_unlock( &horizon_jit_mutex );
+        return STATUS_NO_MEMORY;
+    }
+
+    rc = jitCreate( &slot->jit, params->size );
+    if (R_FAILED(rc))
+    {
+        horizon_trace( "[JIT] wine_nx_jit_allocate: jitCreate(0x%zx) failed rc=0x%x",
+                       (size_t)params->size, rc );
+        pthread_mutex_unlock( &horizon_jit_mutex );
+        return STATUS_NO_MEMORY;
+    }
+
+    rc = jitTransitionToWritable( &slot->jit );
+    if (R_FAILED(rc))
+    {
+        horizon_trace( "[JIT] wine_nx_jit_allocate: jitTransitionToWritable failed rc=0x%x", rc );
+        jitClose( &slot->jit );
+        pthread_mutex_unlock( &horizon_jit_mutex );
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    slot->rw_addr = jitGetRwAddr( &slot->jit );
+    slot->size = params->size;
+    slot->used = 1;
+
+    *params->rw_addr = slot->rw_addr;
+    *params->rx_addr = jitGetRxAddr( &slot->jit );
+
+    horizon_trace( "[JIT] wine_nx_jit_allocate size=0x%zx rw=%p rx=%p",
+                   (size_t)params->size, *params->rw_addr, *params->rx_addr );
+
+    pthread_mutex_unlock( &horizon_jit_mutex );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS unixcall_wine_nx_jit_free( void *args )
+{
+    struct wine_nx_jit_free_params *params = args;
+    int i;
+
+    pthread_mutex_lock( &horizon_jit_mutex );
+
+    for (i = 0; i < HORIZON_JIT_MAX_ALLOCATIONS; i++)
+    {
+        struct horizon_jit_allocation *slot = &horizon_jit_allocations[i];
+
+        if (slot->used && slot->rw_addr == params->rw_addr && slot->size == params->size)
+        {
+            jitClose( &slot->jit );
+            slot->used = 0;
+            pthread_mutex_unlock( &horizon_jit_mutex );
+            return STATUS_SUCCESS;
+        }
+    }
+
+    pthread_mutex_unlock( &horizon_jit_mutex );
+    WARN( "wine_nx_jit_free: no tracked allocation at rw=%p size=0x%zx.\n",
+          params->rw_addr, (size_t)params->size );
+    return STATUS_INVALID_PARAMETER;
+}
+
+#endif /* !HORIZON_STANDALONE_SYNTAX */
 
 #endif /* __SWITCH__ */

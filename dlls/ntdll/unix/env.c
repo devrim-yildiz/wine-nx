@@ -1845,7 +1845,12 @@ static void load_global_options( const UNICODE_STRING *image )
 /*************************************************************************
  *		build_wow64_parameters
  */
-static void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
+/* Not static: wine-nx-probe/source/runtime.c's runtime_init_peb_process()
+ * calls this directly to populate wow_peb->ProcessParameters, since it
+ * backports init_peb()'s WoW64 block rather than calling init_peb() itself
+ * (wine-nx bypasses the standard LdrInitializeThunk path this function's
+ * caller is normally reached from). Declared in unix_private.h. */
+void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
 {
 #ifdef _WIN64
     RTL_USER_PROCESS_PARAMETERS32 *wow64_params = NULL;

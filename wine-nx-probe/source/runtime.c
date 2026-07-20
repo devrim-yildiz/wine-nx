@@ -62,6 +62,7 @@ extern void wine_nx_runtime_environment_init(void);
 extern NTSTATUS wine_nx_loader_bootstrap( const UNICODE_STRING *main_nt_name );
 extern NTSTATUS wine_nx_loader_fixup_main_imports(void);
 extern NTSTATUS wine_nx_loader_attach_main(void);
+extern NTSTATUS wine_nx_wow64_handoff(void);
 extern const char *wine_nx_loader_last_import_dll(void);
 extern NTSTATUS wine_nx_loader_last_import_status(void);
 extern const char *wine_nx_loader_last_open_path(void);
@@ -1315,6 +1316,27 @@ static void put_process_string( WCHAR **cursor, UNICODE_STRING *string, const ch
     *cursor += len + 1;
 }
 
+/* Box64's own BTCpuThreadInit()/BTCpuSimulate()/BTCpuResetToConsistentState()
+ * (and its whole interpreter/dynarec) are all gated behind
+ * printf_log(LOG_DEBUG, ...) -- filtered out by Box64's own log-level env var
+ * (BOX64_LOG, defaults to LOG_INFO=1, one below LOG_DEBUG=2). The guest
+ * process previously had no environment block at all ("empty environment"),
+ * so Box64 never saw any BOX64_* variable regardless of what was set outside
+ * the process. Without this, a real 32-bit guest reaching DynaRun() (Box64's
+ * dynarec, running the guest's own code) is completely invisible -- no
+ * tracing exists once execution gets there. */
+static const char *const env_strings[] = {
+    "BOX64_LOG=2",
+};
+
+static WCHAR *put_env_string( WCHAR *cursor, const char *value )
+{
+    size_t i, len = strlen( value );
+    for (i = 0; i < len; i++) cursor[i] = (unsigned char)value[i];
+    cursor[len] = 0;
+    return cursor + len + 1;
+}
+
 static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *target,
                                                                    UNICODE_STRING *main_nt_name,
                                                                    char *dos_path, size_t dos_path_size )
@@ -1362,7 +1384,11 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     chars += strlen( cmdline_str ) + 1;
     chars += strlen( dos_path ) + 1;
     chars += strlen( nt_path ) + 1;
-    chars += 2; /* empty environment */
+    {
+        size_t i;
+        chars += 1; /* final double-null terminator */
+        for (i = 0; i < ARRAY_SIZE(env_strings); i++) chars += strlen( env_strings[i] ) + 1;
+    }
     size = sizeof(*params) + chars * sizeof(WCHAR);
 
     if (!(params = calloc( 1, size ))) return NULL;
@@ -1384,12 +1410,26 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     put_process_string( &cursor, &params->WindowTitle, dos_path );
     put_process_string( &cursor, main_nt_name, nt_path );
     params->Environment = cursor;
+    {
+        size_t i;
+        for (i = 0; i < ARRAY_SIZE(env_strings); i++) cursor = put_env_string( cursor, env_strings[i] );
+    }
     *cursor++ = 0;
-    *cursor++ = 0;
-    params->EnvironmentSize = 2 * sizeof(WCHAR);
+    params->EnvironmentSize = (ULONG)((cursor - (WCHAR *)params->Environment) * sizeof(WCHAR));
     return params;
 }
 
+/* Backports the #ifdef _WIN64 WoW64 block from real Wine's init_peb()
+ * (dlls/ntdll/unix/env.c) -- this function is otherwise a line-for-line
+ * copy of that function's basic field population, written before WoW64
+ * support existed here, so it never included that block. Safe to backport
+ * now: main_image_info.Machine is already correctly populated for both
+ * PE32/PE32+ by the time this runs (runtime_describe_image() always runs
+ * first in main()), and the memory this writes into (wow_peb, at
+ * peb+page_size) is already committed -- virtual_alloc_first_teb() commits
+ * 2*block_size starting at the TEB, and block_size (signal-stack-aligned,
+ * tens of KB) is far larger than page_size (4KB), so peb+page_size sits
+ * well inside that same committed region. */
 static void runtime_init_peb_process( TEB *teb, void *module,
                                       RTL_USER_PROCESS_PARAMETERS *params )
 {
@@ -1404,6 +1444,45 @@ static void runtime_init_peb_process( TEB *teb, void *module,
     peb->ImageSubSystem             = main_image_info.SubSystemType;
     peb->ImageSubSystemMajorVersion = main_image_info.MajorSubsystemVersion;
     peb->ImageSubSystemMinorVersion = main_image_info.MinorSubsystemVersion;
+
+    if (!is_machine_64bit( main_image_info.Machine ))
+    {
+        NtCurrentTeb()->WowTebOffset = teb_offset;
+        NtCurrentTeb()->Tib.ExceptionList = (void *)((char *)NtCurrentTeb() + teb_offset);
+        wow_peb = (WOW_PEB *)((char *)peb + page_size);
+        set_thread_id( NtCurrentTeb(), GetCurrentProcessId(), GetCurrentThreadId() );
+
+        wow_peb->ImageBaseAddress                = PtrToUlong( peb->ImageBaseAddress );
+        wow_peb->ProcessParameters                = PtrToUlong( build_wow64_parameters( params ) );
+        wow_peb->NumberOfProcessors               = peb->NumberOfProcessors;
+        wow_peb->NtGlobalFlag                     = peb->NtGlobalFlag;
+        wow_peb->CriticalSectionTimeout.QuadPart  = peb->CriticalSectionTimeout.QuadPart;
+        wow_peb->HeapSegmentReserve               = peb->HeapSegmentReserve;
+        wow_peb->HeapSegmentCommit                = peb->HeapSegmentCommit;
+        wow_peb->HeapDeCommitTotalFreeThreshold   = peb->HeapDeCommitTotalFreeThreshold;
+        wow_peb->HeapDeCommitFreeBlockThreshold   = peb->HeapDeCommitFreeBlockThreshold;
+        wow_peb->OSMajorVersion                   = peb->OSMajorVersion;
+        wow_peb->OSMinorVersion                   = peb->OSMinorVersion;
+        wow_peb->OSBuildNumber                    = peb->OSBuildNumber;
+        wow_peb->OSPlatformId                     = peb->OSPlatformId;
+        wow_peb->ImageSubSystem                   = peb->ImageSubSystem;
+        wow_peb->ImageSubSystemMajorVersion       = peb->ImageSubSystemMajorVersion;
+        wow_peb->ImageSubSystemMinorVersion       = peb->ImageSubSystemMinorVersion;
+        wow_peb->SessionId                        = peb->SessionId;
+
+        /* Real Wine's init_peb() calls this right after the wow_peb setup --
+         * it's the only place in the whole codebase that sets
+         * user_space_wow_limit (dlls/ntdll/unix/virtual.c), which
+         * map_image_view()'s low-address search range depends on
+         * (get_wow_user_space_limit() returns 0 without it). Missing this
+         * call is why wowbox64.dll -- despite its own ImageBase already
+         * being linked below 4GB -- was falling through to the unconstrained
+         * top-down fallback and landing above 4GB anyway. */
+        virtual_set_large_address_space();
+
+        log_line( "[WOW64] 32-bit guest detected (machine=0x%x); WowTebOffset=0x%x wow_peb=%p",
+                  main_image_info.Machine, (unsigned)teb_offset, (void *)wow_peb );
+    }
 }
 
 static int dll_name_matches( const char *loaded, const char *wanted )
@@ -1469,11 +1548,23 @@ static struct runtime_module *register_module( const char *path, void *base, SIZ
         return NULL;
     }
 
+    /* Signature/FileHeader/AddressOfEntryPoint are layout-identical between
+     * PE32 and PE32+ (see the comment on runtime_describe_image()), and
+     * those are the only fields of module->nt any *live* code path reads --
+     * resolve_export()/resolve_module_imports(), the only consumers that
+     * touch OptionalHeader.DataDirectory at its bitness-divergent offset,
+     * are dead code (resolve_module_imports is __attribute__((unused)),
+     * never called; the real import fixup goes through Wine's own
+     * wine_nx_loader_fixup_main_imports() in loader.c instead). So this
+     * gate can safely widen without also patching those two -- if that
+     * dead cluster is ever revived, it needs the same is_pe32 treatment
+     * runtime_describe_image() and horizon.c's read_pe_image_info() got. */
     nt = runtime_nt_headers( base );
     if (!nt || nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+         nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC))
     {
-        log_line( "[FAIL] %s mapped image does not look like PE32+", path );
+        log_line( "[FAIL] %s mapped image does not look like a PE image", path );
         return NULL;
     }
 
@@ -1766,48 +1857,130 @@ static void __attribute__((unused)) resolve_module_imports( struct runtime_modul
     module->resolving_imports = 0;
 }
 
+/* Bit-agnostic on purpose (WowBox64 Phase 1, task 3): Signature and
+ * FileHeader sit at identical offsets in IMAGE_NT_HEADERS32 and ...64 (the
+ * two only diverge inside OptionalHeader, after AddressOfEntryPoint/
+ * BaseOfCode), so nt->FileHeader.* and nt->OptionalHeader.AddressOfEntryPoint
+ * are safe to read through the 64-bit view regardless of actual bitness.
+ * Everything after that divergence point is read through whichever of
+ * nt/nt32 actually matches OptionalHeader.Magic. This only fixes metadata
+ * extraction -- map_pe_image()/register_module()/runtime_nt_headers() still
+ * hard-require PE32+ to actually map and run an image, unchanged here. */
 static int runtime_describe_image( void *module, SIZE_T size, void **entry )
 {
     IMAGE_NT_HEADERS64 *nt = runtime_nt_headers( module );
+    IMAGE_NT_HEADERS32 *nt32 = (IMAGE_NT_HEADERS32 *)nt;
     IMAGE_DATA_DIRECTORY *imports;
+    unsigned long long stack_reserve, stack_commit, image_base;
+    unsigned int subsystem, major_os, minor_os, major_sub, minor_sub;
+    unsigned int dll_charact, loader_flags, size_of_image, checksum;
+    int is_pe32;
 
-    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE)
     {
-        log_line( "[FAIL] mapped image does not look like PE32+" );
+        log_line( "[FAIL] mapped image does not look like a PE image" );
         return 0;
     }
 
-    imports = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    is_pe32 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    if (!is_pe32 && nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        log_line( "[FAIL] mapped image has unrecognized OptionalHeader.Magic 0x%x",
+                  nt->OptionalHeader.Magic );
+        return 0;
+    }
+
+    if (is_pe32)
+    {
+        imports       = &nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        stack_reserve = nt32->OptionalHeader.SizeOfStackReserve;
+        stack_commit  = nt32->OptionalHeader.SizeOfStackCommit;
+        image_base    = nt32->OptionalHeader.ImageBase;
+        subsystem     = nt32->OptionalHeader.Subsystem;
+        major_sub     = nt32->OptionalHeader.MajorSubsystemVersion;
+        minor_sub     = nt32->OptionalHeader.MinorSubsystemVersion;
+        major_os      = nt32->OptionalHeader.MajorOperatingSystemVersion;
+        minor_os      = nt32->OptionalHeader.MinorOperatingSystemVersion;
+        dll_charact   = nt32->OptionalHeader.DllCharacteristics;
+        loader_flags  = nt32->OptionalHeader.LoaderFlags;
+        size_of_image = nt32->OptionalHeader.SizeOfImage;
+        checksum      = nt32->OptionalHeader.CheckSum;
+    }
+    else
+    {
+        imports       = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        stack_reserve = nt->OptionalHeader.SizeOfStackReserve;
+        stack_commit  = nt->OptionalHeader.SizeOfStackCommit;
+        image_base    = nt->OptionalHeader.ImageBase;
+        subsystem     = nt->OptionalHeader.Subsystem;
+        major_sub     = nt->OptionalHeader.MajorSubsystemVersion;
+        minor_sub     = nt->OptionalHeader.MinorSubsystemVersion;
+        major_os      = nt->OptionalHeader.MajorOperatingSystemVersion;
+        minor_os      = nt->OptionalHeader.MinorOperatingSystemVersion;
+        dll_charact   = nt->OptionalHeader.DllCharacteristics;
+        loader_flags  = nt->OptionalHeader.LoaderFlags;
+        size_of_image = nt->OptionalHeader.SizeOfImage;
+        checksum      = nt->OptionalHeader.CheckSum;
+    }
+
     *entry = (char *)module + nt->OptionalHeader.AddressOfEntryPoint;
 
     main_image_info.TransferAddress = *entry;
-    main_image_info.MaximumStackSize = nt->OptionalHeader.SizeOfStackReserve;
-    main_image_info.CommittedStackSize = nt->OptionalHeader.SizeOfStackCommit;
-    main_image_info.SubSystemType = nt->OptionalHeader.Subsystem;
-    main_image_info.MajorSubsystemVersion = nt->OptionalHeader.MajorSubsystemVersion;
-    main_image_info.MinorSubsystemVersion = nt->OptionalHeader.MinorSubsystemVersion;
-    main_image_info.MajorOperatingSystemVersion = nt->OptionalHeader.MajorOperatingSystemVersion;
-    main_image_info.MinorOperatingSystemVersion = nt->OptionalHeader.MinorOperatingSystemVersion;
+    main_image_info.MaximumStackSize = stack_reserve;
+    main_image_info.CommittedStackSize = stack_commit;
+    main_image_info.SubSystemType = subsystem;
+    main_image_info.MajorSubsystemVersion = major_sub;
+    main_image_info.MinorSubsystemVersion = minor_sub;
+    main_image_info.MajorOperatingSystemVersion = major_os;
+    main_image_info.MinorOperatingSystemVersion = minor_os;
     main_image_info.ImageCharacteristics = nt->FileHeader.Characteristics;
-    main_image_info.DllCharacteristics = nt->OptionalHeader.DllCharacteristics;
+    main_image_info.DllCharacteristics = dll_charact;
     main_image_info.Machine = nt->FileHeader.Machine;
     main_image_info.ImageContainsCode = TRUE;
     main_image_info.ImageFlags = 0;
-    if (nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)
+    if (dll_charact & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)
         main_image_info.ImageDynamicallyRelocated = 1;
-    main_image_info.LoaderFlags = nt->OptionalHeader.LoaderFlags;
-    main_image_info.ImageFileSize = nt->OptionalHeader.SizeOfImage;
-    main_image_info.CheckSum = nt->OptionalHeader.CheckSum;
+    main_image_info.LoaderFlags = loader_flags;
+    main_image_info.ImageFileSize = size_of_image;
+    main_image_info.CheckSum = checksum;
 
-    log_line( "[IMAGE] base=%p size=0x%lx preferred=0x%llx entry_rva=0x%x machine=0x%x",
-              module, (unsigned long)size,
-              (unsigned long long)nt->OptionalHeader.ImageBase,
-              nt->OptionalHeader.AddressOfEntryPoint, nt->FileHeader.Machine );
+    log_line( "[IMAGE] base=%p size=0x%lx preferred=0x%llx entry_rva=0x%x machine=0x%x pe32=%d",
+              module, (unsigned long)size, image_base,
+              nt->OptionalHeader.AddressOfEntryPoint, nt->FileHeader.Machine, is_pe32 );
     log_line( "[IMAGE] subsystem=%u dll_char=0x%x imports=0x%x/0x%x sections=%u",
-              nt->OptionalHeader.Subsystem, nt->OptionalHeader.DllCharacteristics,
-              imports->VirtualAddress, imports->Size, nt->FileHeader.NumberOfSections );
+              subsystem, dll_charact, imports->VirtualAddress, imports->Size,
+              nt->FileHeader.NumberOfSections );
     return 1;
+}
+
+/* WowBox64 Phase 1: the server's init_first_thread handshake fires (see
+ * server_init_process() below) before map_pe_image() ever opens the target,
+ * so the target's declared architecture isn't known yet at that point. Read
+ * just the DOS+COFF header here, via a plain fopen/fread on the direct SD
+ * card path (not runtime_open_exe()'s NT-style open, which depends on
+ * bootstrap state this runs ahead of), so the server can be told the real
+ * value instead of the hardcoded ARM64 default. Best-effort: any failure
+ * (missing file, truncated header, bad magic) falls back to that same
+ * default rather than aborting -- this is a hint for the handshake, not the
+ * authoritative parse, which still happens later in runtime_describe_image(). */
+static unsigned short peek_pe_machine( const char *path )
+{
+    unsigned short machine = IMAGE_FILE_MACHINE_ARM64;
+    IMAGE_DOS_HEADER dos;
+    unsigned int pe_sig;
+    IMAGE_FILE_HEADER file_header;
+    FILE *f;
+
+    if (!(f = fopen( path, "rb" ))) return machine;
+
+    if (fread( &dos, sizeof(dos), 1, f ) == 1 && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        !fseek( f, dos.e_lfanew, SEEK_SET ) &&
+        fread( &pe_sig, sizeof(pe_sig), 1, f ) == 1 && pe_sig == IMAGE_NT_SIGNATURE &&
+        fread( &file_header, sizeof(file_header), 1, f ) == 1)
+        machine = file_header.Machine;
+
+    fclose( f );
+    return machine;
 }
 
 int main( int argc, char **argv )
@@ -1893,6 +2066,7 @@ int main( int argc, char **argv )
         park_forever();
     }
 
+    wine_nx_set_target_machine( peek_pe_machine( target ) );
     server_init_process();
     status = runtime_init_process_done();
     if (status)
@@ -1924,7 +2098,18 @@ int main( int argc, char **argv )
         {
             status = wine_nx_loader_bootstrap( &main_nt_name );
             log_line( "[LDR] bootstrap status=%08x", status );
-            if (!status)
+            /* A 32-bit guest's own dependency chain (kernel32/kernelbase/ntdll)
+             * has genuine IMAGE_THUNK_DATA32 (4-byte) import tables, but this
+             * native loader's fixup_imports()/import_dll() hardcode
+             * IMAGE_THUNK_DATA (== IMAGE_THUNK_DATA64, 8-byte stride) for IAT
+             * walking -- correct for a 64-bit target, but it walks a 32-bit
+             * IAT off into unmapped memory. Real Wine's new-WoW64 model never
+             * asks the 64-bit host loader to do this: the guest's own,
+             * separately i386-compiled ntdll.dll resolves its own imports as
+             * real x86 code once Wow64LdrpInitialize/cpu_simulate() takes
+             * over. So for a WoW64 target, skip native import resolution and
+             * attach entirely and hand off immediately. */
+            if (!status && !is_wow64())
             {
                 ldr_status = wine_nx_loader_fixup_main_imports();
                 log_line( "[LDR] fixup_imports status=%08x", ldr_status );
@@ -1946,7 +2131,20 @@ int main( int argc, char **argv )
             }
         }
         log_line( "[READY] PE image is mapped by Wine ntdll; entry=%p", entry );
-        if (autorun && !ldr_status && !attach_status)
+        if (autorun && is_wow64())
+        {
+            NTSTATUS wow64_status;
+
+            log_line( "[RUN] run-entry.txt enabled; 32-bit guest, handing off to WoW64 (wow64.dll + WowBox64)" );
+            wow64_status = wine_nx_wow64_handoff();
+            /* Only reached if the handoff itself failed before ever
+             * reaching cpu_simulate() (e.g. wow64.dll or
+             * Wow64LdrpInitialize couldn't be resolved) -- a
+             * successfully running guest blocks inside
+             * wine_nx_wow64_handoff() and this line never executes. */
+            log_line( "[RUN] wow64 handoff returned status=%08x", wow64_status );
+        }
+        else if (autorun && !ldr_status && !attach_status)
         {
             log_line( "[RUN] run-entry.txt enabled; jumping to PE entry after Wine loader attach" );
             log_line( "[RUN] entry returned %d", call_pe_entry_point( entry ) );

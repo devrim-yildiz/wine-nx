@@ -1168,6 +1168,13 @@ struct cpu_topology_override
     int          debug_level;  /* new debug level */
     int          reply_fd;     /* fd for reply pipe */
     int          wait_fd;      /* fd for blocking calls pipe */
+    unsigned short machine;    /* wine-nx (__SWITCH__) addition, WowBox64 Phase 1: target
+                                   executable's PE Machine type, detected client-side before
+                                   this request fires since wine-nx loads its target in-process
+                                   and has no separate CreateProcess-time negotiation step. Real
+                                   guard lives in include/wine/server_protocol.h; this repo has
+                                   no tools/make_requests to regenerate that file from here, so
+                                   both are kept in sync by hand. Unused outside __SWITCH__. */
     VARARG(cpu_override,cpu_topology_override); /* Overridden CPUs to host CPUs mapping. */
 @REPLY
     process_id_t pid;          /* process id of the new thread's process */
