@@ -15,6 +15,16 @@ if [ -x /opt/homebrew/opt/bison/bin/bison ]; then
     WINE_BUILD_PATH="/opt/homebrew/opt/bison/bin:$WINE_BUILD_PATH"
 fi
 LOCAL_PE_BUILD_DIR="$SCRIPT_DIR/build-wine-arm64-pe-local"
+# Host-side CMake build of the WowBox64 CPU backend (wowbox64.dll) --
+# separate from both $BUILD_DIR (the Docker/devkitA64 NRO build) and
+# $WINE_PE_BUILD_DIR (the desktop-Wine-configure PE tree): it needs the
+# aarch64-w64-mingw32 toolchain, not devkitA64, and isn't part of Wine's
+# own configure/make. Not built by this script -- see README for
+# `cmake -S wine-nx-probe -B "$WOWBOX64_BUILD_DIR" -DWINE_NX_BUILD_WOWBOX64=ON`
+# then `cmake --build ... --target wowbox64-dll`. If it hasn't been built,
+# system32 just won't get a wowbox64.dll and 32-bit guests won't run.
+WOWBOX64_BUILD_DIR="${WOWBOX64_BUILD_DIR:-$SCRIPT_DIR/build-wowbox64}"
+WOWBOX64_DLL_PATH="$WOWBOX64_BUILD_DIR/wowbox_out/wowbox64.dll"
 PROGRAM_PE_BUILD_DIR="${WINE_NX_PROGRAM_BUILD_DIR:-$WINE_PE_BUILD_DIR}"
 if [ "$APP_KIND" = "notepad" ] && [ -z "${WINE_NX_PROGRAM_BUILD_DIR:-}" ] && [ -d "$LOCAL_PE_BUILD_DIR" ]; then
     PROGRAM_PE_BUILD_DIR="$LOCAL_PE_BUILD_DIR"
@@ -50,6 +60,48 @@ NOTEPAD_SYSTEM_DLLS=(
     shell32.dll
     shlwapi.dll
     version.dll
+)
+# openttd.exe's own import table needs opengl32/winmm/imm32/usp10/winhttp/
+# shell32/ole32/oleaut32 beyond REQUIRED_SYSTEM_DLLS (confirmed via objdump -p
+# on the real openttd.exe). Reusing NOTEPAD_WINE_DLL_MODULES's combase/
+# comctl32/comdlg32/coml2/shcore/shlwapi/version as well -- those are already
+# proven-necessary transitive dependencies of shell32/ole32/oleaut32 for this
+# same devkitA64/Wine PE build, so pulling in that same set here rather than
+# guessing a smaller one avoids missing an internal import shell32.dll etc.
+# themselves rely on.
+OPENTTD_WINE_DLL_MODULES=(
+    combase
+    comctl32
+    comdlg32
+    coml2
+    imm32
+    ole32
+    oleaut32
+    opengl32
+    shcore
+    shell32
+    shlwapi
+    usp10
+    version
+    winhttp
+    winmm
+)
+OPENTTD_SYSTEM_DLLS=(
+    combase.dll
+    comctl32.dll
+    comdlg32.dll
+    coml2.dll
+    imm32.dll
+    ole32.dll
+    oleaut32.dll
+    opengl32.dll
+    shcore.dll
+    shell32.dll
+    shlwapi.dll
+    usp10.dll
+    version.dll
+    winhttp.dll
+    winmm.dll
 )
 REQUIRED_SYSTEM_DLLS=(
     advapi32.dll
@@ -163,15 +215,36 @@ if [ "$APP_KIND" = "notepad" ]; then
     done
 fi
 
+# openttd.exe itself is not built here -- it's the user's own external game
+# install, already placed directly on the SD card at drive_c/openttd (outside
+# this script's local staging tree, see tools/sync-switch-wine-package.sh's
+# --exclude handling below for why that matters). Only its missing Wine PE
+# DLL dependencies get built here.
+if [ "$APP_KIND" = "openttd" ]; then
+    if [ ! -d "$WINE_PE_BUILD_DIR" ]; then
+        echo "Missing PE build dir for openttd: $WINE_PE_BUILD_DIR" >&2
+        exit 1
+    fi
+    for module in "${OPENTTD_WINE_DLL_MODULES[@]}"; do
+        dll="$WINE_PE_BUILD_DIR/dlls/$module/aarch64-windows/$module.dll"
+        if [ ! -f "$dll" ]; then
+            echo "Building openttd dependency $module.dll"
+            PATH="$WINE_BUILD_PATH" \
+                make -C "$WINE_PE_BUILD_DIR" "dlls/$module/aarch64-windows/$module.dll"
+        fi
+    done
+fi
+
 if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -f "$SCRIPT_DIR/samples/curl-arm64/trurl.exe" ]; }; then
     echo "Preparing SD package for WINE_NX_APP=$APP_KIND"
     PACKAGE_DIR="$BUILD_DIR/sd-card/switch/wine"
     APP_DIR="$PACKAGE_DIR/drive_c/curl"
     SYSTEM_DIR="$PACKAGE_DIR/drive_c/windows/system32"
+    SYSWOW64_DIR="$PACKAGE_DIR/drive_c/windows/syswow64"
     WIN_FONTS_DIR="$PACKAGE_DIR/drive_c/windows/fonts"
     NLS_DIR="$PACKAGE_DIR/share/wine/nls"
     DATA_FONTS_DIR="$PACKAGE_DIR/share/wine/fonts"
-    mkdir -p "$APP_DIR" "$SYSTEM_DIR" "$WIN_FONTS_DIR" "$NLS_DIR" "$DATA_FONTS_DIR"
+    mkdir -p "$APP_DIR" "$SYSTEM_DIR" "$SYSWOW64_DIR" "$WIN_FONTS_DIR" "$NLS_DIR" "$DATA_FONTS_DIR"
     if [ "$APP_KIND" != "curl" ]; then
         rm -f "$APP_DIR/curl.exe" "$APP_DIR/trurl.exe" "$APP_DIR/libcurl-arm64.dll" \
               "$APP_DIR/curl.args" "$APP_DIR/trurl.args"
@@ -204,6 +277,22 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         while IFS= read -r -d '' dll; do
             cp "$dll" "$SYSTEM_DIR/"
         done < <(find "$WINE_PE_DLL_ROOT" -path '*/aarch64-windows/*.dll' -print0)
+        # 32-bit guest-side DLLs (ntdll/kernel32/kernelbase -- pure, unpatched
+        # upstream Wine, never touch the host OS directly, see WoW64 thunking
+        # architecture notes) land in syswow64, same generic "copy whatever's
+        # there" approach as the aarch64-windows loop above. wow64.dll/
+        # wow64win.dll only ever build for aarch64 (never i386 -- confirmed,
+        # WoW64 is inherently a 64-bit-host mechanism), so they're already
+        # covered by the loop above and never appear here.
+        while IFS= read -r -d '' dll; do
+            cp "$dll" "$SYSWOW64_DIR/"
+        done < <(find "$WINE_PE_DLL_ROOT" -path '*/i386-windows/*.dll' -print0)
+    fi
+    if [ -f "$WOWBOX64_DLL_PATH" ]; then
+        cp "$WOWBOX64_DLL_PATH" "$SYSTEM_DIR/wowbox64.dll"
+    else
+        echo "WARNING: no wowbox64.dll at $WOWBOX64_DLL_PATH; 32-bit guests won't run. Build it with:" >&2
+        echo "  cmake -S \"$SCRIPT_DIR\" -B \"$WOWBOX64_BUILD_DIR\" -DWINE_NX_BUILD_WOWBOX64=ON && cmake --build \"$WOWBOX64_BUILD_DIR\" --target wowbox64-dll" >&2
     fi
     if [ "$APP_KIND" = "notepad" ] && [ -d "$PROGRAM_PE_DLL_ROOT" ]; then
         while IFS= read -r -d '' dll; do
@@ -292,6 +381,23 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged Wine notepad.exe as runtime target (WINE_NX_APP=notepad)"
+    elif [ "$APP_KIND" = "openttd" ]; then
+        # openttd.exe and its game data (baseset/lang/ai/game/scripts/...) are
+        # not staged here -- they're the user's own external install, already
+        # on the SD card at drive_c/openttd. Only the DLLs it needs and
+        # target.txt/run-entry.txt get packaged; deploying must not run a
+        # plain --delete mirror over that folder (see sync script's --exclude).
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/openttd/openttd.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        # Raw per-syscall tracing is off by default (real perf cost once a
+        # window is painting, see wine_nx_syscall_trace_select()'s comment in
+        # runtime.c) but openttd.exe's WoW64 bootstrap goes silent well before
+        # any window exists, and two narrow [NX-DIAG] checkpoints already
+        # guessed wrong once -- this gives full visibility into every native
+        # syscall instead of guessing at specific functions again.
+        printf '%s\n' '1' > "$PACKAGE_DIR/systrace.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged openttd.exe as runtime target (WINE_NX_APP=openttd); game files stay on the SD card as-is"
     elif [ "$APP_KIND" = "curl" ] && [ -f "$SCRIPT_DIR/samples/curl-arm64/curl.exe" ]; then
         cp "$SCRIPT_DIR/samples/curl-arm64/curl.exe" "$APP_DIR/curl.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/curl/curl.exe' > "$PACKAGE_DIR/target.txt"
@@ -327,6 +433,14 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         for dll in "${NOTEPAD_SYSTEM_DLLS[@]}"; do
             if [ ! -f "$SYSTEM_DIR/$dll" ]; then
                 echo "Missing notepad runtime DLL: $SYSTEM_DIR/$dll" >&2
+                missing=1
+            fi
+        done
+    fi
+    if [ "$APP_KIND" = "openttd" ]; then
+        for dll in "${OPENTTD_SYSTEM_DLLS[@]}"; do
+            if [ ! -f "$SYSTEM_DIR/$dll" ]; then
+                echo "Missing openttd runtime DLL: $SYSTEM_DIR/$dll" >&2
                 missing=1
             fi
         done
