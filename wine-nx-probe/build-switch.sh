@@ -338,6 +338,29 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             fi
         fi
     fi
+    # 32-bit WOW64 smoke test: WINE_NX_APP=cube32 stages the only sample that
+    # actually exercises WOW64/box64 (see samples/cube32/cube32.c's file
+    # header) -- built i686-w64-mingw32, not aarch64-w64-mingw32 like gui/
+    # blit above. Previously staged by hand every time (copy exe, edit
+    # target.txt/run-entry.txt) because this branch didn't exist yet.
+    if [ "$APP_KIND" = "cube32" ]; then
+        CUBE32_SRC="$SCRIPT_DIR/samples/cube32/cube32.c"
+        CUBE32_EXE="$SCRIPT_DIR/samples/cube32/cube32.exe"
+        CUBE32_CC="$LLVM_MINGW_BIN_DIR/i686-w64-mingw32-clang"
+        if [ -f "$CUBE32_SRC" ]; then
+            if [ ! -x "$CUBE32_CC" ]; then
+                CUBE32_CC="$(command -v i686-w64-mingw32-clang || true)"
+            fi
+            if [ -z "$CUBE32_CC" ] || [ ! -x "$CUBE32_CC" ]; then
+                echo "Missing i686-w64-mingw32-clang; cannot build cube32 test app" >&2
+                exit 1
+            fi
+            if [ ! -f "$CUBE32_EXE" ] || [ "$CUBE32_SRC" -nt "$CUBE32_EXE" ]; then
+                "$CUBE32_CC" -municode -mwindows -O2 -Wall -Wextra \
+                    -o "$CUBE32_EXE" "$CUBE32_SRC" -luser32 -lgdi32
+            fi
+        fi
+    fi
     # Direct-blit test app: WINE_NX_APP=blit stages the no-InvalidateRect/
     # no-BeginPaint GetDC+StretchDIBits comparison test (see
     # samples/direct-blit/direct_blit.c's file header for what this isolates).
@@ -375,6 +398,18 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged direct-blit test app as runtime target (WINE_NX_APP=blit)"
+    elif [ "$APP_KIND" = "cube32" ] && [ -f "$SCRIPT_DIR/samples/cube32/cube32.exe" ]; then
+        CUBE32_DIR="$PACKAGE_DIR/drive_c/cube32"
+        mkdir -p "$CUBE32_DIR"
+        cp "$SCRIPT_DIR/samples/cube32/cube32.exe" "$CUBE32_DIR/cube32.exe"
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/cube32/cube32.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        # This is specifically a performance smoke test -- never force
+        # syscall tracing on for it (see the openttd branch's comment on why
+        # that was hardware-confirmed to dominate the 1fps result).
+        printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged cube32 (32-bit WOW64 smoke test) as runtime target (WINE_NX_APP=cube32)"
     elif [ "$APP_KIND" = "notepad" ] && [ -f "$NOTEPAD_EXE" ]; then
         cp "$NOTEPAD_EXE" "$SYSTEM_DIR/notepad.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/windows/system32/notepad.exe' > "$PACKAGE_DIR/target.txt"
@@ -389,13 +424,20 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         # plain --delete mirror over that folder (see sync script's --exclude).
         printf '%s\n' 'sdmc:/switch/wine/drive_c/openttd/openttd.exe' > "$PACKAGE_DIR/target.txt"
         printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
-        # Raw per-syscall tracing is off by default (real perf cost once a
-        # window is painting, see wine_nx_syscall_trace_select()'s comment in
-        # runtime.c) but openttd.exe's WoW64 bootstrap goes silent well before
-        # any window exists, and two narrow [NX-DIAG] checkpoints already
-        # guessed wrong once -- this gives full visibility into every native
-        # syscall instead of guessing at specific functions again.
-        printf '%s\n' '1' > "$PACKAGE_DIR/systrace.txt"
+        # Raw per-syscall tracing used to be force-enabled here to chase the
+        # WoW64 boot-sequence silent-hang bugs (openttd.exe's bootstrap went
+        # silent well before any window existed, and two narrow [NX-DIAG]
+        # checkpoints already guessed wrong once). That whole bug chain is
+        # fixed now (see README's "32-bit WOW64 Guest Boot" section) and this
+        # forced-on trace was hardware-confirmed to be *the* dominant 1fps
+        # cause on cube32 (19,358 of 23,067 log lines / 84%, each an
+        # unconditional fflush-to-SD-card write) once a window is actually
+        # painting -- it was never turned back off after the bugs it was
+        # added for were fixed. Explicitly writing 0 leaves a clean,
+        # unambiguous file rather than relying on config.txt/absence. Turn
+        # it back on manually (WINE_NX_SYSCALL_TRACE=1 or edit
+        # systrace.txt) only for actual boot-sequence debugging.
+        printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged openttd.exe as runtime target (WINE_NX_APP=openttd); game files stay on the SD card as-is"
     elif [ "$APP_KIND" = "curl" ] && [ -f "$SCRIPT_DIR/samples/curl-arm64/curl.exe" ]; then

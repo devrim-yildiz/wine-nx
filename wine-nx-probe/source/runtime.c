@@ -246,6 +246,17 @@ static void wine_nx_syscall_trace_select(void)
              wine_nx_syscall_trace_enabled ? "ON" : "off (default)", source );
 }
 
+int wine_nx_box64_trace_enabled;
+
+static void wine_nx_box64_trace_select(void)
+{
+    const char *source;
+    wine_nx_box64_trace_enabled = wine_nx_resolve_bool_toggle( "WINE_NX_BOX64_TRACE", "box64trace",
+                                                                RUNTIME_DIR "/box64trace.txt", &source );
+    log_line( "[NXTRACE] box64 trace: %s (source=%s)",
+             wine_nx_box64_trace_enabled ? "ON" : "off (default)", source );
+}
+
 /* Off by default, same reasoning and same pattern as
  * wine_nx_syscall_trace_enabled above -- this one gates the
  * [NXPAINT][TIMING]/[NXPAINT][CALLER] tier added while chasing
@@ -1324,9 +1335,21 @@ static void put_process_string( WCHAR **cursor, UNICODE_STRING *string, const ch
  * so Box64 never saw any BOX64_* variable regardless of what was set outside
  * the process. Without this, a real 32-bit guest reaching DynaRun() (Box64's
  * dynarec, running the guest's own code) is completely invisible -- no
- * tracing exists once execution gets there. */
+ * tracing exists once execution gets there. 
+ *
+ * Update: unconditionally setting BOX64_LOG=2 forces Box64 to emit verbose
+ * traces for every dynarec block, destroying performance (1fps, confirmed
+ * the dominant contributor alongside wine-nx's own per-syscall tracing --
+ * see README's "32-bit WOW64 Guest Boot" performance section). Now
+ * conditionally set to 2 (LOG_DEBUG) if wine_nx_box64_trace_enabled, else
+ * explicitly 0 (LOG_NONE) -- quieter than Box64's own unset-env default of
+ * LOG_INFO=1, since there's no reason to pay even info-level log cost by
+ * default. The BOX64_LOG entry is computed separately below (its value
+ * depends on wine_nx_box64_trace_enabled), so this array holds only the
+ * two always-static entries. */
 static const char *const env_strings[] = {
-    "BOX64_LOG=2",
+    "WINEDEBUG=+timestamp,+tid,-all",
+    "WINE_NX_NATIVE_EXEC=0"
 };
 
 static WCHAR *put_env_string( WCHAR *cursor, const char *value )
@@ -1385,9 +1408,14 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     chars += strlen( dos_path ) + 1;
     chars += strlen( nt_path ) + 1;
     {
-        size_t i;
+        size_t i, env_size = 0;
+        const char *box64_log_env = wine_nx_box64_trace_enabled ? "BOX64_LOG=2" : "BOX64_LOG=0";
+
         chars += 1; /* final double-null terminator */
-        for (i = 0; i < ARRAY_SIZE(env_strings); i++) chars += strlen( env_strings[i] ) + 1;
+        env_size += (strlen( box64_log_env ) + 1);
+        for (i = 0; i < ARRAY_SIZE(env_strings); i++)
+            env_size += strlen( env_strings[i] ) + 1;
+        chars += env_size;
     }
     size = sizeof(*params) + chars * sizeof(WCHAR);
 
@@ -1412,6 +1440,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     params->Environment = cursor;
     {
         size_t i;
+        cursor = put_env_string( cursor, wine_nx_box64_trace_enabled ? "BOX64_LOG=2" : "BOX64_LOG=0" );
         for (i = 0; i < ARRAY_SIZE(env_strings); i++) cursor = put_env_string( cursor, env_strings[i] );
     }
     *cursor++ = 0;
@@ -2018,8 +2047,10 @@ int main( int argc, char **argv )
     mkdir( WINE_DRIVE_C "/windows", 0777 );
     mkdir( WINE_SYSTEM_DIR, 0777 );
     log_file = fopen( RUNTIME_DIR WINE_NX_RUNTIME_LOG_NAME, "w" );
+    wine_nx_fb_backend_select();
     wine_nx_syscall_trace_select();
     wine_nx_paint_trace_select();
+    wine_nx_box64_trace_select();
     wine_nx_flush_legacy_select();
     wine_nx_batch_paint_regions_select();
     wine_nx_skip_redundant_update_check_select();
