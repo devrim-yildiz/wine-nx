@@ -350,6 +350,7 @@ struct horizon_fd_queue
 #define HORIZON_STATUS_NOT_SAME_OBJECT 0xc00001acu
 #define HORIZON_IMAGE_FILE_MACHINE_ARM64 0xaa64
 #define HORIZON_IMAGE_FILE_MACHINE_I386 0x014c
+#define HORIZON_IMAGE_FILE_MACHINE_AMD64 0x8664
 #define HORIZON_IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
 #define HORIZON_IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x10b
 #define HORIZON_IMAGE_FILE_DLL 0x2000
@@ -3119,7 +3120,8 @@ static unsigned int horizon_server_read_pe_image_info( int fd, struct horizon_pe
     opt_size = horizon_get_le16( nt + 20 );
     characteristics = horizon_get_le16( nt + 22 );
 
-    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 && machine != HORIZON_IMAGE_FILE_MACHINE_I386)
+    if (machine != HORIZON_IMAGE_FILE_MACHINE_ARM64 && machine != HORIZON_IMAGE_FILE_MACHINE_I386 &&
+        machine != HORIZON_IMAGE_FILE_MACHINE_AMD64)
         return HORIZON_STATUS_INVALID_IMAGE_FORMAT;
     is_pe32 = machine == HORIZON_IMAGE_FILE_MACHINE_I386;
     if (!section_count || section_count > 128 || opt_size < (is_pe32 ? 96 : 112))

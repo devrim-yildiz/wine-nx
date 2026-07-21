@@ -1937,9 +1937,10 @@ size_t server_init_process(void)
      * is a single-process, bespoke environment; the client already knows
      * the real answer, so force it here rather than keep chasing
      * wineserver's state. */
-    supported_machines_count = 2;
+    supported_machines_count = 3;
     supported_machines[0] = IMAGE_FILE_MACHINE_ARM64;
     supported_machines[1] = IMAGE_FILE_MACHINE_I386;
+    supported_machines[2] = IMAGE_FILE_MACHINE_AMD64;
 #endif
 
     close( reply_pipe );

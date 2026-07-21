@@ -2153,7 +2153,13 @@ int main( int argc, char **argv )
              * real x86 code once Wow64LdrpInitialize/cpu_simulate() takes
              * over. So for a WoW64 target, skip native import resolution and
              * attach entirely and hand off immediately. */
-            if (!status && !is_wow64())
+            /* An x86_64 guest must skip native import resolution/attach for
+             * the same reason a 32-bit one does (the host loader would
+             * resolve its imports against aarch64 DLLs and run x86-64
+             * DllMains natively) -- it just doesn't announce itself via
+             * is_wow64(), since a 64-bit guest shares the native PEB and
+             * never gets a wow_peb. */
+            if (!status && !is_wow64() && main_image_info.Machine != IMAGE_FILE_MACHINE_AMD64)
             {
                 ldr_status = wine_nx_loader_fixup_main_imports();
                 log_line( "[LDR] fixup_imports status=%08x", ldr_status );
@@ -2175,7 +2181,15 @@ int main( int argc, char **argv )
             }
         }
         log_line( "[READY] PE image is mapped by Wine ntdll; entry=%p", entry );
-        if (autorun && is_wow64())
+        if (autorun && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)
+        {
+            /* Detection and routing exist ahead of the executor so an
+             * x86_64 target fails here, identifiably, instead of jumping
+             * to x86-64 machine code on an aarch64 CPU below. */
+            log_line( "[RUN] 64-bit x86 guest detected (machine=0x8664); "
+                      "x86_64 execution path not implemented yet" );
+        }
+        else if (autorun && is_wow64())
         {
             NTSTATUS wow64_status;
 
