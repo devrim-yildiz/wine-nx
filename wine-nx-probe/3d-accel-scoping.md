@@ -1,10 +1,14 @@
 # 3D-accel (GPU compositor) milestone -- scoping
 
-Status: the Mesa/NVK dependency question is **resolved** (see below), the
-deko3d bring-up smoke test (`wine-nx-probe/source/deko3d_smoke.c`, target
-`wine-nx-deko3d-smoke`) hardware-confirmed device/queue/swapchain creation,
-a CPU-to-GPU texture upload, and a real shader-driven rotating cube all
-running together at 60-62fps -- and the actual compositor swap into
+Status: the Mesa/NVK dependency question, originally resolved as "no" (see
+below) is now **superseded by direct evidence of real, working NVK ports on
+this exact hardware** -- see "Update: NVK on Horizon OS is real, not
+architecturally impossible" further down, keep reading past the original
+analysis. Separately, the deko3d bring-up smoke test
+(`wine-nx-probe/source/deko3d_smoke.c`, target `wine-nx-deko3d-smoke`)
+hardware-confirmed device/queue/swapchain creation, a CPU-to-GPU texture
+upload, and a real shader-driven rotating cube all running together at
+60-62fps -- and the actual compositor swap into
 `wine_nx_fb_lock/unlock/present` (`wine-nx-probe/source/runtime_deko3d.c`)
 has been attempted and is now **architecturally blocked** for the
 single-binary, runtime-selectable-backend design this project uses. See
@@ -14,8 +18,17 @@ built vs. planned" at the bottom for the full picture. The runtime falls
 back to the proven libnx-framebuffer path automatically and unconditionally
 on any deko3d failure, so this is a parked dead end, not a regression --
 the app works today exactly as it did before this milestone was attempted.
+The deko3d findings below are unaffected by the NVK update -- they're a
+separate, still-accurate track.
 
-## Resolved: does a usable Mesa/NVK (Vulkan) port exist for this project?
+## Originally resolved (now superseded, kept for the record): does a usable Mesa/NVK (Vulkan) port exist?
+
+**This section's conclusion was wrong. Kept verbatim below for the record
+-- see the "Update" section right after it for the correction.** It was an
+accurate description of the *stock* `devkitpro/devkita64` Docker image at
+the time it was written, not a fabrication -- the image genuinely ships no
+Vulkan/NVK out of the box. The error was concluding from that alone that no
+adaptation was possible.
 
 **No, and it's not a packaging gap -- it's architectural.** Verified by
 inspecting the actual `devkitpro/devkita64` Docker image this project's own
@@ -34,6 +47,57 @@ inspecting the actual `devkitpro/devkita64` Docker image this project's own
   Switchroot/L4T-style Linux distro) -- a completely different target than
   "Switch homebrew via libnx," not a library this project could link
   against.
+
+## Update: NVK on Horizon OS is real, not architecturally impossible
+
+**The "no kernel underneath it to attach to" reasoning above missed the
+actual option: don't attach NVK to a kernel at all -- reimplement its
+Linux-DRM-facing backend to talk to Horizon's `nvhost`/`nvmap` IPC services
+directly, the same substrate this project's own `deko3d_smoke.c` already
+proves reachable from homebrew.** Confirmed two independent, real
+implementations of exactly that:
+
+1. **[dantiicu/vulkan-triangle-test-switch](https://github.com/dantiicu/vulkan-triangle-test-switch)**
+   (same original author as this project), plus sibling repos
+   `vulkan-smoke-test-switch` and `vulkan-compute-shader-test-switch`. All
+   three build real `.nro`s against a custom Mesa/NVK build
+   (`ticohq/switch-nvk-vulkan`, produced by a private, unpublished
+   `nvk-image/create-nvk-image.sh` tool this project has no access to) and
+   use standard Vulkan 1.0 (`VK_KHR_surface` + `VK_NN_vi_surface`, the
+   official Khronos WSI extension built for Nintendo's native windowing
+   system). The triangle example's `output.jpg` shows a real,
+   correctly-rendered RGB-interpolated triangle -- consistent with genuine
+   hardware output. The actual kernel-interface substitution (the core of
+   how this works) is not publicly inspectable; the Docker image denies
+   anonymous `docker manifest inspect` access.
+2. **[PalindromicBreadLoaf/nxvk](https://github.com/PalindromicBreadLoaf/nxvk)**
+   -- fully public, MIT-licensed (new code; Mesa's own license for the
+   rest), actively maintained (most recent commit as of this write-up:
+   2026-07-08). A downstream Mesa fork (based on Mesa 26.1.4) with a
+   dedicated `switch/` directory containing the entire port: Docker
+   toolchain (layered on `devkitpro/devkita64`, the same base image this
+   project's own `build-switch.sh` already uses), build scripts, and nine
+   working example apps (`nvk_smoke`, `nvk_tri`, `nvk_textures`,
+   `nvk_cubemap`, a real WSI swapchain example, etc.) plus a reusable
+   bring-up helper (`switch/smoke/nvk_harness.h`). No dynamic Vulkan
+   loader/ICD registration -- you statically link the driver's archives
+   (`libnvk.a` + its NAK/NIL/NIR/SPIR-V dependency archives) directly into
+   your own `.nro` and bootstrap everything through one exported symbol,
+   `vk_icdGetInstanceProcAddr`. A real, honest caveat: device creation
+   requires explicitly setting `NVK_I_WANT_A_BROKEN_VULKAN_DRIVER=1` --
+   NVK itself is flagging that this platform port isn't fully conformant
+   yet. Early and real, not polished, not nothing.
+
+**What this changes:** the categorical "NVK cannot run, full stop" claim
+above is wrong. A real, working Vulkan driver for this exact GPU
+(Tegra X1/GM20B) under Horizon OS exists today, in at least one publicly
+usable form. That reopens the downstream conclusions this doc drew from
+the old claim -- see the corrections in "Side effect worth flagging" and
+"Two real candidate GPU APIs" below, both marked accordingly. **Not yet
+integrated into this project** -- what remains is the wine-nx-side glue
+(a WGL driver or Vulkan-surface plumbing bridging Wine's own GL/D3D calls
+into one of these drivers), which is real, scoped engineering work, not
+blocked on something nonexistent anymore.
 
 **But real GPU acceleration does exist and is already installed** in the
 same toolchain image, just not Vulkan:
@@ -61,21 +125,23 @@ Both `deko3d`'s and the OpenGL examples' display setup call
 here is a real, bounded interface swap, not a rewrite -- true for either
 GPU API choice.
 
-**Side effect worth flagging:** since Vulkan doesn't exist on this OS, the
-README's framing of "DXVK/vkd3d later, after Wine's Vulkan path is clean"
-for real D3D-game acceleration is a dead end on Switch specifically. Wine's
-older `wined3d` OpenGL backend (predates DXVK, still fully present upstream)
-is the actually-viable long-term path to accelerated D3D on this platform,
-*because* Mesa/GLES is real and installed. Noting this now so the
-"Vulkan later" framing doesn't quietly stay in anyone's head as the plan --
-it isn't reachable here. Not scoped further in this pass.
+**Side effect worth flagging (correction, see the Update section above):**
+this originally said Vulkan doesn't exist on this OS, making DXVK/vkd3d a
+dead end and `wined3d`-over-OpenGL the only viable long-term D3D path. That
+premise no longer holds -- real NVK ports exist (see above). DXVK/vkd3d
+becoming viable is now a real possibility, not ruled out, though nothing
+in this project targets it yet; it would need wine-nx's own Vulkan-surface
+integration built first (not yet done). `wined3d`-over-OpenGL remains a
+valid, likely-simpler path regardless -- not correcting to "Vulkan is now
+the plan," just no longer stating Vulkan is impossible.
 
 ## What the milestone actually is
 
-This is **not** "get D3D games running via DXVK/vkd3d" -- and per the
-resolved Vulkan/NVK question above, it structurally can't be; DXVK/vkd3d
-both require Vulkan, which doesn't exist on Horizon OS. It's narrower:
-replace the *presentation* path only --
+This is **not** "get D3D games running via DXVK/vkd3d" -- that's a
+separate, much larger, not-yet-scoped milestone (DXVK/vkd3d both need
+Vulkan, which is now known to be real on this hardware but not yet
+integrated into this project -- see the Update section above). This
+milestone is narrower: replace the *presentation* path only --
 
 - Keep Wine's existing software GDI/DIB rendering exactly as-is.
 - Instead of `framebufferBegin()`/`framebufferEnd()` (CPU block-linear
@@ -114,8 +180,12 @@ without touching the caller.
 
 ## Two real candidate GPU APIs, and the tradeoff
 
-NVK is off the table (see above). The actual choice is between the two
-APIs confirmed available in the toolchain:
+NVK/Vulkan is a real third option now (see the Update section above), but
+not yet integrated into this project, and not needed for *this* milestone
+specifically (a single texture upload + quad + present, not a renderer).
+For the presentation-compositor milestone scoped here, the choice stays
+between the two APIs already confirmed available and ready to use in the
+toolchain:
 
 **deko3d** (Switch homebrew's own low-level GPU API):
 - Pro: purpose-built for this exact OS/hardware by the same team that

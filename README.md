@@ -313,7 +313,9 @@ wine-nx-probe/x86_64-scoping.md      # 64-bit (x86_64) guest path scoping
   otherwise confirmed working.
 - **No GPU-accelerated rendering for apps that need it** — no WGL/D3D
   driver exists yet, so OpenGL/Direct3D content won't render (unrelated to
-  the GPU-accelerated *presentation* path above, which does work).
+  the GPU-accelerated *presentation* path above, which does work). A real
+  Vulkan driver for this hardware now exists externally (not yet
+  integrated) — see `wine-nx-probe/3d-accel-scoping.md`.
 - **UI completeness is early**: menus work but aren't pixel-perfect, no
   keyboard/text-input path, limited controller/touch handling, no
   double-click/drag polish.
