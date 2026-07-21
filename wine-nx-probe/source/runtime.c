@@ -1373,6 +1373,9 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
 
     if (!target_to_dos_path( target, dos_path, dos_path_size )) return NULL;
     dos_dirname( dos_path, current_dir, sizeof(current_dir) );
+    /* The curdir string must fit its MAX_PATH slot below, trailing
+     * backslash and NUL included. */
+    if (strlen( current_dir ) > MAX_PATH - 2) current_dir[MAX_PATH - 2] = 0;
     snprintf( nt_path, sizeof(nt_path), "\\??\\%s", dos_path );
     snprintf( dll_path, sizeof(dll_path), "%s;C:\\windows\\system32;C:\\windows;C:\\",
               current_dir );
@@ -1401,7 +1404,7 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
         log_line( "[ARGS] no args configured; CommandLine='%s'", cmdline_str );
     }
 
-    chars = strlen( current_dir ) + 1;
+    chars = MAX_PATH; /* curdir slot, see below */
     chars += strlen( dll_path ) + 1;
     chars += strlen( dos_path ) + 1;
     chars += strlen( cmdline_str ) + 1;
@@ -1431,7 +1434,17 @@ static RTL_USER_PROCESS_PARAMETERS *runtime_create_process_params( const char *t
     params->ProcessGroupId = GetCurrentProcessId();
 
     cursor = (WCHAR *)(params + 1);
+    /* The curdir slot needs MAX_PATH capacity, not a tight fit:
+     * RtlSetCurrentDirectory_U() rewrites this buffer in place (adding a
+     * trailing backslash) with no capacity check, trusting the MAX_PATH
+     * reservation real Wine's build_initial_params() makes. Packed tight,
+     * the guest's first RtlSetCurrentDirectory_U() call overflowed by one
+     * WCHAR and planted a NUL on DllPath.Buffer[0] -- the next packed
+     * string -- emptying the DLL search path, so bundled app DLLs only
+     * ever resolved through the hardcoded system-dir fallback. */
     put_process_string( &cursor, &params->CurrentDirectory.DosPath, current_dir );
+    params->CurrentDirectory.DosPath.MaximumLength = MAX_PATH * sizeof(WCHAR);
+    cursor = params->CurrentDirectory.DosPath.Buffer + MAX_PATH;
     put_process_string( &cursor, &params->DllPath, dll_path );
     put_process_string( &cursor, &params->ImagePathName, dos_path );
     put_process_string( &cursor, &params->CommandLine, cmdline_str );
