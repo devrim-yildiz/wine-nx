@@ -5095,9 +5095,16 @@ static int horizon_server_handle_set_window_pos( struct horizon_server_connectio
             window->needs_erase = 0;
             window->needs_nonclient = 0;
             horizon_server_mark_window_update_locked( window, client_screen, 1 );
-            horizon_trace( "[HZPAINT] setpos resize hwnd=%08x rect=%d,%d-%d,%d swp=%x\n",
-                           window->handle, client_screen.left, client_screen.top,
-                           client_screen.right, client_screen.bottom, request->swp_flags );
+            {
+                static unsigned int logged;
+                if (logged < 5)
+                {
+                    horizon_trace( "[HZPAINT] setpos resize hwnd=%08x rect=%d,%d-%d,%d swp=%x\n",
+                                   window->handle, client_screen.left, client_screen.top,
+                                   client_screen.right, client_screen.bottom, request->swp_flags );
+                    logged++;
+                }
+            }
         }
         if (window->paint_flags & HORIZON_SET_WINPOS_PAINT_SURFACE)
         {
@@ -5107,10 +5114,17 @@ static int horizon_server_handle_set_window_pos( struct horizon_server_connectio
             if (!horizon_server_rect_empty( &client_screen ))
             {
                 horizon_server_mark_window_update_locked( window, client_screen, 1 );
-                horizon_trace( "[HZPAINT] setpos dirty hwnd=%08x rect=%d,%d-%d,%d flags=%x style=%x\n",
-                               window->handle, client_screen.left, client_screen.top,
-                               client_screen.right, client_screen.bottom,
-                               window->paint_flags, window->style );
+                {
+                    static unsigned int logged;
+                    if (logged < 5)
+                    {
+                        horizon_trace( "[HZPAINT] setpos dirty hwnd=%08x rect=%d,%d-%d,%d flags=%x style=%x\n",
+                                       window->handle, client_screen.left, client_screen.top,
+                                       client_screen.right, client_screen.bottom,
+                                       window->paint_flags, window->style );
+                        logged++;
+                    }
+                }
             }
             reply.surface_win = window->handle;
         }
@@ -5646,14 +5660,21 @@ static int horizon_server_handle_get_visible_region( struct horizon_server_conne
         reply.total_size = horizon_server_rect_empty( &rect ) ? 0 : sizeof(rect);
         reply.header.reply_size = data_size;
 
-        horizon_trace( "[HZPAINT] visible hwnd=%08x top=%08x flags=%x rect=%d,%d-%d,%d "
-                       "toprect=%d,%d-%d,%d data=%u err=%08x\n",
-                       request->window, reply.top_win, request->flags,
-                       reply.win_rect.left, reply.win_rect.top,
-                       reply.win_rect.right, reply.win_rect.bottom,
-                       reply.top_rect.left, reply.top_rect.top,
-                       reply.top_rect.right, reply.top_rect.bottom,
-                       data_size, reply.header.error );
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] visible hwnd=%08x top=%08x flags=%x rect=%d,%d-%d,%d "
+                               "toprect=%d,%d-%d,%d data=%u err=%08x\n",
+                               request->window, reply.top_win, request->flags,
+                               reply.win_rect.left, reply.win_rect.top,
+                               reply.win_rect.right, reply.win_rect.bottom,
+                               reply.top_rect.left, reply.top_rect.top,
+                               reply.top_rect.right, reply.top_rect.bottom,
+                               data_size, reply.header.error );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -6005,14 +6026,21 @@ static int horizon_server_handle_get_update_region( struct horizon_server_connec
                 }
             }
         }
-        horizon_trace( "[HZPAINT] get_update hwnd=%08x from=%08x req=%x child=%08x flags=%x size=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d err=%08x\n",
-                       request->window, request->from_child, request->flags, reply.child, reply.flags,
-                       reply.total_size, target ? target->has_update_rect : window->has_update_rect,
-                       target ? target->has_internal_paint : window->has_internal_paint,
-                       target ? target->needs_erase : window->needs_erase,
-                       target ? target->needs_nonclient : window->needs_nonclient,
-                       rect.left, rect.top, rect.right, rect.bottom,
-                       reply.header.error );
+        {
+            static unsigned int logged;
+            if (logged < 5)
+            {
+                horizon_trace( "[HZPAINT] get_update hwnd=%08x from=%08x req=%x child=%08x flags=%x size=%u has=%u internal=%u erase=%u nc=%u rect=%d,%d-%d,%d err=%08x\n",
+                               request->window, request->from_child, request->flags, reply.child, reply.flags,
+                               reply.total_size, target ? target->has_update_rect : window->has_update_rect,
+                               target ? target->has_internal_paint : window->has_internal_paint,
+                               target ? target->needs_erase : window->needs_erase,
+                               target ? target->needs_nonclient : window->needs_nonclient,
+                               rect.left, rect.top, rect.right, rect.bottom,
+                               reply.header.error );
+                logged++;
+            }
+        }
     }
     pthread_mutex_unlock( &horizon_server_objects_mutex );
 
@@ -9052,35 +9080,49 @@ void __libnx_exception_handler( ThreadExceptionDump *ctx )
     else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
     rec.ExceptionInformation[1] = (ULONG_PTR)ctx->far.x;
 
-    snprintf( buf, sizeof(buf),
-              "[EXC] desc=0x%08x esr=0x%08x pc=0x%llx far=0x%llx sp=0x%llx lr=0x%llx kind=%s",
-              ctx->error_desc, ctx->esr,
-              (unsigned long long)ctx->pc.x, (unsigned long long)ctx->far.x,
-              (unsigned long long)ctx->sp.x, (unsigned long long)ctx->lr.x,
-              rec.ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT ? "exec" :
-              rec.ExceptionInformation[0] == EXCEPTION_WRITE_FAULT   ? "write" : "read" );
-    wine_nx_runtime_trace( buf );
-    snprintf( buf, sizeof(buf),
-              "[EXC] x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x18=0x%llx",
-              (unsigned long long)ctx->cpu_gprs[0].x, (unsigned long long)ctx->cpu_gprs[1].x,
-              (unsigned long long)ctx->cpu_gprs[2].x, (unsigned long long)ctx->cpu_gprs[3].x,
-              (unsigned long long)ctx->cpu_gprs[18].x );
-    wine_nx_runtime_trace( buf );
-    /* Full register dump for the current exec-fault investigation: pc==far
-     * (0x7ae2aeb648) matched none of x0-x3/x18/lr, meaning whatever register
-     * held the RW jump target (instead of the correct RX alias) is somewhere
-     * in x4-x17/x19-x30 that the trace above never covered. Print everything
-     * this once rather than guessing which register to add next. */
+    /* This handler only runs on a genuine hardware fault -- confirmed via
+     * the actual cube32 1fps hardware log to fire zero times in that run
+     * (grep for "[EXC]" found nothing), so it is NOT the 1fps cause. Still
+     * rate-limited defensively, matching this codebase's established
+     * fflush-per-call idiom (see e.g. 44bf9fa, 3c3982f): if a real fault
+     * ever does fire repeatedly, these 4 unconditional trace calls would
+     * otherwise flood the log exactly like the syscall/BOX64_LOG traces
+     * did. Kept unlimited for the first 5 faults, which is plenty to
+     * diagnose any real occurrence. */
     {
-        char buf2[512]; int p = 0;
-        for (int i = 4; i <= 17 && p < 480; i++)
-            p += snprintf( buf2+p, sizeof(buf2)-p, "x%d=%llx ", i, (unsigned long long)ctx->cpu_gprs[i].x );
-        wine_nx_runtime_trace( buf2 );
-        p = 0;
-        for (int i = 19; i <= 28 && p < 480; i++)
-            p += snprintf( buf2+p, sizeof(buf2)-p, "x%d=%llx ", i, (unsigned long long)ctx->cpu_gprs[i].x );
-        snprintf( buf2+p, sizeof(buf2)-p, "fp=%llx", (unsigned long long)ctx->fp.x );
-        wine_nx_runtime_trace( buf2 );
+        static unsigned int exc_logged;
+        if (exc_logged < 5)
+        {
+            snprintf( buf, sizeof(buf),
+                      "[EXC] desc=0x%08x esr=0x%08x pc=0x%llx far=0x%llx sp=0x%llx lr=0x%llx kind=%s",
+                      ctx->error_desc, ctx->esr,
+                      (unsigned long long)ctx->pc.x, (unsigned long long)ctx->far.x,
+                      (unsigned long long)ctx->sp.x, (unsigned long long)ctx->lr.x,
+                      rec.ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT ? "exec" :
+                      rec.ExceptionInformation[0] == EXCEPTION_WRITE_FAULT   ? "write" : "read" );
+            wine_nx_runtime_trace( buf );
+            snprintf( buf, sizeof(buf),
+                      "[EXC] x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x18=0x%llx",
+                      (unsigned long long)ctx->cpu_gprs[0].x, (unsigned long long)ctx->cpu_gprs[1].x,
+                      (unsigned long long)ctx->cpu_gprs[2].x, (unsigned long long)ctx->cpu_gprs[3].x,
+                      (unsigned long long)ctx->cpu_gprs[18].x );
+            wine_nx_runtime_trace( buf );
+            /* Full register dump for the current exec-fault investigation: pc==far
+             * (0x7ae2aeb648) matched none of x0-x3/x18/lr, meaning whatever register
+             * held the RW jump target (instead of the correct RX alias) is somewhere
+             * in x4-x17/x19-x30 that the trace above never covered. Print everything
+             * this once rather than guessing which register to add next. */
+            char buf2[512]; int p = 0;
+            for (int i = 4; i <= 17 && p < 480; i++)
+                p += snprintf( buf2+p, sizeof(buf2)-p, "x%d=%llx ", i, (unsigned long long)ctx->cpu_gprs[i].x );
+            wine_nx_runtime_trace( buf2 );
+            p = 0;
+            for (int i = 19; i <= 28 && p < 480; i++)
+                p += snprintf( buf2+p, sizeof(buf2)-p, "x%d=%llx ", i, (unsigned long long)ctx->cpu_gprs[i].x );
+            snprintf( buf2+p, sizeof(buf2)-p, "fp=%llx", (unsigned long long)ctx->fp.x );
+            wine_nx_runtime_trace( buf2 );
+            exc_logged++;
+        }
     }
 
     status = virtual_handle_fault( &rec, (void *)ctx->sp.x );

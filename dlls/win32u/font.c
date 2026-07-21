@@ -4545,7 +4545,21 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
     {
         TRACE( "returning cached gdiFont(%p)\n", font );
 #ifdef __SWITCH__
-        nxfont_trace_wpath( "select_cached", lf->lfFaceName, lf->lfCharSet, font->fs.fsCsb[0] );
+        /* Unlike select_request/select_family/select_file below (only hit
+         * once per distinct font, on a real cache miss), this is the cache
+         * HIT path -- fires on every single TextOutW-class call once a
+         * font's already loaded, same unconditional-fflush cost as every
+         * other fix in this series. Hardware-confirmed as the dominant
+         * trace volume (69% of one log) once the syscall/box64-log/NX-DIAG
+         * fixes landed. Rate-limited to 5 samples, same idiom. */
+        {
+            static unsigned int select_cached_logged;
+            if (select_cached_logged < 5)
+            {
+                nxfont_trace_wpath( "select_cached", lf->lfFaceName, lf->lfCharSet, font->fs.fsCsb[0] );
+                select_cached_logged++;
+            }
+        }
 #endif
         return font;
     }

@@ -618,10 +618,25 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
         ULONG_PTR guest_eip = 0;
         void *emu_ptr = NtCurrentTeb()->TlsSlots[17];
         if (emu_ptr) guest_eip = *(ULONG_PTR *)((char *)emu_ptr + 0x88);
-        char buf[160];
-        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x t=%u f=%u args=%u handler=%p eip=0x%lx",
-                  syscall_id, table_idx, func_idx, arg_bytes, handler, guest_eip );
-        wine_nx_runtime_trace( buf );
+
+        /* wine_nx_runtime_trace() fflush()es to the SD card unconditionally,
+         * every call -- same bug class already root-caused and fixed on the
+         * native ARM64 path (fflush-per-frame traces in hot server handlers
+         * were the real "~14ms IPC floor", not scheduler/IPC cost itself;
+         * see 6051370 and 44bf9fa). This entry/exit pair fires on literally
+         * every syscall crossing the WOW64 boundary -- hardware-confirmed
+         * as 19,358 of a 23,067-line cube32 log (84%) at ~9,679 syscalls in
+         * one short capture. Rate-limited to 5 samples, matching the same
+         * idiom used everywhere else this bug class was fixed. */
+        static unsigned int syscall_entry_logged;
+        if (syscall_entry_logged < 5)
+        {
+            char buf[160];
+            snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x t=%u f=%u args=%u handler=%p eip=0x%lx",
+                      syscall_id, table_idx, func_idx, arg_bytes, handler, guest_eip );
+            wine_nx_runtime_trace( buf );
+            syscall_entry_logged++;
+        }
 
         /* Hardware-confirmed tight loop: NtQueryInformationFile (0x11) /
          * NtSetInformationFile (0x27) alternate 1700+ times with identical
@@ -635,12 +650,20 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
          * lines to identify which guest function is looping. */
         if ((syscall_id == 0x0011 || syscall_id == 0x0027) && guest_eip)
         {
-            void *frame1 = __builtin_frame_address(1);
-            ULONG_PTR caller_native_ret = frame1 ? ((ULONG_PTR *)frame1)[1] : 0;
-            char buf4[160];
-            snprintf( buf4, sizeof(buf4), "[SYSCALL] file-info-loop id=0x%04x class=0x%lx caller_native_ret=0x%lx",
-                      syscall_id, x4, caller_native_ret );
-            wine_nx_runtime_trace( buf4 );
+            /* Hardware-confirmed to hit 1700+ times in a single retry loop
+             * (see comment above) -- same unconditional-fflush cost as the
+             * entry/exit trace, rate-limited the same way. */
+            static unsigned int file_info_loop_logged;
+            if (file_info_loop_logged < 5)
+            {
+                void *frame1 = __builtin_frame_address(1);
+                ULONG_PTR caller_native_ret = frame1 ? ((ULONG_PTR *)frame1)[1] : 0;
+                char buf4[160];
+                snprintf( buf4, sizeof(buf4), "[SYSCALL] file-info-loop id=0x%04x class=0x%lx caller_native_ret=0x%lx",
+                          syscall_id, x4, caller_native_ret );
+                wine_nx_runtime_trace( buf4 );
+                file_info_loop_logged++;
+            }
         }
 
         /* NtTerminateProcess(self, STATUS_DLL_NOT_FOUND) -- dump the actual
@@ -797,10 +820,17 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
 
     if (trace_syscall)
     {
-        char buf[128];
-        snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x done status=0x%08x",
-                  syscall_id, (unsigned)result );
-        wine_nx_runtime_trace( buf );
+        /* Same unconditional-fflush cost as the entry trace above, same
+         * fix: rate-limited to 5 samples. */
+        static unsigned int syscall_exit_logged;
+        if (syscall_exit_logged < 5)
+        {
+            char buf[128];
+            snprintf( buf, sizeof(buf), "[SYSCALL] id=0x%04x done status=0x%08x",
+                      syscall_id, (unsigned)result );
+            wine_nx_runtime_trace( buf );
+            syscall_exit_logged++;
+        }
 
         /* NtMapViewOfSection (table 0, func 0x28): BaseAddress (x2) and
          * ViewSize (x6) are IN/OUT pointers -- on success the callee has
