@@ -1894,6 +1894,35 @@ void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
     wow64_params->wShowWindow     = params->wShowWindow;
     wow64_params->ProcessGroupId  = params->ProcessGroupId;
 
+#ifdef __SWITCH__
+    /* Luanti (a real app with bundled DLLs next to its exe, unlike every
+     * prior test target -- OpenTTD/cube32 have none) hit STATUS_DLL_NOT_FOUND
+     * for every one of its own bundled DLLs: the search never tried
+     * C:\<app-dir>\<dll>, only syswow64/windows/drive-root. This traces the
+     * actual DllPath string being handed to the WOW64 guest right here, to
+     * bisect whether it's missing the app directory at construction (this
+     * function/its caller) or the guest's own loader.c ignores a correct
+     * value -- narrowed to ASCII since this is just for a quick eyeball
+     * check, not a real conversion. */
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            char ascii[200], trace_buf[256];
+            unsigned int i, n = params->DllPath.Length / sizeof(WCHAR);
+            if (n > sizeof(ascii) - 1) n = sizeof(ascii) - 1;
+            for (i = 0; i < n; i++)
+            {
+                WCHAR c = params->DllPath.Buffer[i];
+                ascii[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+            }
+            ascii[i] = 0;
+            snprintf( trace_buf, sizeof(trace_buf), "[WOW64] build_wow64_parameters DllPath='%s' len=%u",
+                     ascii, params->DllPath.Length / sizeof(WCHAR) );
+            wine_nx_runtime_trace( trace_buf );
+        }
+    }
+#endif
     dst = (WCHAR *)(wow64_params + 1);
     dup_unicode_string( &params->CurrentDirectory.DosPath, &dst, &wow64_params->CurrentDirectory.DosPath );
     dup_unicode_string( &params->DllPath, &dst, &wow64_params->DllPath );
