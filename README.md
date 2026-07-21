@@ -862,17 +862,78 @@ smoke test — the existing `gui_smoke.c` demo is aarch64-windows native and
 never touches the WOW64/box64 path at all, so it couldn't have caught any
 of the bugs above).
 
-**Not yet fixed:** presentation is still extremely slow on this specific
-32-bit guest path — `cube32` alone measured around 1fps, not the WOW64-
-independent numbers reported earlier in this document. One concrete,
-fixed contributor: a caret-blink system timer was paying a full IPC round
-trip every tick even in processes that never create a caret at all (~25%
-of all IPC traffic in one short capture). Text rendering also appears
-inconsistent in some contexts (a dialog box's own message text rendered
-blank while its title and one button label did not) — not yet root-caused,
-plausibly related to font loading/glyph rasterization rather than the
-GDI blit path itself (which is otherwise confirmed working). Both need
-further investigation before this is a usable app-launch path.
+**Performance — hardware-confirmed fix: 1fps → 60fps (present-rate
+capped, full parity with the native ARM64 path).** `cube32` initially
+measured around 1fps. A caret-blink IPC round trip (fixed above)
+didn't close the gap; the real cause turned out to be the exact same bug
+class already root-caused once on the native ARM64 path (see "the '~14ms
+IPC floor' hypothesis is refuted... the floor was unconditional
+fflush-to-SD traces in hot handlers" — the run that took native from 8fps
+to 34fps by fixing it). Direct count against the actual 1fps hardware log:
+**19,358 of 23,067 lines (84%) were `[SYSCALL]` trace lines** — the
+per-syscall diagnostic tracing added this session to chase the boot-
+sequence bugs above (`wine_nx_do_syscall` in
+`dlls/ntdll/unix/signal_arm64.c`), each unconditionally `fflush()`ing to
+the SD card, firing on every single syscall crossing the WOW64 boundary
+(~9,679 syscalls in one short capture). It was still on because
+`build-switch.sh`'s `openttd` app-kind branch force-wrote `systrace.txt=1`
+to debug the (now-fixed) silent boot hang and never turned it back off;
+`cube32` had no app-kind branch of its own and silently inherited the
+leftover flag from whatever SD card state existed. Fixed:
+- Rate-limited all three `wine_nx_do_syscall` trace call sites to 5
+  samples, the same established idiom used for every other
+  fflush-per-call fix on the native path (see e.g. `44bf9fa`, `3c3982f`).
+- `build-switch.sh`'s `openttd` branch now writes `systrace.txt=0`.
+- Added a proper `WINE_NX_APP=cube32` app-kind to `build-switch.sh`
+  (build + stage + explicit `systrace.txt=0`) so it's a one-command
+  build/deploy instead of manual staging.
+- Force-rebuilt the i386-windows `win32u.dll` from current source — its
+  unity-build `main.c` means `make`'s dependency tracking can silently
+  miss edits to files it `#include`s (`dce.c`, `winnx_drv.c`), so there
+  was no guarantee the deployed 32-bit `win32u.dll` actually carried the
+  native path's already-landed paint/redraw-batching fixes.
+
+First hardware retest after the above landed at 1fps → 21fps, and turned up
+two more instances of the exact same bug in different spots, both since
+fixed and re-verified by log volume on a follow-up run:
+- **Box64's own dynarec-block logging.** `BOX64_LOG=2` (box64's own log
+  level: `LOG_NONE=0`/`LOG_INFO=1`/`LOG_DEBUG=2`) was hardcoded into every
+  guest process's environment unconditionally (`runtime.c`) — box64
+  tracing every translated x86 block, forever. Now defaults to `0`, only
+  raised to `2` when `wine_nx_box64_trace_enabled`.
+- **`[NX-DIAG]` box64-side traces always-on regardless of `BOX64_LOG`.**
+  9 `printf_log()` call sites added this session in the vendored
+  `wowbox64.c` (`BTCpuSetContext`, `BTCpuSimulate`, `calculate_fs`, etc. —
+  all boot-sequence-debugging instrumentation) used `LOG_NONE`, which
+  bypasses box64's own log-level filter entirely regardless of
+  `BOX64_LOG`, unlike every other call site in that file (`LOG_DEBUG`).
+  Measured at 1,171 of 3,312 log lines (35%) in the 21fps run — changed
+  all 9 to `LOG_DEBUG` so they respect the toggle above.
+
+Both confirmed fixed on a follow-up log: `[SYSCALL]` stayed capped at 5,
+`[NX-DIAG]` dropped from 1,171 to 2. A fourth instance turned up in the
+same log — `[NXFONT] select_cached` (win32u's font-cache-hit trace,
+`dlls/win32u/font.c`) was 3,945 of 5,753 lines (69%), unconditional on
+every `TextOutW`-class call once a font is cached — rate-limited to 5
+samples the same way.
+
+Hardware-confirmed after that round: **60fps** — the same present-rate cap
+the native ARM64 path already sits at (`138f249`, ~60Hz), i.e. full parity
+with the platform's own refresh rate, not an emulation-imposed ceiling.
+Progression across the three rounds: 1fps → 21fps → 60fps (capped). All
+four fixes were the same bug pattern in four different places (wine-nx's
+own per-syscall trace, box64's own dynarec-block log, box64-side
+`printf_log(LOG_NONE, ...)` bypassing that log level, win32u's font-cache
+trace) — unconditional `fflush()`-to-SD-card diagnostic logging added
+while chasing the boot-sequence bug chain above, never rate-limited or
+turned back off once those bugs were fixed. None of it was a real
+WOW64/box64 architectural limitation.
+
+Text rendering also appears inconsistent in some contexts (a dialog box's
+own message text rendered blank while its title and one button label did
+not) — not yet root-caused, plausibly related to font loading/glyph
+rasterization rather than the GDI blit path itself (which is otherwise
+confirmed working).
 
 ## Build
 
