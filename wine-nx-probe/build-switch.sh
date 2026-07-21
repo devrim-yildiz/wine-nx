@@ -388,6 +388,31 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             fi
         fi
     fi
+    # 64-bit (x86_64) variant of the same cube smoke test, built from the
+    # same cube32.c source with the x86_64 cross target. The x86_64
+    # execution path is not implemented yet -- today this target boots only
+    # as far as runtime.c's machine detection/routing and logs a clean
+    # "[RUN] 64-bit x86 guest detected" line instead of running; it exists
+    # to hardware-verify exactly that routing, and becomes the real 64-bit
+    # smoke test once an executor lands.
+    if [ "$APP_KIND" = "cube64" ]; then
+        CUBE64_SRC="$SCRIPT_DIR/samples/cube32/cube32.c"
+        CUBE64_EXE="$SCRIPT_DIR/samples/cube32/cube64.exe"
+        CUBE64_CC="$LLVM_MINGW_BIN_DIR/x86_64-w64-mingw32-clang"
+        if [ -f "$CUBE64_SRC" ]; then
+            if [ ! -x "$CUBE64_CC" ]; then
+                CUBE64_CC="$(command -v x86_64-w64-mingw32-clang || true)"
+            fi
+            if [ -z "$CUBE64_CC" ] || [ ! -x "$CUBE64_CC" ]; then
+                echo "Missing x86_64-w64-mingw32-clang; cannot build cube64 test app" >&2
+                exit 1
+            fi
+            if [ ! -f "$CUBE64_EXE" ] || [ "$CUBE64_SRC" -nt "$CUBE64_EXE" ]; then
+                "$CUBE64_CC" -municode -mwindows -O2 -Wall -Wextra \
+                    -o "$CUBE64_EXE" "$CUBE64_SRC" -luser32 -lgdi32
+            fi
+        fi
+    fi
     # Direct-blit test app: WINE_NX_APP=blit stages the no-InvalidateRect/
     # no-BeginPaint GetDC+StretchDIBits comparison test (see
     # samples/direct-blit/direct_blit.c's file header for what this isolates).
@@ -437,6 +462,15 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged cube32 (32-bit WOW64 smoke test) as runtime target (WINE_NX_APP=cube32)"
+    elif [ "$APP_KIND" = "cube64" ] && [ -f "$SCRIPT_DIR/samples/cube32/cube64.exe" ]; then
+        CUBE64_DIR="$PACKAGE_DIR/drive_c/cube64"
+        mkdir -p "$CUBE64_DIR"
+        cp "$SCRIPT_DIR/samples/cube32/cube64.exe" "$CUBE64_DIR/cube64.exe"
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/cube64/cube64.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged cube64 (x86_64 detection smoke test) as runtime target (WINE_NX_APP=cube64)"
     elif [ "$APP_KIND" = "notepad" ] && [ -f "$NOTEPAD_EXE" ]; then
         cp "$NOTEPAD_EXE" "$SYSTEM_DIR/notepad.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/windows/system32/notepad.exe' > "$PACKAGE_DIR/target.txt"
