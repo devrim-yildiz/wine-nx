@@ -1,3 +1,6 @@
 [submodule "wine-nx-probe/third_party/box64"]
 	path = wine-nx-probe/third_party/box64
 	url = https://github.com/ptitSeb/box64.git
+[submodule "wine-nx-probe/third_party/nxvk"]
+	path = wine-nx-probe/third_party/nxvk
+	url = https://github.com/PalindromicBreadLoaf/nxvk.git
