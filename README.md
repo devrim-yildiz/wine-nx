@@ -297,6 +297,8 @@ numbers behind every fix):
 wine-nx-probe/perf-lab-log.md        # performance investigation trail
 wine-nx-probe/wowbox64-scoping.md    # WOW64 integration planning + bring-up
 wine-nx-probe/3d-accel-scoping.md    # deko3d GPU compositor bring-up
+wine-nx-probe/dll-resolution-log.md  # portable-app DLL search root cause
+wine-nx-probe/x86_64-scoping.md      # 64-bit (x86_64) guest path scoping
 ```
 
 ## Known Limitations
