@@ -235,6 +235,33 @@ if [ "$APP_KIND" = "openttd" ]; then
     done
 fi
 
+# luanti.exe (Luanti, open-source voxel game engine) is the user's own
+# external game install, same pattern as openttd above: not built here,
+# already placed directly on the SD card at drive_c/luanti/bin/luanti.exe
+# (upstream Luanti's own distribution layout -- bin/ holds the engine
+# binary and its DLLs, data folders are siblings one level up). Its import
+# table (checked directly via objdump -p) needs exactly the same DLL set
+# openttd already needs -- opengl32/shell32/shlwapi/version/winmm plus the
+# always-built REQUIRED_SYSTEM_DLLS -- so it reuses OPENTTD_WINE_DLL_MODULES
+# rather than duplicating that list. Its own bundled runtime DLLs (SDL2,
+# OpenAL32, libcurl, libleveldb, libc++, libunwind, ...) ship right next to
+# luanti.exe itself and are not this port's concern, same as openttd's own
+# bundled DLLs.
+if [ "$APP_KIND" = "luanti" ]; then
+    if [ ! -d "$WINE_PE_BUILD_DIR" ]; then
+        echo "Missing PE build dir for luanti: $WINE_PE_BUILD_DIR" >&2
+        exit 1
+    fi
+    for module in "${OPENTTD_WINE_DLL_MODULES[@]}"; do
+        dll="$WINE_PE_BUILD_DIR/dlls/$module/aarch64-windows/$module.dll"
+        if [ ! -f "$dll" ]; then
+            echo "Building luanti dependency $module.dll"
+            PATH="$WINE_BUILD_PATH" \
+                make -C "$WINE_PE_BUILD_DIR" "dlls/$module/aarch64-windows/$module.dll"
+        fi
+    done
+fi
+
 if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -f "$SCRIPT_DIR/samples/curl-arm64/trurl.exe" ]; }; then
     echo "Preparing SD package for WINE_NX_APP=$APP_KIND"
     PACKAGE_DIR="$BUILD_DIR/sd-card/switch/wine"
@@ -440,6 +467,22 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged openttd.exe as runtime target (WINE_NX_APP=openttd); game files stay on the SD card as-is"
+    elif [ "$APP_KIND" = "luanti" ]; then
+        # Same external-game pattern as openttd: luanti.exe and everything
+        # it ships with (SDL2.dll, OpenAL32.dll, libcurl.dll, etc.) are not
+        # staged here -- they're expected already on the SD card at
+        # drive_c/luanti, placed there directly (see sync script's
+        # --exclude handling above so a resync doesn't wipe them out).
+        # luanti.exe lives in bin/ alongside its engine DLLs (SDL2.dll,
+        # OpenAL32.dll, ...); data folders (builtin/client/fonts/locale/
+        # mods/textures) are siblings of bin/, one level up -- that's
+        # upstream Luanti's real distribution layout, not worth asking
+        # anyone to flatten just for this port.
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/luanti/bin/luanti.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged luanti.exe as runtime target (WINE_NX_APP=luanti); game files stay on the SD card as-is"
     elif [ "$APP_KIND" = "curl" ] && [ -f "$SCRIPT_DIR/samples/curl-arm64/curl.exe" ]; then
         cp "$SCRIPT_DIR/samples/curl-arm64/curl.exe" "$APP_DIR/curl.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/curl/curl.exe' > "$PACKAGE_DIR/target.txt"
@@ -479,10 +522,10 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             fi
         done
     fi
-    if [ "$APP_KIND" = "openttd" ]; then
+    if [ "$APP_KIND" = "openttd" ] || [ "$APP_KIND" = "luanti" ]; then
         for dll in "${OPENTTD_SYSTEM_DLLS[@]}"; do
             if [ ! -f "$SYSTEM_DIR/$dll" ]; then
-                echo "Missing openttd runtime DLL: $SYSTEM_DIR/$dll" >&2
+                echo "Missing $APP_KIND runtime DLL: $SYSTEM_DIR/$dll" >&2
                 missing=1
             fi
         done

@@ -54,7 +54,7 @@ mkdir -p "$SD_ROOT/switch"
 # cleanup -- without it, anything under drive_c on the SD card that isn't
 # also in $PACKAGE_DIR gets deleted, wiping out drive_c/openttd (or any future
 # external app placed the same way).
-rsync -a --delete --exclude='drive_c/openttd' "$PACKAGE_DIR/" "$DEST_DIR/"
+rsync -a --delete --exclude='drive_c/openttd' --exclude='drive_c/luanti' "$PACKAGE_DIR/" "$DEST_DIR/"
 
 missing=0
 for dll in "${REQUIRED_SYSTEM_DLLS[@]}"; do
