@@ -7,6 +7,17 @@ BUILD_DIR="$SCRIPT_DIR/build-switch"
 APP_KIND="${WINE_NX_APP:-curl}"
 WINE_PE_BUILD_DIR="${WINE_PE_BUILD_DIR:-$SCRIPT_DIR/build-wine-arm64-pe-clean}"
 WINE_PE_DLL_ROOT="$WINE_PE_BUILD_DIR/dlls"
+# Separate tree, NOT $WINE_PE_BUILD_DIR: that one is configured
+# --enable-archs=aarch64,i386 only (task #19's own x86_64-scoping.md item
+# 4 finding -- adding x86_64 to it would mean reconfiguring/rebuilding a
+# tree everything else here already depends on, for the sake of six DLLs
+# nothing else needs). This one is --enable-archs=aarch64,i386,x86_64,
+# built purely to get real x86_64-windows ntdll/kernel32/kernelbase/
+# user32/gdi32/win32u -- the guest-side DLLs wine_nx_x64_handoff()
+# (dlls/ntdll/loader.c) loads from C:\windows\sysx64, mirroring
+# syswow64's own i386-windows staging exactly, just for the third arch.
+WINE_PE_X64NATIVE_BUILD_DIR="${WINE_PE_X64NATIVE_BUILD_DIR:-$SCRIPT_DIR/build-wine-arm64-pe-x64native}"
+WINE_PE_X64NATIVE_DLL_ROOT="$WINE_PE_X64NATIVE_BUILD_DIR/dlls"
 LLVM_MINGW_DIR="${LLVM_MINGW_DIR:-$SCRIPT_DIR/toolchains/llvm-mingw-20260505-ucrt-macos-universal}"
 LLVM_MINGW_RUNTIME_DIR="$LLVM_MINGW_DIR/aarch64-w64-mingw32/bin"
 LLVM_MINGW_BIN_DIR="$LLVM_MINGW_DIR/bin"
@@ -347,10 +358,11 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     APP_DIR="$PACKAGE_DIR/drive_c/curl"
     SYSTEM_DIR="$PACKAGE_DIR/drive_c/windows/system32"
     SYSWOW64_DIR="$PACKAGE_DIR/drive_c/windows/syswow64"
+    SYSX64_DIR="$PACKAGE_DIR/drive_c/windows/sysx64"
     WIN_FONTS_DIR="$PACKAGE_DIR/drive_c/windows/fonts"
     NLS_DIR="$PACKAGE_DIR/share/wine/nls"
     DATA_FONTS_DIR="$PACKAGE_DIR/share/wine/fonts"
-    mkdir -p "$APP_DIR" "$SYSTEM_DIR" "$SYSWOW64_DIR" "$WIN_FONTS_DIR" "$NLS_DIR" "$DATA_FONTS_DIR"
+    mkdir -p "$APP_DIR" "$SYSTEM_DIR" "$SYSWOW64_DIR" "$SYSX64_DIR" "$WIN_FONTS_DIR" "$NLS_DIR" "$DATA_FONTS_DIR"
     if [ "$APP_KIND" != "curl" ]; then
         rm -f "$APP_DIR/curl.exe" "$APP_DIR/trurl.exe" "$APP_DIR/libcurl-arm64.dll" \
               "$APP_DIR/curl.args" "$APP_DIR/trurl.args"
@@ -393,6 +405,21 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         while IFS= read -r -d '' dll; do
             cp "$dll" "$SYSWOW64_DIR/"
         done < <(find "$WINE_PE_DLL_ROOT" -path '*/i386-windows/*.dll' -print0)
+    fi
+    # 64-bit (x86_64) guest-side DLLs, mirroring the syswow64 loop above but
+    # from the separate $WINE_PE_X64NATIVE_BUILD_DIR tree (see that
+    # variable's own comment for why it's not folded into $WINE_PE_BUILD_DIR).
+    # No box64-equivalent CPU-emulator DLL is needed here the way wowbox64.dll
+    # is for 32-bit guests -- x86_64 guest code runs through the box64 core
+    # already linked directly into wine-nx-runtime's own binary
+    # (x64native-core/x64native_dynarec_pass*), not a loadable DLL.
+    if [ -d "$WINE_PE_X64NATIVE_DLL_ROOT" ]; then
+        while IFS= read -r -d '' dll; do
+            cp "$dll" "$SYSX64_DIR/"
+        done < <(find "$WINE_PE_X64NATIVE_DLL_ROOT" -path '*/x86_64-windows/*.dll' -print0)
+    else
+        echo "WARNING: no x86_64-windows DLLs at $WINE_PE_X64NATIVE_DLL_ROOT; 64-bit guests won't run. Build with:" >&2
+        echo "  (from $SCRIPT_DIR) mkdir -p build-wine-arm64-pe-x64native && cd build-wine-arm64-pe-x64native && PATH=\"$LLVM_MINGW_BIN_DIR:\$PATH\" ../../configure --enable-archs=aarch64,i386,x86_64 --with-mingw=llvm-mingw ... && make dlls/ntdll/x86_64-windows/ntdll.dll dlls/kernel32/x86_64-windows/kernel32.dll dlls/kernelbase/x86_64-windows/kernelbase.dll dlls/user32/x86_64-windows/user32.dll dlls/gdi32/x86_64-windows/gdi32.dll dlls/win32u/x86_64-windows/win32u.dll" >&2
     fi
     if [ -f "$WOWBOX64_DLL_PATH" ]; then
         cp "$WOWBOX64_DLL_PATH" "$SYSTEM_DIR/wowbox64.dll"
@@ -491,16 +518,18 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             fi
         fi
     fi
-    # 64-bit (x86_64) variant of the same cube smoke test, built from the
-    # same cube32.c source with the x86_64 cross target. The x86_64
-    # execution path is not implemented yet -- today this target boots only
-    # as far as runtime.c's machine detection/routing and logs a clean
-    # "[RUN] 64-bit x86 guest detected" line instead of running; it exists
-    # to hardware-verify exactly that routing, and becomes the real 64-bit
-    # smoke test once an executor lands.
+    # 64-bit (x86_64) cube smoke test, its own dedicated source
+    # (samples/cube64/cube64.c -- fullscreen, otherwise a near-verbatim
+    # copy of cube32.c's already-proven rendering/message-loop code; see
+    # that file's own header comment for why it's a copy, not a shared
+    # source, and why fullscreen specifically). Exercises the real
+    # wine_nx_x64_handoff() path end to end for the first time: box64's
+    # dynarec running real x86_64 code, EmuX64Syscall, and the sysx64
+    # guest DLL set built via $WINE_PE_X64NATIVE_BUILD_DIR (see that
+    # variable's own comment above) -- not yet hardware-validated.
     if [ "$APP_KIND" = "cube64" ]; then
-        CUBE64_SRC="$SCRIPT_DIR/samples/cube32/cube32.c"
-        CUBE64_EXE="$SCRIPT_DIR/samples/cube32/cube64.exe"
+        CUBE64_SRC="$SCRIPT_DIR/samples/cube64/cube64.c"
+        CUBE64_EXE="$SCRIPT_DIR/samples/cube64/cube64.exe"
         CUBE64_CC="$LLVM_MINGW_BIN_DIR/x86_64-w64-mingw32-clang"
         if [ -f "$CUBE64_SRC" ]; then
             if [ ! -x "$CUBE64_CC" ]; then
@@ -645,15 +674,15 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged vulkan_triangle_test (32-bit Vulkan shader/pipeline test) as runtime target (WINE_NX_APP=vulkan_triangle_test)"
-    elif [ "$APP_KIND" = "cube64" ] && [ -f "$SCRIPT_DIR/samples/cube32/cube64.exe" ]; then
+    elif [ "$APP_KIND" = "cube64" ] && [ -f "$SCRIPT_DIR/samples/cube64/cube64.exe" ]; then
         CUBE64_DIR="$PACKAGE_DIR/drive_c/cube64"
         mkdir -p "$CUBE64_DIR"
-        cp "$SCRIPT_DIR/samples/cube32/cube64.exe" "$CUBE64_DIR/cube64.exe"
+        cp "$SCRIPT_DIR/samples/cube64/cube64.exe" "$CUBE64_DIR/cube64.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/cube64/cube64.exe' > "$PACKAGE_DIR/target.txt"
         printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
         printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
         rm -f "$PACKAGE_DIR/args.txt"
-        echo "Staged cube64 (x86_64 detection smoke test) as runtime target (WINE_NX_APP=cube64)"
+        echo "Staged cube64 (fullscreen x86_64 execution smoke test) as runtime target (WINE_NX_APP=cube64)"
     elif [ "$APP_KIND" = "notepad" ] && [ -f "$NOTEPAD_EXE" ]; then
         cp "$NOTEPAD_EXE" "$SYSTEM_DIR/notepad.exe"
         printf '%s\n' 'sdmc:/switch/wine/drive_c/windows/system32/notepad.exe' > "$PACKAGE_DIR/target.txt"

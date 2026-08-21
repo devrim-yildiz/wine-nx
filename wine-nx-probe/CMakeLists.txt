@@ -1319,3 +1319,479 @@ if(WINE_NX_BUILD_WOWBOX64)
 
     add_custom_target(wowbox64-dll ALL DEPENDS "${WOWBOX64_DLL_OUT}")
 endif()
+
+# --- x64native (Box64's core, linked natively into wine-nx-runtime) --------
+# Completely independent of WINE_NX_BUILD_WOWBOX64 above -- that option
+# stays exactly as-is; 32-bit guest support (wowbox64.dll, WOW64) is not
+# touched by anything in this section. This is the OTHER of the two box64
+# integrations, for x86_64 guests: unlike wowbox64.dll, box64's core here is
+# compiled with the SAME devkitA64 toolchain as the rest of this file (no
+# nested ExternalProject_Add, no separate aarch64-w64-mingw32 sysroot) and
+# linked directly into wine-nx-runtime's own ELF binary, matching how every
+# other wine-*-real object library in this file already works. See
+# x86_64-scoping.md's "Revised plan: no separate PE DLL" section for why --
+# there is no wow64.dll loader in this path to demand a genuinely separate
+# PE module the way wowbox64.dll needs one.
+#
+# NOT YET BUILT END-TO-END. Written from the same source lists
+# wine/wow64/CMakeLists.txt (WOW64_BOX64CPU_SRC) and the top-level
+# CMakeLists.txt's ARM_DYNAREC block (both read in full, both proven to
+# compile for ARM64 -- just via aarch64-w64-mingw32, not devkitA64), with
+# two deliberate differences: MUSL_SRC is dropped (devkitA64/libnx already
+# links a full newlib libm -- `m` is already in wine-nx-runtime's own
+# target_link_libraries above; box64's vendored musl math sources would
+# fight it with duplicate symbols, not complement it) and CMAKE_ASM_FLAGS
+# is NOT overridden with wowbox64's own `-mcpu=cortex-a76` (that value was
+# specific to its own build; the devkitA64 toolchain file already sets
+# `-mtune=cortex-a57` globally, matching the Switch's actual CPU, and every
+# other object library in this file already inherits it -- box64's ASM
+# files should too, not diverge). Neither devkitA64 nor a Docker build
+# environment were available in the session that wrote this to actually
+# run the compile -- this is reasoned from the real, working patterns
+# elsewhere in this same file, not verified end-to-end. Expect real
+# compile errors on first attempt (box64's custommem.c/dynarec assume more
+# POSIX than newlib/libnx provides in places) and iterate from there.
+option(WINE_NX_BUILD_X64NATIVE "Link Box64's x86-64 core natively into wine-nx-runtime" OFF)
+
+if(WINE_NX_BUILD_X64NATIVE)
+    # box64's ARM64 dynarec prolog/epilog/next/lock (X64NATIVE_DYNAREC_ASM
+    # below) are real .S files, forced through CMake's ASM language via
+    # set_source_files_properties(... LANGUAGE ASM) later in this block --
+    # this project's top-level project() call only enables C CXX, so that
+    # property use fails at generate time ("The language ASM was requested
+    # ... but was not enabled") without this. Scoped to this option's own
+    # block rather than added to the top-level project() call, since
+    # nothing else in this file needs it.
+    enable_language(ASM)
+
+    set(BOX64_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64")
+    if(NOT EXISTS "${BOX64_ROOT}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "WINE_NX_BUILD_X64NATIVE is ON but ${BOX64_ROOT} is empty. "
+            "Run: git submodule update --init wine-nx-probe/third_party/box64")
+    endif()
+
+    # Same minimal "Wine-hosted, no ELF loader" core box64 core source list
+    # wine/wow64/CMakeLists.txt uses for wowbox64.dll (WOW64_BOX64CPU_SRC
+    # there) -- proven sufficient to build a working Wine-hosted CPU backend
+    # without box64's own program loader/Linux-process machinery. MUSL_SRC
+    # deliberately omitted -- see the section comment above.
+    set(X64NATIVE_BOX64CPU_SRC
+        "${BOX64_ROOT}/src/build_info.c"
+        "${BOX64_ROOT}/src/custommem.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/arm64_immenc.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/arm64_printer.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_arch.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_functions.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_jmpnext.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_consts.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/updateflags_arm64.c"
+        "${BOX64_ROOT}/src/dynarec/dynablock.c"
+        "${BOX64_ROOT}/src/dynarec/dynarec_native_functions.c"
+        "${BOX64_ROOT}/src/dynarec/dynarec_native.c"
+        "${BOX64_ROOT}/src/dynarec/dynarec.c"
+        "${BOX64_ROOT}/src/dynarec/dynacache_reloc.c"
+        "${BOX64_ROOT}/src/emu/x64compstrings.c"
+        "${BOX64_ROOT}/src/emu/x64emu.c"
+        "${BOX64_ROOT}/src/emu/x64primop.c"
+        "${BOX64_ROOT}/src/emu/x64shaext.c"
+        "${BOX64_ROOT}/src/emu/x64test.c"
+        "${BOX64_ROOT}/src/emu/x64trace.c"
+        "${BOX64_ROOT}/src/emu/x64run_private.c"
+        "${BOX64_ROOT}/src/emu/x87emu_private.c"
+        "${BOX64_ROOT}/src/os/backtrace.c"
+        "${BOX64_ROOT}/src/os/os_horizon.c"
+        "${BOX64_ROOT}/src/os/hostext_common.c"
+        "${BOX64_ROOT}/src/os/hostext_wine.c"
+        "${BOX64_ROOT}/src/os/freq_wine.c"
+        "${BOX64_ROOT}/src/os/symbolfuncs_wine.c"
+        "${BOX64_ROOT}/src/os/emit_signal_wine.c"
+        "${BOX64_ROOT}/src/os/perfmap.c"
+        "${BOX64_ROOT}/src/os/random_wine.c"
+        "${BOX64_ROOT}/src/os/my_cpuid.c"
+        "${BOX64_ROOT}/src/os/sysinfo.c"
+        "${BOX64_ROOT}/src/tools/alternate.c"
+        "${BOX64_ROOT}/src/tools/bitutils.c"
+        "${BOX64_ROOT}/src/tools/env.c"
+        "${BOX64_ROOT}/src/tools/dynacache.c"
+        "${BOX64_ROOT}/src/tools/rbtree.c"
+        "${BOX64_ROOT}/src/tools/cpumask.c"
+    )
+
+    # Same ARM64 dynarec file lists as the top-level CMakeLists.txt's
+    # ARM_DYNAREC block (CMakeLists.txt:1033-1091 there), copied explicitly
+    # rather than including that file, since it does a great deal else
+    # (package finds, install() rules, non-ARM64 dynarec backends) this
+    # target has no business depending on.
+    set(X64NATIVE_DYNAREC_ASM
+        "${BOX64_ROOT}/src/dynarec/arm64/arm64_prolog.S"
+        "${BOX64_ROOT}/src/dynarec/arm64/arm64_epilog.S"
+        "${BOX64_ROOT}/src/dynarec/arm64/arm64_next.S"
+        "${BOX64_ROOT}/src/dynarec/arm64/arm64_lock.S"
+    )
+    set(X64NATIVE_DYNAREC_PASS
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_helper.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_emit_tests.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_emit_math.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_emit_logic.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_emit_shift.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_00.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_0f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_66.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_d8.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_d9.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_da.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_db.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_dc.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_dd.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_de.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_df.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_f0.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_660f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_66f20f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_66f30f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_66f0.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_f20f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_f30f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_0f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_0f38.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_66_0f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_f2_0f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_f3_0f.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_66_0f38.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_66_0f3a.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_f2_0f38.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_f2_0f3a.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/dynarec_arm64_avx_f3_0f38.c"
+        "${BOX64_ROOT}/src/dynarec/arm64/updateflags_arm64_pass.c"
+        # Added by the real CMakeLists.txt's own `if(DYNAREC)` block
+        # (CMakeLists.txt:1248-1253) on top of the ARM_DYNAREC-specific
+        # list above -- confirmed genuinely needed (not the also-listed
+        # wrapper.h alongside it there, which src/wrapped/generated/
+        # wrapper.h turns out to be a pre-generated, already-checked-in
+        # file that dynarec_native_pass.c doesn't even #include -- no
+        # extra generation step needed for it, verified by grep and by
+        # `git log` on the file itself). wowbox64.dll inherits this same
+        # file via the nested-config mechanism described in the
+        # WINE_NX_BUILD_WOWBOX64 section's own comments above; an earlier
+        # draft of this list omitted it by not tracing that inheritance.
+        "${BOX64_ROOT}/src/dynarec/dynarec_native_pass.c"
+    )
+    # Copied field-for-field from the top-level CMakeLists.txt's own
+    # `set(INTERPRETER ...)` (CMakeLists.txt:544-577), actually re-read in
+    # full to produce this list (an earlier draft of this file reconstructed
+    # it from memory and got it wrong: missing x64runavx.c/x64runavxf20f38.c/
+    # x64runavxf30f38.c/x64runavxf20f3a.c/x64runavxf30f3a.c, and wrongly
+    # included x64syscall.c/x86int3.c/x64int3.c -- see below for why those
+    # three are excluded on purpose, not by omission).
+    set(X64NATIVE_INTERPRETER
+        "${BOX64_ROOT}/src/emu/x64run.c"
+        "${BOX64_ROOT}/src/emu/x64run0f.c"
+        "${BOX64_ROOT}/src/emu/x64run66.c"
+        "${BOX64_ROOT}/src/emu/x64run660f.c"
+        "${BOX64_ROOT}/src/emu/x64run66f20f.c"
+        "${BOX64_ROOT}/src/emu/x64run66f30f.c"
+        "${BOX64_ROOT}/src/emu/x64run66d9.c"
+        "${BOX64_ROOT}/src/emu/x64run66dd.c"
+        "${BOX64_ROOT}/src/emu/x64run66f0.c"
+        "${BOX64_ROOT}/src/emu/x64rund8.c"
+        "${BOX64_ROOT}/src/emu/x64rund9.c"
+        "${BOX64_ROOT}/src/emu/x64runda.c"
+        "${BOX64_ROOT}/src/emu/x64rundb.c"
+        "${BOX64_ROOT}/src/emu/x64rundc.c"
+        "${BOX64_ROOT}/src/emu/x64rundd.c"
+        "${BOX64_ROOT}/src/emu/x64runde.c"
+        "${BOX64_ROOT}/src/emu/x64rundf.c"
+        "${BOX64_ROOT}/src/emu/x64runf0.c"
+        "${BOX64_ROOT}/src/emu/x64runf20f.c"
+        "${BOX64_ROOT}/src/emu/x64runf30f.c"
+        "${BOX64_ROOT}/src/emu/x64runavx.c"
+        "${BOX64_ROOT}/src/emu/x64runavx0f.c"
+        "${BOX64_ROOT}/src/emu/x64runavx0f38.c"
+        "${BOX64_ROOT}/src/emu/x64runavx660f.c"
+        "${BOX64_ROOT}/src/emu/x64runavxf20f.c"
+        "${BOX64_ROOT}/src/emu/x64runavxf30f.c"
+        "${BOX64_ROOT}/src/emu/x64runavx660f38.c"
+        "${BOX64_ROOT}/src/emu/x64runavx660f3a.c"
+        "${BOX64_ROOT}/src/emu/x64runavxf20f38.c"
+        "${BOX64_ROOT}/src/emu/x64runavxf30f38.c"
+        "${BOX64_ROOT}/src/emu/x64runavxf20f3a.c"
+        "${BOX64_ROOT}/src/emu/x64runavxf30f3a.c"
+    )
+    # x64syscall.c/x86int3.c/x64int3.c deliberately excluded, matching
+    # wowbox64.c's own already-hardware-validated choice (its
+    # WOW64_BOX64CPU_SRC list excludes all three too -- read in full,
+    # confirmed, not assumed): x86int3.c is BOX32-gated in the real
+    # CMakeLists.txt (line 509, inside `if(BOX32)`) and irrelevant to
+    # either guest bitness this project hosts. x64syscall.c implements
+    # box64's own Linux-style syscall-number dispatch (x64Syscall(), which
+    # real Linux hosting's EmuX64Syscall calls into, per src/os/os_linux.c)
+    # -- not used here, since this build's own EmuX64Syscall
+    # (src/os/os_horizon.c, #ifdef WINE_NX_X64NATIVE) calls
+    # wine_nx_do_syscall() directly instead, the same way wowbox64.c's
+    # EmitInterruptionImpl bypasses it for the 32-bit case. x64int3.c is
+    # part of the *full* ELFLOADER_SRC build's base list (CMakeLists.txt
+    # line 455, unconditional there) but wowbox64.c doesn't need it either
+    # -- EmuInt3() (used by emit_signal_wine.c, which IS in this build) is
+    # invoked from the interpreter files already included above, not from
+    # x64int3.c itself.
+
+    set(X64NATIVE_DYNACACHE_HASH_HEADER "${BOX64_ROOT}/src/dynacache_hashes.h")
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_custom_command(
+        OUTPUT "${X64NATIVE_DYNACACHE_HASH_HEADER}"
+        COMMAND "${Python3_EXECUTABLE}" "${BOX64_ROOT}/tools/gen_dynacache_hashes.py"
+            --root "${BOX64_ROOT}"
+            --output "${X64NATIVE_DYNACACHE_HASH_HEADER}"
+        # gen_dynacache_hashes.py itself does an rglob("*") over the whole
+        # BOX64_ROOT tree, so its true inputs are impractical to list here
+        # exhaustively -- DEPENDS on the script itself is a floor, not a
+        # complete dependency, but it's a real improvement over the
+        # original version of this command, which had no DEPENDS at all
+        # and therefore never re-ran once its OUTPUT file existed: found
+        # the hard way mid compile-error campaign, when this command
+        # turned out to have been silently reusing a stale
+        # dynacache_hashes.h left over from an earlier wowbox64.dll build
+        # session three days prior (dynacache_hashes.h is generated
+        # in-tree, at a path both build configurations share).
+        DEPENDS "${BOX64_ROOT}/tools/gen_dynacache_hashes.py"
+        BYPRODUCTS "${X64NATIVE_DYNACACHE_HASH_HEADER}"
+        VERBATIM
+    )
+    add_custom_target(x64native-generate-dynacache-hashes DEPENDS "${X64NATIVE_DYNACACHE_HASH_HEADER}")
+
+    set(X64NATIVE_INCLUDES
+        "${BOX64_ROOT}/src/include"
+        "${BOX64_ROOT}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine/include"
+        ${WINE_SWITCH_NTDLL_INCLUDES}
+    )
+    # wine/include added on top of the original list here (found the hard
+    # way mid compile-error campaign: "wine/compiler.h: No such file or
+    # directory" building os_horizon.c/hostext_wine.c) -- it holds ONLY
+    # wine/include/wine/{compiler,debug}.h, genuine Wine-extension headers
+    # with no Windows-SDK equivalent at all, nothing resembling
+    # windows.h/winternl.h at its own top level (confirmed: `find
+    # third_party/box64/wine/include -maxdepth 1 -type f` returns
+    # nothing), so adding it carries none of the shadowing risk described
+    # below for a plain windows.h.
+    #
+    # WINE_SWITCH_NTDLL_INCLUDES is still what resolves <windows.h>/
+    # <winternl.h> itself -- deliberately: box64's own wine/include/ is
+    # shaped for the aarch64-w64-mingw32/llvm-mingw sysroot wowbox64.dll
+    # uses, a DIFFERENT (if similar) windows.h from this project's own
+    # real ../include/windows.h that every other native/devkitA64 object
+    # library in this file already builds against (wine-horizon-real,
+    # wine-ntdll-loader-real, ...). Mixing the two
+    # risks real type/macro conflicts; reusing the already-proven one is
+    # both simpler and consistent with everything else in this file.
+    set(X64NATIVE_DEFS ${WINE_SWITCH_NTDLL_DEFS})
+    # __WINESRC__ dropped, unlike every other consumer of
+    # WINE_SWITCH_NTDLL_DEFS in this file: it does not mean "building
+    # against Wine headers" (a reasonable-sounding but wrong guess this
+    # list started with) -- it specifically means "this translation unit
+    # IS Wine's own internal source," and winbase.h uses it to POISON raw
+    # strncpy()/wcsncpy() calls (rewrites them to a deliberately-broken
+    # macro, `error do_not_use_strncpy_...`), forcing genuine Wine source
+    # to use lstrcpynA/memcpy instead -- confirmed by reading the actual
+    # #if/#else structure in include/winbase.h (~line 2542-2630), not
+    # guessed, after a real devkitA64 build reproduced the exact
+    # corrupted line (my_cpuid.c's own strncpy call, poisoned this way).
+    # Box64 is third-party code that treats <windows.h> as a normal
+    # application header (see src/include/os.h's own `#ifndef _WIN32`
+    # design) -- it was never "Wine's own source" and must not get this
+    # define, the same way an ordinary Windows application wouldn't.
+    list(REMOVE_ITEM X64NATIVE_DEFS __WINESRC__)
+    # Same reasoning, same fix, for the same class of bug: WINE_UNIX_LIB
+    # means "this translation unit IS wine-nx's own unix-side/native
+    # implementation code" (dlls/ntdll/unix/*.c) -- under it,
+    # include/winbase.h's own GetProcessHeap/GetLastError/SetLastError
+    # aren't declared *at all* (that branch, ~winbase.h:2662, only
+    # defines GetCurrentProcess/GetCurrentThread/GetCurrentProcessId/
+    # GetCurrentThreadId as macros -- unix-side code reaches the process
+    # heap directly, with no GetProcessHeap()-style indirection needed).
+    # Confirmed via a real devkitA64 build failing exactly there
+    # (os_horizon.c calling GetProcessHeap(), "implicit declaration").
+    # Box64 is neither Wine's own source nor its unix-side implementation
+    # -- it's third-party code that needs the same externally-facing
+    # WINBASEAPI declarations any application would get.
+    list(REMOVE_ITEM X64NATIVE_DEFS WINE_UNIX_LIB)
+    list(APPEND X64NATIVE_DEFS
+        WINE_NX_X64NATIVE
+        DYNAREC
+        ARM64
+        _WIN32
+        WIN32_LEAN_AND_MEAN
+    )
+    # WIN32_LEAN_AND_MEAN: standard Windows SDK convention, not something
+    # new -- without __WINESRC__ (removed above), windows.h's own
+    # `#ifndef __WINESRC__` / `#ifndef WIN32_LEAN_AND_MEAN` block (~line
+    # 48-80) pulls in a large "not so essential" bundle box64 has no use
+    # for (winscard.h, mmsystem.h, nb30.h, ddeml.h, ole2.h, winspool.h,
+    # ...) -- found the hard way, via a real devkitA64 build failing on
+    # winscard.h needing wtypes.h, which this include environment doesn't
+    # have. Any ordinary third-party Windows application defines this for
+    # the same reason; box64 (via os.h's own `#ifndef _WIN32` design)
+    # already treats itself as exactly that kind of application.
+    # _WIN32: box64's own src/include/os.h already branches on this --
+    # `#ifndef _WIN32` pulls in <dlfcn.h>/<sys/mman.h> and expects a real
+    # POSIX host; the #else side (no dlfcn.h/sys/mman.h) declares
+    # mmap/munmap/mprotect and PROT_*/MAP_* itself, matching os_horizon.c's
+    # existing definitions of those three functions exactly. This is not
+    # a new mechanism -- box64 already uses it throughout (custommem.c,
+    # dynarec_native.c, x64emu.c, and others all branch on _WIN32 too);
+    # the wowbox64.dll build never had to think about this because
+    # aarch64-w64-mingw32-clang predefines both _WIN32 and _WIN64
+    # automatically as part of its target triple (confirmed via
+    # `echo | aarch64-w64-mingw32-clang -dM -E -`), which devkitA64's bare
+    # aarch64-none-elf-gcc does neither of. WINE_SWITCH_NTDLL_DEFS above
+    # already carries _WIN64; this adds the missing _WIN32 explicitly.
+    # First real compile error found by the actual Docker/devkitA64 build
+    # (attempt 1: os.h:8:10, "fatal error: dlfcn.h: No such file or
+    # directory") -- fixed by using box64's own existing switch, not by
+    # adding a new stub header.
+
+    add_library(x64native_dynarec_pass0 OBJECT ${X64NATIVE_DYNAREC_PASS})
+    add_library(x64native_dynarec_pass1 OBJECT ${X64NATIVE_DYNAREC_PASS})
+    add_library(x64native_dynarec_pass2 OBJECT ${X64NATIVE_DYNAREC_PASS})
+    add_library(x64native_dynarec_pass3 OBJECT ${X64NATIVE_DYNAREC_PASS})
+    add_library(x64native_interpreter   OBJECT ${X64NATIVE_INTERPRETER})
+    set_target_properties(x64native_dynarec_pass0 PROPERTIES COMPILE_DEFINITIONS "STEP=0")
+    set_target_properties(x64native_dynarec_pass1 PROPERTIES COMPILE_DEFINITIONS "STEP=1")
+    set_target_properties(x64native_dynarec_pass2 PROPERTIES COMPILE_DEFINITIONS "STEP=2")
+    set_target_properties(x64native_dynarec_pass3 PROPERTIES COMPILE_DEFINITIONS "STEP=3")
+
+    add_library(x64native-core OBJECT
+        ${X64NATIVE_BOX64CPU_SRC}
+        ${X64NATIVE_DYNAREC_ASM}
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine/x64native/x64native.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine/x64native/x64native_globals.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine/x64native/x64native_rtl.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine/x64native/x64native_rtl.S"
+    )
+    # x64native_rtl.S: RtlCaptureContext, plain ARM64 register-capture
+    # assembly with no LSE instructions at all -- unlike
+    # X64NATIVE_DYNAREC_ASM, it does NOT need the armv8.1-a bump (that
+    # section's own comment explains why arm64_lock.S alone does), so
+    # it's kept out of that list and left on the toolchain's own default
+    # -march=armv8-a+crc+crypto.
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64/wine/x64native/x64native_rtl.S"
+        PROPERTIES LANGUAGE ASM)
+    add_dependencies(x64native-core x64native-generate-dynacache-hashes)
+
+    foreach(X64NATIVE_TGT IN ITEMS
+            x64native_dynarec_pass0 x64native_dynarec_pass1
+            x64native_dynarec_pass2 x64native_dynarec_pass3
+            x64native_interpreter x64native-core)
+        target_compile_definitions(${X64NATIVE_TGT} PRIVATE ${X64NATIVE_DEFS})
+        target_include_directories(${X64NATIVE_TGT} PRIVATE ${X64NATIVE_INCLUDES})
+        target_compile_options(${X64NATIVE_TGT} PRIVATE
+            -std=gnu11 -w
+            $<$<COMPILE_LANGUAGE:C>:-include;stdarg.h>)
+        # $<COMPILE_LANGUAGE:C> guard: x64native-core also compiles real
+        # .S assembly sources (X64NATIVE_DYNAREC_ASM) through this same
+        # foreach -- a plain, ungated -include stdarg.h applies to every
+        # source regardless of language, and GCC's assembler chokes
+        # immediately on stdarg.h's C `typedef` syntax ("unknown mnemonic
+        # `typedef'"), confirmed via a real devkitA64 build. -include
+        # stdarg.h: some box64 files (src/os/hostext_wine.c,
+        # confirmed via a real devkitA64 build) include
+        # winternl.h/windef.h directly rather than the full windows.h --
+        # windows.h itself includes <stdarg.h> before <windef.h> (see
+        # include/windows.h:37-38), which is what makes va_list already
+        # visible by the time minwindef.h's `#define __ms_va_list
+        # va_list` (now reachable after removing WINE_UNIX_LIB above)
+        # needs it elsewhere. Force-including it here matches this
+        # file's own established pattern for exactly this situation
+        # (wine-ntdll-loader-real's `-include ntdll_loader_compat.h`
+        # above) and fixes it for every file in one place instead of
+        # editing each box64 .c file's own include order.
+        # -w (not -Wall -Wextra -Werror=implicit-function-declaration like
+        # this file's own sources): box64 is a large, external codebase
+        # with its own warning posture; enforcing this project's own
+        # -Werror=implicit-function-declaration against it is how the
+        # compile-error campaign starts, not something to silence, BUT
+        # doing so file-by-file as errors are actually found is more
+        # tractable than fighting box64's entire warning surface at once
+        # sight-unseen. Tighten this once the first clean build exists.
+        add_dependencies(${X64NATIVE_TGT} x64native-generate-dynacache-hashes)
+    endforeach()
+    set_source_files_properties(${X64NATIVE_DYNAREC_ASM} PROPERTIES LANGUAGE ASM)
+    # arm64_lock.S uses ARMv8.1 LSE atomics (casal/swpal) for its fast
+    # path -- the base -march=armv8-a this toolchain sets globally
+    # (cmake/switch-devkitA64.cmake, matching the Switch's real Cortex-A57
+    # CPU, which is ARMv8.0 and has no LSE in hardware) doesn't recognize
+    # them at the assembler level at all (confirmed via a real devkitA64
+    # build: "selected processor does not support `casal w2,w1,[x0]'").
+    #
+    # This is NOT a hardware-compatibility risk despite that, though --
+    # verified by reading the actual .S source (not assumed): every LSE
+    # instruction is reached only through a runtime check first
+    # (`adrp/ldr cpuext; tbnz w3, #0, arm64_atomic_...`), falling back to
+    # portable ldaxr/stlxr LL/SC loops otherwise, which work on any ARM64
+    # CPU including real Cortex-A57. On real hardware cpuext's LSE bit
+    # will read false (A57 genuinely can't do LSE), so this code is
+    # encoded but never executed there -- the same reasoning that already
+    # justifies wowbox64.dll's own build using -mcpu=cortex-a76 (which
+    # also enables LSE) for this exact file, hardware-proven working.
+    # Bumping to armv8.1-a (the minimum ISA level LSE was introduced in)
+    # rather than copying cortex-a76 specifically, to change as little as
+    # possible relative to the toolchain's own base -march=armv8-a+crc+crypto.
+    set_source_files_properties(${X64NATIVE_DYNAREC_ASM} PROPERTIES
+        COMPILE_OPTIONS "-march=armv8.1-a+crc+crypto")
+
+    # wine-ntdll-loader-real (dlls/ntdll/loader.c, defined above) needs
+    # WINE_NX_X64NATIVE to compile wine_nx_x64_handoff() at all, and needs
+    # this submodule's wine/ dir on its include path to resolve
+    # #include "wine/x64native.h". Both applied via generator expression so
+    # the DEFAULT (WINE_NX_BUILD_X64NATIVE=OFF) build of this same object
+    # library -- shared by wine-nx-runtime, wine-nx-runtime-deko3d, AND
+    # every smoke-test executable -- is completely unchanged; only turning
+    # this option on recompiles it with the new macro. Safe even for
+    # consumers that don't link x64native-core because wine_nx_x64_handoff()
+    # declares its four box64-side dependencies __attribute__((weak)) (see
+    # loader.c's own comment on that) -- verified least risky given the
+    # BOOL generator expression only takes effect for consumers of THIS
+    # object library, not a global define.
+    target_compile_definitions(wine-ntdll-loader-real PRIVATE
+        $<$<BOOL:${WINE_NX_BUILD_X64NATIVE}>:WINE_NX_X64NATIVE>)
+    target_include_directories(wine-ntdll-loader-real PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/box64")
+    # NOT .../third_party/box64/wine -- loader.c includes
+    # "wine/x64native.h" (a quoted, wine/-prefixed path, matching how
+    # every other file in the box64 tree refers to its own wine/
+    # subdirectory), so the include path needs to be one level higher,
+    # at box64's own root, for that path to resolve at all. Found via
+    # the actual link attempt failing with "wine/x64native.h: No such
+    # file or directory" -- the original version of this line pointed
+    # one directory too deep.
+
+    # Linked into wine-nx-runtime specifically (not wine-nx-runtime-deko3d,
+    # the software-render variant -- out of scope for this pass, add
+    # later if needed) via target_sources() rather than editing that
+    # add_executable() call above, so the default build's source list is
+    # untouched either way.
+    target_sources(wine-nx-runtime PRIVATE
+        $<TARGET_OBJECTS:x64native_dynarec_pass0>
+        $<TARGET_OBJECTS:x64native_dynarec_pass1>
+        $<TARGET_OBJECTS:x64native_dynarec_pass2>
+        $<TARGET_OBJECTS:x64native_dynarec_pass3>
+        $<TARGET_OBJECTS:x64native_interpreter>
+        $<TARGET_OBJECTS:x64native-core>
+    )
+    # Same objects, into wine-nx-launcher too (defined further down this
+    # file) -- the merged single-NRO build's whole point is running the
+    # identical 64-bit x86 guest path this gives wine-nx-runtime, not a
+    # second copy of it.
+    target_sources(wine-nx-launcher PRIVATE
+        $<TARGET_OBJECTS:x64native_dynarec_pass0>
+        $<TARGET_OBJECTS:x64native_dynarec_pass1>
+        $<TARGET_OBJECTS:x64native_dynarec_pass2>
+        $<TARGET_OBJECTS:x64native_dynarec_pass3>
+        $<TARGET_OBJECTS:x64native_interpreter>
+        $<TARGET_OBJECTS:x64native-core>
+    )
+endif()
