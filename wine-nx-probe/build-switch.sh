@@ -228,6 +228,15 @@ fi
 if [ -f "$BUILD_DIR/wine-nx-runtime-deko3d.nro" ]; then
     echo "Built $BUILD_DIR/wine-nx-runtime-deko3d.nro"
 fi
+if [ -f "$BUILD_DIR/wine-nx-vulkan-runtime.nro" ]; then
+    echo "Built $BUILD_DIR/wine-nx-vulkan-runtime.nro"
+fi
+if [ -f "$BUILD_DIR/wine-nx-jit-smoke.nro" ]; then
+    echo "Built $BUILD_DIR/wine-nx-jit-smoke.nro"
+fi
+if [ -f "$BUILD_DIR/wine-nx-launcher.nro" ]; then
+    echo "Built $BUILD_DIR/wine-nx-launcher.nro"
+fi
 
 if [ -d "$WINE_PE_BUILD_DIR" ]; then
     for module in "${REQUIRED_WINE_DLL_MODULES[@]}"; do
@@ -415,6 +424,30 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
     fi
     if [ -f "$BUILD_DIR/wine-nx-runtime-deko3d.nro" ]; then
         cp "$BUILD_DIR/wine-nx-runtime-deko3d.nro" "$PACKAGE_DIR/wine-nx-runtime-deko3d.nro"
+    fi
+    # Same wine-nx-runtime.elf as "Wine-NX Runtime" above, just its own
+    # distinctly-titled hbmenu entry (see CMakeLists.txt's
+    # wine-nx-vulkan-runtime-nro target) so a Vulkan test run is
+    # unambiguous. Reads the same target.txt as every other entry here.
+    if [ -f "$BUILD_DIR/wine-nx-vulkan-runtime.nro" ]; then
+        cp "$BUILD_DIR/wine-nx-vulkan-runtime.nro" "$PACKAGE_DIR/wine-nx-vulkan-runtime.nro"
+    fi
+    # source/gui/nxtest.c's auto-test mode envSetNextLoad's straight to this
+    # by name (sdmc:/switch/wine/wine-nx-jit-smoke.nro) as its one real,
+    # wired-end-to-end test entry -- see that file's own comment on why the
+    # other 8 entries are protocol-only for now. Wasn't previously staged at
+    # all (a pre-existing gap, unrelated to this feature, but auto-test mode
+    # now depends on it being here).
+    if [ -f "$BUILD_DIR/wine-nx-jit-smoke.nro" ]; then
+        cp "$BUILD_DIR/wine-nx-jit-smoke.nro" "$PACKAGE_DIR/wine-nx-jit-smoke.nro"
+    fi
+    # The launcher itself -- see CMakeLists.txt's wine-nx-launcher-nro target
+    # and source/launcher_main.c. This is the one users actually run from
+    # hbmenu; every other .nro staged in this directory is either a backend
+    # runtime it hands off to or a standalone smoke test its auto-test mode
+    # chains through.
+    if [ -f "$BUILD_DIR/wine-nx-launcher.nro" ]; then
+        cp "$BUILD_DIR/wine-nx-launcher.nro" "$PACKAGE_DIR/wine-nx-launcher.nro"
     fi
     # GUI smoke app: WINE_NX_APP=gui stages the win32u software-window test exe.
     if [ "$APP_KIND" = "gui" ]; then

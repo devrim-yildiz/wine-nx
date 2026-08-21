@@ -840,6 +840,124 @@ target_link_options(wine-nx-runtime-deko3d PRIVATE -Wl,--gc-sections)
 target_link_libraries(wine-nx-runtime-deko3d PRIVATE
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} deko3d nx m)
 
+wine_nx_link_vulkan(wine-nx-runtime-deko3d)
+
+# --- Launcher: the single "run this from hbmenu" entry point ---------------
+# See source/launcher_main.c's own header comment and source/gui/ for the
+# full design (Cemu-style game library: touch+joycon, per-game backend/
+# bitness overrides, a debug overlay, auto-test mode). Deliberately its own
+# small binary with no deko3d/Vulkan/box64 linked in at all -- it never
+# references nwindowGetDefault() for any GPU-backed purpose, only the same
+# plain libnx Framebuffer path wine-nx-runtime.nro itself falls back to, so
+# it can't trip the pre-main() __nx_win_init() conflict documented above and
+# in wine-nx-probe/3d-accel-scoping.md. Picking a backend/game hands off to a
+# separate already-built binary (wine-nx-runtime.nro or
+# wine-nx-vulkan-runtime.nro) via envSetNextLoad; see resolve_runtime_nro()
+# in launcher_main.c.
+# wine-nx-launcher is the "single NRO" merge: this project's actual PE
+# loader/box64 engine (the exact same sources and $<TARGET_OBJECTS:...>
+# object libraries wine-nx-runtime links below, byte-for-byte -- not a
+# second, parallel implementation of any of it) compiled into the same
+# binary as the GUI. See source/nx_arch.c for the in-process entry point
+# that replaces envSetNextLoad+exit for GDI-backend games, and
+# source/runtime_boot.h for why "the game closes, you're back at the
+# library screen" is NOT what this buys you -- wine_nx_x64_handoff()/
+# wine_nx_wow64_handoff() never return once a guest is running
+# successfully, merged into one binary or not; when the guest process
+# exits, the whole Horizon process exits with it, same as running
+# wine-nx-runtime.nro standalone today. Vulkan-backend games still hand
+# off to the separate wine-nx-vulkan-runtime.nro exactly as before --
+# deliberately not merged, since this binary already references
+# nwindowGetDefault() for its own GUI framebuffer (see
+# 3d-accel-scoping.md for why that specific combination is the one that
+# actually breaks).
+add_executable(wine-nx-launcher
+    source/launcher_main.c
+    source/nx_arch.c
+    source/nx_diagnostics.c
+    source/runtime.c
+    source/runtime_deko3d.c
+    source/runtime_platform.c
+    source/ntdll_pe_compat.c
+    source/ws2_32_unix_stub.c
+    source/gui/nxgui.c
+    source/gui/nxgui_font.c
+    source/gui/nxgui_pe_icon.c
+    source/gui/nxgui_png_mini.c
+    source/gui/nxinput.c
+    source/gui/nxlib.c
+    source/gui/nxmenu.c
+    source/gui/nxmenu_library.c
+    source/gui/nxmenu_detail.c
+    source/gui/nxmenu_mod_manager.c
+    source/gui/nxmenu_controller.c
+    source/gui/nxmenu_quickmenu.c
+    source/gui/nx_discord.c
+    source/gui/nxtoast.c
+    source/gui/nxdebug.c
+    source/gui/nxtest.c
+    $<TARGET_OBJECTS:wine-horizon-real>
+    $<TARGET_OBJECTS:wine-server-real>
+    $<TARGET_OBJECTS:wine-sync-real>
+    $<TARGET_OBJECTS:wine-file-real>
+    $<TARGET_OBJECTS:wine-thread-real>
+    $<TARGET_OBJECTS:wine-virtual-real>
+    $<TARGET_OBJECTS:wine-signal-arm64-real>
+    $<TARGET_OBJECTS:wine-env-real>
+    $<TARGET_OBJECTS:wine-debug-real>
+    $<TARGET_OBJECTS:wine-system-real>
+    $<TARGET_OBJECTS:wine-loadorder-real>
+    $<TARGET_OBJECTS:wine-loader-unix-real>
+    $<TARGET_OBJECTS:wine-ntdll-loader-real>
+    $<TARGET_OBJECTS:wine-registry-real>
+    $<TARGET_OBJECTS:wine-security-real>
+    $<TARGET_OBJECTS:wine-process-real>
+    $<TARGET_OBJECTS:wine-socket-real>
+    $<TARGET_OBJECTS:wine-serial-real>
+    $<TARGET_OBJECTS:wine-cdrom-real>
+    $<TARGET_OBJECTS:wine-tape-real>
+    $<TARGET_OBJECTS:wine-win32u-real>
+)
+
+set_target_properties(wine-nx-launcher PROPERTIES SUFFIX ".elf")
+
+# WINE_NX_MERGED_LAUNCHER suppresses runtime.c's own main() (see that
+# file's own #ifndef around it) -- this binary's real entry point is
+# launcher_main.c's main(), which owns the GUI's own boot sequence and
+# only reaches into runtime.c's boot-and-run path (via nx_arch.c) once
+# the user actually picks a game.
+target_compile_definitions(wine-nx-launcher PRIVATE ${WINE_SWITCH_NTDLL_DEFS} WINE_NX_MERGED_LAUNCHER)
+
+target_compile_options(wine-nx-launcher PRIVATE
+    -std=gnu99
+    -Wall
+    -Wextra
+    -Werror=implicit-function-declaration
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_include_directories(wine-nx-launcher PRIVATE
+    ${WINE_SWITCH_NTDLL_INCLUDES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/source"
+    "${CMAKE_CURRENT_SOURCE_DIR}/source/gui"
+)
+
+target_link_options(wine-nx-launcher PRIVATE -Wl,--gc-sections)
+
+# Same freetype/harfbuzz/png/bz2/z/deko3d/nx/m set wine-nx-runtime links
+# below, for the same reason (win32u's font rendering + the loader's own
+# needs) -- deko3d itself is linked but, same as wine-nx-runtime's own
+# plain (non -deko3d-only) build, never actually initialized by this
+# binary; only wine-nx-runtime-deko3d.elf (wrapped as both
+# wine-nx-runtime-deko3d.nro and wine-nx-vulkan-runtime.nro) is compiled
+# with WINE_NX_DEKO3D_ONLY and calls it. nxgui_png_mini.c also needs
+# zlib's inflate for PNG-format icon resources, already covered by the
+# same ${SWITCH_Z}.
+target_link_libraries(wine-nx-launcher PRIVATE
+    ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} deko3d nx m)
+wine_nx_link_vulkan(wine-nx-launcher)
+
 find_program(NACPTOOL nacptool HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(ELF2NRO elf2nro HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
 find_program(UAM uam HINTS "$ENV{DEVKITPRO}/tools/bin" "/opt/devkitpro/tools/bin")
@@ -896,10 +1014,14 @@ if(NACPTOOL AND ELF2NRO)
     set(RUNTIME_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime.nro")
     set(RUNTIME_DEKO3D_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime-deko3d.nacp")
     set(RUNTIME_DEKO3D_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-runtime-deko3d.nro")
+    set(VULKAN_RUNTIME_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-vulkan-runtime.nacp")
+    set(VULKAN_RUNTIME_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-vulkan-runtime.nro")
+    set(LAUNCHER_NACP_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-launcher.nacp")
+    set(LAUNCHER_NRO_FILE "${CMAKE_CURRENT_BINARY_DIR}/wine-nx-launcher.nro")
 
     add_custom_command(
         OUTPUT "${NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX Probe" "Codex" "0.1.0" "${NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX Probe" "voric" "0.1.0" "${NACP_FILE}"
         VERBATIM
     )
 
@@ -914,7 +1036,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE Smoke" "Codex" "0.1.0" "${PE_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE Smoke" "voric" "0.1.0" "${PE_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -929,7 +1051,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_REAL_REPORT_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Report" "Codex" "0.1.0" "${PE_REAL_REPORT_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Report" "voric" "0.1.0" "${PE_REAL_REPORT_NACP_FILE}"
         VERBATIM
     )
 
@@ -944,7 +1066,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_REAL_RUN_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Run" "Codex" "0.1.0" "${PE_REAL_RUN_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE Real Run" "voric" "0.1.0" "${PE_REAL_RUN_NACP_FILE}"
         VERBATIM
     )
 
@@ -959,7 +1081,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${PE_NTDLL_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX PE NTDLL Smoke" "Codex" "0.1.0" "${PE_NTDLL_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX PE NTDLL Smoke" "voric" "0.1.0" "${PE_NTDLL_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -974,7 +1096,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${NTDLL_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL Smoke" "Codex" "0.1.0" "${NTDLL_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL Smoke" "voric" "0.1.0" "${NTDLL_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -989,7 +1111,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${JIT_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX JIT Smoke" "Codex" "0.1.0" "${JIT_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX JIT Smoke" "voric" "0.1.0" "${JIT_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -1004,7 +1126,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${NTDLL_FILE_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL File Smoke" "Codex" "0.1.0" "${NTDLL_FILE_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX NTDLL File Smoke" "voric" "0.1.0" "${NTDLL_FILE_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -1019,7 +1141,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${DEKO3D_SMOKE_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX deko3d Smoke" "Codex" "0.1.0" "${DEKO3D_SMOKE_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX deko3d Smoke" "voric" "0.1.0" "${DEKO3D_SMOKE_NACP_FILE}"
         VERBATIM
     )
 
@@ -1041,7 +1163,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${RUNTIME_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime" "Codex" "0.1.0" "${RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime" "voric" "0.1.0" "${RUNTIME_NACP_FILE}"
         VERBATIM
     )
 
@@ -1056,7 +1178,7 @@ if(NACPTOOL AND ELF2NRO)
 
     add_custom_command(
         OUTPUT "${RUNTIME_DEKO3D_NACP_FILE}"
-        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime (deko3d)" "Codex" "0.1.0" "${RUNTIME_DEKO3D_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX Runtime (deko3d)" "voric" "0.1.0" "${RUNTIME_DEKO3D_NACP_FILE}"
         VERBATIM
     )
 
@@ -1068,6 +1190,52 @@ if(NACPTOOL AND ELF2NRO)
     )
 
     add_custom_target(wine-nx-runtime-deko3d-nro ALL DEPENDS "${RUNTIME_DEKO3D_NRO_FILE}")
+
+    # "Vulkan Runtime": wraps wine-nx-runtime-deko3d.elf, NOT the plain
+    # wine-nx-runtime.elf. Hardware-confirmed why: my own Vulkan surface
+    # creation needs viOpenDefaultDisplay() to succeed (a dedicated
+    # ViDisplay/ViLayer, same as deko3d's own -- see winnx_vulkan.c), but
+    # the plain runtime still references nwindowGetDefault()/consoleInit()
+    # for its libnx-framebuffer fallback path, which trips libnx's
+    # __nx_win_init() pre-main() bootstrap and claims the default vi
+    # session before any user code runs -- the exact same conflict
+    # documented for deko3d in wine-nx-probe/3d-accel-scoping.md, and the
+    # reason wine-nx-runtime-deko3d (WINE_NX_DEKO3D_ONLY, compiles those
+    # references out entirely) exists as a separate binary in the first
+    # place. Confirmed on real hardware: with the plain runtime, this
+    # Vulkan path got exactly viOpenDefaultDisplay rc=0x1272 (LibnxError_
+    # AlreadyInitialized). wine_nx_link_vulkan() already links NVK into
+    # wine-nx-runtime-deko3d too (see above), so no new build wiring is
+    # needed here -- just pointing elf2nro at the right target.
+    add_custom_command(
+        OUTPUT "${VULKAN_RUNTIME_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Vulkan Runtime" "voric" "0.1.0" "${VULKAN_RUNTIME_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${VULKAN_RUNTIME_NRO_FILE}"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-runtime-deko3d>" "${VULKAN_RUNTIME_NRO_FILE}" "--nacp=${VULKAN_RUNTIME_NACP_FILE}"
+        DEPENDS wine-nx-runtime-deko3d "${VULKAN_RUNTIME_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_target(wine-nx-vulkan-runtime-nro ALL DEPENDS "${VULKAN_RUNTIME_NRO_FILE}")
+
+    add_custom_command(
+        OUTPUT "${LAUNCHER_NACP_FILE}"
+        COMMAND "${NACPTOOL}" --create "Wine-NX" "voric" "0.1.0" "${LAUNCHER_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${LAUNCHER_NRO_FILE}"
+        COMMAND "${ELF2NRO}" "$<TARGET_FILE:wine-nx-launcher>" "${LAUNCHER_NRO_FILE}" "--nacp=${LAUNCHER_NACP_FILE}"
+        DEPENDS wine-nx-launcher "${LAUNCHER_NACP_FILE}"
+        VERBATIM
+    )
+
+    add_custom_target(wine-nx-launcher-nro ALL DEPENDS "${LAUNCHER_NRO_FILE}")
 endif()
 
 # --- WowBox64 (Box64's WOW64 CPU-backend build) -----------------------------

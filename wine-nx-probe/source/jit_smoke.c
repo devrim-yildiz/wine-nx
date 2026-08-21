@@ -448,6 +448,44 @@ int main( int argc, char *argv[] )
         log_line( "[JIT] phase 1 did not fully pass -- SKIPPING phase 2/3 (would be uninterpretable)" );
 
 wait_exit:
+    /* "Chained" mode: the wine-nx launcher's auto-test mode (source/gui/
+     * nxtest.c) drives this binary the same way build-switch.sh's
+     * WINE_NX_APP targets drive wine-nx-runtime.nro -- envSetNextLoad
+     * straight into it, no argv. Its presence is detected the same way
+     * nxtest.c's own protocol defines: autotest_index.txt existing means
+     * a chain is in progress. When chained, skip the interactive
+     * "press + to exit" wait entirely (there's no launcher UI standing by
+     * to notice a manual button press -- the whole point of auto-test
+     * mode is running unattended) and report straight back: write
+     * autotest_result.txt with this test's real, already-computed phase-1
+     * outcome (PASS iff all 8 rounds passed -- matches this file's own
+     * header comment, "Phase 1 hardware-confirmed 8/8 pass"), then hand
+     * control back to the launcher via envSetNextLoad instead of exiting
+     * to hbmenu. Standalone launches (no chain marker present) behave
+     * exactly as before -- this is strictly additive. */
+    {
+        FILE *idx_check = fopen( "sdmc:/switch/wine/autotest_index.txt", "r" );
+        int chained = (idx_check != NULL);
+        if (idx_check) fclose( idx_check );
+
+        if (chained)
+        {
+            FILE *result_file = fopen( "sdmc:/switch/wine/autotest_result.txt", "w" );
+            if (result_file)
+            {
+                if (fail == 0 && pass == rounds) fprintf( result_file, "PASS\n" );
+                else fprintf( result_file, "FAIL:%d/%d ROUNDS PASSED\n", pass, rounds );
+                fclose( result_file );
+            }
+            log_line( "[JIT] chained auto-test mode detected -- reporting result and returning to launcher" );
+
+            if (g_log) fclose( g_log );
+            consoleExit( NULL );
+            envSetNextLoad( "sdmc:/switch/wine/wine-nx-launcher.nro", "" );
+            return 0;
+        }
+    }
+
     printf( "\nPress + to exit\n" );
     consoleUpdate( NULL );
 
