@@ -164,6 +164,17 @@ DOCKER_IMAGE="devkitpro/devkita64"
 # has a long-standing bug where "${arr[*]}" on a zero-element array trips
 # "unbound variable" under set -u even though the array itself is defined.
 CMAKE_VULKAN_ARGS=""
+# Default build produces exactly one NRO, wine-nx-launcher.nro (see
+# CMakeLists.txt's own WINE_NX_BUILD_EXTRA_TARGETS comment for the full
+# reasoning). Set WINE_NX_BUILD_EXTRA_TARGETS=1 to also build the standalone
+# wine-nx-runtime/-deko3d/-vulkan-runtime binaries and the jit-smoke/
+# deko3d-smoke reference probes -- needed for WINE_NX_APP=<sample> testing,
+# re-verifying the deko3d/JIT bring-up probes, or a Vulkan-backend game
+# launched from wine-nx-launcher's own menu.
+CMAKE_EXTRA_TARGETS_ARGS=""
+if [ "${WINE_NX_BUILD_EXTRA_TARGETS:-0}" = "1" ]; then
+    CMAKE_EXTRA_TARGETS_ARGS="-DWINE_NX_BUILD_EXTRA_TARGETS=ON"
+fi
 # `docker image inspect nvk-switch-build` has been observed to
 # intermittently report a real, present image as missing, even after a
 # `docker version` warm-up and 8 retries -- but `docker images -q
@@ -207,29 +218,15 @@ docker run --rm \
         cmake -S . -B build-switch \
             -DCMAKE_TOOLCHAIN_FILE=cmake/switch-devkitA64.cmake \
             -DCMAKE_BUILD_TYPE=Release \
-            '"$CMAKE_VULKAN_ARGS"'
+            '"$CMAKE_VULKAN_ARGS"' \
+            '"$CMAKE_EXTRA_TARGETS_ARGS"'
         cmake --build build-switch -j"$(nproc)"
     '
 
-echo "Built $BUILD_DIR/wine-nx-probe.nro"
-if [ -f "$BUILD_DIR/wine-nx-pe-smoke.nro" ]; then
-    echo "Built $BUILD_DIR/wine-nx-pe-smoke.nro"
-fi
-if [ -f "$BUILD_DIR/wine-nx-pe-real-report.nro" ]; then
-    echo "Built $BUILD_DIR/wine-nx-pe-real-report.nro"
-fi
-if [ -f "$BUILD_DIR/wine-nx-pe-real-run.nro" ]; then
-    echo "Built $BUILD_DIR/wine-nx-pe-real-run.nro"
-fi
-if [ -f "$BUILD_DIR/wine-nx-pe-ntdll-smoke.nro" ]; then
-    echo "Built $BUILD_DIR/wine-nx-pe-ntdll-smoke.nro"
-fi
-if [ -f "$BUILD_DIR/wine-nx-ntdll-smoke.nro" ]; then
-    echo "Built $BUILD_DIR/wine-nx-ntdll-smoke.nro"
-fi
-if [ -f "$BUILD_DIR/wine-nx-ntdll-file-smoke.nro" ]; then
-    echo "Built $BUILD_DIR/wine-nx-ntdll-file-smoke.nro"
-fi
+# wine-nx-probe/pe-smoke/pe-real-report/pe-real-run/pe-ntdll-smoke/ntdll-smoke/
+# ntdll-file-smoke no longer exist as targets at all (see CMakeLists.txt's
+# WINE_NX_BUILD_EXTRA_TARGETS comment) -- only the remaining ones, gated the
+# same way deko3d-smoke below always has been, are worth guarding for here.
 if [ -f "$BUILD_DIR/wine-nx-deko3d-smoke.nro" ]; then
     echo "Built $BUILD_DIR/wine-nx-deko3d-smoke.nro"
 fi
@@ -352,7 +349,7 @@ if [ "$APP_KIND" = "luanti" ]; then
     done
 fi
 
-if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -f "$SCRIPT_DIR/samples/curl-arm64/trurl.exe" ]; }; then
+if [ -f "$BUILD_DIR/wine-nx-launcher.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -f "$SCRIPT_DIR/samples/curl-arm64/trurl.exe" ]; }; then
     echo "Preparing SD package for WINE_NX_APP=$APP_KIND"
     PACKAGE_DIR="$BUILD_DIR/sd-card/switch/wine"
     APP_DIR="$PACKAGE_DIR/drive_c/curl"
@@ -437,15 +434,9 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             cp "$dll" "$SYSTEM_DIR/"
         done < <(find "$LLVM_MINGW_RUNTIME_DIR" -maxdepth 1 -name '*.dll' -print0)
     fi
-    if [ -f "$BUILD_DIR/wine-nx-pe-real-report.nro" ]; then
-        cp "$BUILD_DIR/wine-nx-pe-real-report.nro" "$PACKAGE_DIR/wine-nx-pe-real-report.nro"
-    fi
-    if [ -f "$BUILD_DIR/wine-nx-pe-real-run.nro" ]; then
-        cp "$BUILD_DIR/wine-nx-pe-real-run.nro" "$PACKAGE_DIR/wine-nx-pe-real-run.nro"
-    fi
-    if [ -f "$BUILD_DIR/wine-nx-ntdll-file-smoke.nro" ]; then
-        cp "$BUILD_DIR/wine-nx-ntdll-file-smoke.nro" "$PACKAGE_DIR/wine-nx-ntdll-file-smoke.nro"
-    fi
+    # wine-nx-pe-real-report/pe-real-run/ntdll-file-smoke no longer exist as
+    # targets (see CMakeLists.txt's WINE_NX_BUILD_EXTRA_TARGETS comment) --
+    # nothing left here to stage for them.
     if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ]; then
         cp "$BUILD_DIR/wine-nx-runtime.nro" "$PACKAGE_DIR/wine-nx-runtime.nro"
     fi
