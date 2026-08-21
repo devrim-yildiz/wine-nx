@@ -213,6 +213,45 @@ struct win_proc_params
     WNDPROC procW;
 };
 
+#ifdef __SWITCH__
+/* wine-nx has no wow64win.dll-style layer to translate struct
+ * win_proc_params between the 32-bit guest and 64-bit native win32u --
+ * each side independently compiling struct win_proc_params gets not just
+ * a different total size (44 bytes on i386-windows vs 72 bytes on
+ * aarch64-windows, compiler-confirmed) but different PER-FIELD offsets
+ * too, since WNDPROC/HWND/WPARAM/LPARAM are pointer-sized and every field
+ * after the first one shifts. Sharing the raw struct across the
+ * KeUserModeCallback(NtUserCallWinProc, ...) boundary is unsound: the
+ * guest's params->hwnd/msg/wparam/lparam/procA/procW reads land on
+ * whatever the native side actually stored at a *different* offset
+ * (hardware-confirmed: this produced a crash calling through a garbage
+ * function pointer once buffer layout shifted enough to expose it).
+ *
+ * Fix: a fixed-width wire struct used only for this one crossing. Every
+ * field is UINT64 regardless of its native type, so the layout is
+ * identical on both sides (no per-ABI size or padding differences
+ * possible). dlls/win32u/message.c's dispatch_win_proc_params() serializes
+ * into this before the call; dlls/user32/winproc.c's User32CallWinProc()
+ * deserializes back into a real, guest-native struct win_proc_params
+ * before using it normally. Any packed message payload (e.g. WM_NCCALCSIZE's
+ * RECT) is appended immediately after this fixed header on both sides. */
+struct wine_nx_winproc_wire
+{
+    UINT64 func;
+    UINT64 hwnd;
+    UINT64 msg;
+    UINT64 wparam;
+    UINT64 lparam;
+    UINT64 ansi;
+    UINT64 ansi_dst;
+    UINT64 mapping;
+    UINT64 dpi_context;
+    UINT64 procA;
+    UINT64 procW;
+};
+#define WINE_NX_WINPROC_WIRE_SIZE (sizeof(struct wine_nx_winproc_wire))
+#endif
+
 /* NtUserCallWindowsHook params */
 struct win_hook_params
 {

@@ -517,27 +517,92 @@ static LRESULT dispatch_win_proc_params( struct win_proc_params *params, size_t 
     void *ret_ptr;
     ULONG ret_len;
     NTSTATUS status;
+#ifdef __SWITCH__
+    /* struct win_proc_params itself can't cross this boundary raw -- see
+     * the long comment on struct wine_nx_winproc_wire in ntuser.h. Build
+     * that fixed-layout wire version here (native header + whatever packed
+     * message payload already follows *params in this same allocation)
+     * and send that instead; every other caller of this function is
+     * unaffected. */
+    struct wine_nx_winproc_wire wire;
+    size_t native_header = (sizeof(*params) + 15) & ~15;
+    size_t payload_size = size > native_header ? size - native_header : 0;
+    size_t wire_size = WINE_NX_WINPROC_WIRE_SIZE + payload_size;
+    void *wire_buf;
 
-    if (thread_info->recursion_count > MAX_WINPROC_RECURSION) return 0;
+    if (!(wire_buf = malloc( wire_size ))) return 0;
+    wire.func        = (UINT64)(ULONG_PTR)params->func;
+    wire.hwnd        = (UINT64)(ULONG_PTR)params->hwnd;
+    wire.msg         = params->msg;
+    wire.wparam      = params->wparam;
+    wire.lparam      = params->lparam;
+    wire.ansi        = params->ansi;
+    wire.ansi_dst    = params->ansi_dst;
+    wire.mapping     = params->mapping;
+    wire.dpi_context = params->dpi_context;
+    wire.procA       = (UINT64)(ULONG_PTR)params->procA;
+    wire.procW       = (UINT64)(ULONG_PTR)params->procW;
+    memcpy( wire_buf, &wire, WINE_NX_WINPROC_WIRE_SIZE );
+    if (payload_size)
+        memcpy( (char *)wire_buf + WINE_NX_WINPROC_WIRE_SIZE,
+                (char *)params + native_header, payload_size );
+#endif
+
+    if (thread_info->recursion_count > MAX_WINPROC_RECURSION)
+    {
+#ifdef __SWITCH__
+        free( wire_buf );
+#endif
+        return 0;
+    }
     thread_info->recursion_count++;
+#ifdef __SWITCH__
+    status = KeUserModeCallback( NtUserCallWinProc, wire_buf, wire_size, &ret_ptr, &ret_len );
+#else
     status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
+#endif
     thread_info->recursion_count--;
 
 #ifdef __SWITCH__
     nx_trace_winproc( "return", params, status, ret_len );
 #endif
 
-    if (status) return result;
+    if (status)
+    {
+#ifdef __SWITCH__
+        free( wire_buf );
+#endif
+        return result;
+    }
 
     if (ret_len >= sizeof(result))
     {
         result = *(LRESULT *)ret_ptr;
         if (client_ret)
         {
+#ifdef __SWITCH__
+            /* ret_ptr aliases wire_buf (single address space, direct-call
+             * KeUserModeCallback -- same aliasing hazard as the UAF fixed
+             * in call_window_proc()). Copy the reply payload out to memory
+             * that outlives wire_buf's free() below; the caller consumes
+             * *client_ret and must free() it. */
+            size_t reply_size = ret_len - sizeof(result);
+            *client_ret = NULL;
+            *client_ret_size = 0;
+            if (reply_size && (*client_ret = malloc( reply_size )))
+            {
+                memcpy( *client_ret, (LRESULT *)ret_ptr + 1, reply_size );
+                *client_ret_size = reply_size;
+            }
+#else
             *client_ret = (LRESULT *)ret_ptr + 1;
             *client_ret_size = ret_len - sizeof(result);
+#endif
         }
     }
+#ifdef __SWITCH__
+    free( wire_buf );
+#endif
 
     return result;
 }
@@ -2403,7 +2468,7 @@ static LRESULT call_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     struct win_proc_params p, *params = &p;
     BOOL ansi = ansi_dst && type == MSG_ASCII;
     size_t packed_size = 0, offset = sizeof(*params), reply_size;
-    void *ret_ptr, *extra_buffer = NULL;
+    void *ret_ptr = NULL, *extra_buffer = NULL;
     SIZE_T extra_buffer_size = 0;
     LRESULT result = 0;
     CWPSTRUCT cwp;
@@ -2442,11 +2507,24 @@ static LRESULT call_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         pack_user_message( (char *)params + offset, packed_size, msg, wparam, lparam, ansi, &extra_buffer );
 
     result = dispatch_win_proc_params( params, offset + packed_size, &ret_ptr, &ret_len );
+
+    /* On Switch, KeUserModeCallback() is a direct call sharing one address
+     * space (dlls/ntdll/unix/signal_arm64.c) rather than a real cross-process
+     * transition, so ret_ptr here aliases memory inside `params` itself --
+     * freeing params before this read is a genuine use-after-free (the free()
+     * call commonly overwrites the first bytes of the freed chunk with
+     * allocator freelist bookkeeping). Consume ret_ptr first. */
+    copy_user_result( ret_ptr, min( ret_len, reply_size ), result, msg, wparam, lparam, ansi );
+
+#ifdef __SWITCH__
+    /* dispatch_win_proc_params() now hands back a dedicated malloc()'d copy
+     * of the reply payload (see the wire-struct note there) instead of a
+     * pointer into someone else's buffer -- this caller owns it. */
+    free( ret_ptr );
+#endif
     if (params != &p) free( params );
     if (extra_buffer)
         NtFreeVirtualMemory( GetCurrentProcess(), &extra_buffer, &extra_buffer_size, MEM_RELEASE );
-
-    copy_user_result( ret_ptr, min( ret_len, reply_size ), result, msg, wparam, lparam, ansi );
 
     /* and finally the WH_CALLWNDPROCRET hook */
     cwpret.lResult = result;
@@ -3296,13 +3374,16 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
                 params->lparam  = info.msg.lParam;
                 if (size) memcpy( params->data, buffer, size );
                 status = KeUserModeCallback( NtUserUnpackDDEMessage, params, len, (void **)&result, &len );
-                free( params );
-                if (status) continue; /* ignore it */
-                if (len == sizeof(*result))
+                /* see the matching comment in call_window_proc(): on Switch,
+                 * KeUserModeCallback() aliases `result` into `params`, so it
+                 * must be consumed before params is freed. */
+                if (!status && len == sizeof(*result))
                 {
                     info.msg.wParam = result->wparam;
                     info.msg.lParam = result->lparam;
                 }
+                free( params );
+                if (status) continue; /* ignore it */
             }
             /* CXHACK 19488 */
             if (info.msg.message == WM_PAINT &&

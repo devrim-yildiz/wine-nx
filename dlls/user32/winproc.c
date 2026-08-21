@@ -813,7 +813,74 @@ NTSTATUS WINAPI User32CallWinProc( void *args, ULONG size )
     size_t packed_size = 0;
     void *buffer = NULL;
     LRESULT result;
+#ifdef __SWITCH__
+    /* wine-nx guests are always 32-bit (4-byte LRESULT) while win32u --
+     * the native side receiving this reply, in
+     * dispatch_win_proc_params()/dlls/win32u/message.c -- is 64-bit and
+     * unconditionally expects a native (8-byte) LRESULT-sized result
+     * prefix before the packed reply payload. There is no separate
+     * wow64win.dll-style layer here to adapt a narrower 32-bit prefix, so
+     * write a full 8 bytes regardless of this process's own LRESULT
+     * width, matching what the native side already assumes.
+     * Hardware-confirmed effects of the mismatch: for the packed-reply
+     * case (e.g. WM_NCCALCSIZE's RECT, used by
+     * adjust_surface_capabilities() in dlls/win32u/vulkan.c), the narrow
+     * 4-byte prefix shifted the packed payload by 4 bytes on read,
+     * corrupting it; for the non-packed case, native's own
+     * `ret_len >= sizeof(result)` guard (8) never passed against a 4-byte
+     * guest reply at all, so every plain window-proc return value was
+     * silently discarded as 0. */
+    INT64 result64;
 
+    /* struct win_proc_params can't be read directly out of `args` here --
+     * see the long comment on struct wine_nx_winproc_wire in ntuser.h.
+     * dispatch_win_proc_params() on the native side (dlls/win32u/message.c)
+     * now sends a fixed-layout wire header instead; deserialize it into a
+     * real, guest-native struct win_proc_params before doing anything
+     * else. This replaces the earlier WINE_NX_WIN_PROC_PARAMS_OFFSET
+     * attempt, which only fixed the packed-payload offset and still
+     * hardware-crashed calling through params->procW, because that params
+     * pointer itself was still being read at this guest's (wrong,
+     * 44-byte-struct) field offsets against data native wrote at its own
+     * (72-byte-struct) offsets. */
+    struct wine_nx_winproc_wire *wire = args;
+    struct win_proc_params local_params;
+
+    memset( &local_params, 0, sizeof(local_params) );
+    local_params.func        = (WNDPROC)(ULONG_PTR)wire->func;
+    local_params.hwnd        = (HWND)(ULONG_PTR)wire->hwnd;
+    local_params.msg         = (UINT)wire->msg;
+    local_params.wparam      = (WPARAM)wire->wparam;
+    local_params.lparam      = (LPARAM)wire->lparam;
+    local_params.ansi        = (BOOL)wire->ansi;
+    local_params.ansi_dst    = (BOOL)wire->ansi_dst;
+    local_params.mapping     = (enum wm_char_mapping)wire->mapping;
+    local_params.dpi_context = (UINT)wire->dpi_context;
+    local_params.procA       = (WNDPROC)(ULONG_PTR)wire->procA;
+    local_params.procW       = (WNDPROC)(ULONG_PTR)wire->procW;
+    params = &local_params;
+
+    if (size > WINE_NX_WINPROC_WIRE_SIZE)
+    {
+        const size_t offset = WINE_NX_WINPROC_WIRE_SIZE;
+        packed_size = size - offset;
+        buffer = (char *)args + offset;
+
+        unpack_message( params->hwnd, params->msg, &params->wparam, &params->lparam,
+                        buffer, params->ansi );
+    }
+
+    result = dispatch_win_proc_params( params );
+    result64 = result;
+
+    if (packed_size)
+    {
+        INT64 *result_ptr = (INT64 *)((char *)buffer - sizeof(INT64));
+        *result_ptr = result64;
+        return NtCallbackReturn( result_ptr, sizeof(*result_ptr) + packed_size, STATUS_SUCCESS );
+    }
+    return NtCallbackReturn( &result64, sizeof(result64), STATUS_SUCCESS );
+#else
     if (size > sizeof(*params))
     {
         const size_t offset = (sizeof(*params) + 15) & ~15;
@@ -833,6 +900,7 @@ NTSTATUS WINAPI User32CallWinProc( void *args, ULONG size )
         return NtCallbackReturn( result_ptr, sizeof(*result_ptr) + packed_size, STATUS_SUCCESS );
     }
     return NtCallbackReturn( &result, sizeof(result), STATUS_SUCCESS );
+#endif
 }
 
 NTSTATUS WINAPI User32CallSendAsyncCallback( void *args, ULONG size )

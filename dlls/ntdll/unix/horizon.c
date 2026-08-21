@@ -5579,6 +5579,23 @@ static int horizon_server_handle_get_window_rectangles( struct horizon_server_co
     {
         reply.window = window->window_rect;
         reply.client = window->client_rect;
+#ifdef __SWITCH__
+        {
+            extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+            if (&wine_nx_runtime_trace)
+            {
+                char buf[256];
+                snprintf( buf, sizeof(buf),
+                          "[NXSRV] get_window_rectangles handle=%u rel=%d stored_client=(%d,%d,%d,%d) stored_window=(%d,%d,%d,%d)",
+                          (unsigned)request->handle, (int)request->relative,
+                          window->client_rect.left, window->client_rect.top,
+                          window->client_rect.right, window->client_rect.bottom,
+                          window->window_rect.left, window->window_rect.top,
+                          window->window_rect.right, window->window_rect.bottom );
+                wine_nx_runtime_trace( buf );
+            }
+        }
+#endif
         switch (request->relative)
         {
         case HORIZON_COORDS_CLIENT:

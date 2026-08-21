@@ -5782,6 +5782,20 @@ static void style_fixup_workarounds( CREATESTRUCTW *cs, const UNICODE_STRING *cl
     }
 }
 
+#ifdef __SWITCH__
+static void wine_nx_trace_nccalcsize_rect( const char *stage, HWND hwnd, const RECT *rect )
+{
+    extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+    if (&wine_nx_runtime_trace)
+    {
+        char buf[256];
+        snprintf( buf, sizeof(buf), "[NXNCC] %s hwnd=%p rect=(%d,%d,%d,%d)",
+                  stage, (void *)hwnd, rect->left, rect->top, rect->right, rect->bottom );
+        wine_nx_runtime_trace( buf );
+    }
+}
+#endif
+
 /***********************************************************************
  *           NtUserCreateWindowEx (win32u.@)
  */
@@ -6031,10 +6045,22 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
         HWND insert_after = (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) ? HWND_BOTTOM : HWND_TOP;
         new_rects.client = new_rects.window;
 
+#ifdef __SWITCH__
+        wine_nx_trace_nccalcsize_rect( "pre-map1", hwnd, &new_rects.client );
+#endif
         /* the rectangle is in screen coords for WM_NCCALCSIZE when wparam is FALSE */
         map_window_points( parent, 0, (POINT *)&new_rects.client, 2, win_dpi );
+#ifdef __SWITCH__
+        wine_nx_trace_nccalcsize_rect( "post-map1", hwnd, &new_rects.client );
+#endif
         send_message( hwnd, WM_NCCALCSIZE, FALSE, (LPARAM)&new_rects.client );
+#ifdef __SWITCH__
+        wine_nx_trace_nccalcsize_rect( "post-msg", hwnd, &new_rects.client );
+#endif
         map_window_points( 0, parent, (POINT *)&new_rects.client, 2, win_dpi );
+#ifdef __SWITCH__
+        wine_nx_trace_nccalcsize_rect( "post-map2", hwnd, &new_rects.client );
+#endif
 
         surface = get_window_surface( hwnd, SWP_NOACTIVATE, FALSE, &new_rects, &surface_rect );
         apply_window_pos( hwnd, insert_after, SWP_NOACTIVATE, surface, &new_rects, NULL );
