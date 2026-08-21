@@ -17,7 +17,7 @@ Windows software on a Switch. See "Current Status" below.
 Day-to-day progress, bugfixes, and screenshots are posted on Discord —
 that's the place to ask questions or follow along between releases.
 
-**[Join the Discord server](https://discord.gg/vprPQ46Q3)**
+**[Join the Discord server](https://discord.gg/T4Kb8ZrMbc)**
 
 ## What This Is
 
