@@ -515,6 +515,16 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
     ALL_VK_INSTANCE_EXTS
 #undef USE_VK_EXT
 
+#if defined(__SWITCH__) && defined(WINE_NX_HAVE_VULKAN)
+    /* VK_NN_vi_surface has no has_X bitfield in Wine's generated
+     * ALL_VK_INSTANCE_EXTS table (Switch-specific, not in the vk.xml this
+     * was generated from), so it can never be turned on via the loop above.
+     * Always enable it directly: harmless for instances that never call
+     * vkCreateViSurfaceNN, required for the ones that do -- see
+     * dlls/win32u/winnx_vulkan.c's wine_nx_vulkan_surface_create(). */
+    extensions[count++] = "VK_NN_vi_surface";
+#endif
+
     TRACE( "Enabling %u host instance extensions\n", count );
     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)
         TRACE( "  - %s\n", debugstr_a(*extension) );
@@ -557,6 +567,21 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     }
     physical_device->extensions = extensions;
 
+#ifdef __SWITCH__
+    /* NVK's Switch port advertises VK_EXT_map_memory_placed/
+     * VK_KHR_map_memory2 and even reports memoryMapPlaced/memoryUnmapReserve
+     * as TRUE from vkGetPhysicalDeviceFeatures2KHR, but hardware-confirmed
+     * the REAL vkCreateDevice call rejects the resulting
+     * VkPhysicalDeviceMapMemoryPlacedFeaturesEXT request with
+     * VK_ERROR_FEATURE_NOT_PRESENT (-8) -- unsurprising given NVK's own
+     * NVK_I_WANT_A_BROKEN_VULKAN_DRIVER env var is its own explicit "not
+     * fully conformant" flag. Skip this detection entirely so
+     * map_placed_align stays 0 and win32u_vkCreateDevice() never adds that
+     * feature struct; the code below already has a real, graceful
+     * fallback chain for "neither optimization available" (external_memory_
+     * host, then just disabling VK_KHR_external_memory_win32 with a WARN,
+     * not a failure). */
+#else
     if (zero_bits && physical_device->extensions.has_VK_EXT_map_memory_placed && physical_device->extensions.has_VK_KHR_map_memory2)
     {
         VkPhysicalDeviceMapMemoryPlacedFeaturesEXT map_placed_feature = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
@@ -573,6 +598,7 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
             TRACE( "Using placed map with alignment %u\n", physical_device->map_placed_align );
         }
     }
+#endif
 
     if (zero_bits && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
     {
@@ -705,6 +731,23 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
         if ((res = callback( create_info, allocator, &host_instance, p_vkGetInstanceProcAddr, (void *)(UINT_PTR)callback_info->context ))) goto failed;
     }
     else if ((res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance ))) goto failed;
+
+#if defined(__SWITCH__) && defined(WINE_NX_HAVE_VULKAN)
+    /* vkGetDeviceProcAddr couldn't be resolved in vulkan_init_once() -- the
+     * ICD contract only guarantees instance=NULL resolution for
+     * vkCreateInstance/vkEnumerateInstanceExtensionProperties/etc, not this
+     * one. NVK is a single, statically-linked ICD (not a multi-driver
+     * loader), so vkGetDeviceProcAddr itself has no per-instance behavior;
+     * resolving it against whichever instance happens to exist first is
+     * sufficient, matching nvk_harness.h's own bring-up sequence. */
+    if (!p_vkGetDeviceProcAddr)
+    {
+        extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr( VkInstance instance, const char *name );
+
+        p_vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)(void *)vk_icdGetInstanceProcAddr( host_instance, "vkGetDeviceProcAddr" );
+        vulkan_funcs.p_vkGetDeviceProcAddr = p_vkGetDeviceProcAddr;
+    }
+#endif
 
     vulkan_object_init_ptr( &instance->obj.obj, (UINT_PTR)host_instance, &client_instance->obj );
     instance->obj.p_insert_object = vulkan_instance_insert_object;
@@ -915,13 +958,22 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     device->queues = (void *)(device + 1);
     device->queue_props = (void *)(device->queues + queue_count);
 
+#ifndef __SWITCH__
 {
         VkPhysicalDeviceFeatures features = {0};
         VkPhysicalDeviceFeatures2 *features2;
 
         /* Enable shaderStorageImageWriteWithoutFormat for fshack
          * This is available on all hardware and driver combinations we care about.
-         */
+         *
+         * Hardware-confirmed NOT true on Switch: NVK's experimental Tegra
+         * X1/GM20B port doesn't support this core feature, and requesting
+         * it unconditionally here (regardless of what the app itself
+         * asked for, and not even gated on fshack_enabled) makes every
+         * single vkCreateDevice on this platform fail with
+         * VK_ERROR_FEATURE_NOT_PRESENT (-8) -- confirmed via
+         * wine-nx-probe/samples/vulkan_test, which never requested this
+         * feature at all. See https://github.com/devrim-yildiz/wine-nx. */
         if (create_info->pEnabledFeatures)
         {
             features = *create_info->pEnabledFeatures;
@@ -938,6 +990,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
             create_info->pEnabledFeatures = &features;
         }
 }
+#endif
 
     if (device->extensions.has_VK_WINE_openvr_device_extensions)
     {
@@ -962,7 +1015,64 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
         PFN_vkCreateDeviceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
         if ((res = callback( physical_device->host.physical_device, create_info, allocator, &host_device, p_vkGetDeviceProcAddr, (void *)(UINT_PTR)callback_info->context ))) goto failed;
     }
-    else if ((res = instance->p_vkCreateDevice( physical_device->host.physical_device, create_info, NULL /* allocator */, &host_device ))) goto failed;
+    else
+    {
+#ifdef __SWITCH__
+        /* Diagnosing a real, still-unexplained vkCreateDevice ->
+         * VK_ERROR_FEATURE_NOT_PRESENT (-8) on NVK: the two known
+         * unconditional feature-forcing mechanisms in this file
+         * (VK_EXT_map_memory_placed detection, shaderStorageImage
+         * WriteWithoutFormat for fshack) are both already disabled on
+         * __SWITCH__, but the error persists -- dump exactly what's being
+         * requested instead of guessing further. */
+        {
+            extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+            if (&wine_nx_runtime_trace)
+            {
+                char buf[512];
+                int len = 0, i, true_features = 0;
+                const VkBaseInStructure *chain;
+
+                len += snprintf( buf + len, sizeof(buf) - len, "[NXVK] vkCreateDevice request: %u extensions:",
+                                 create_info->enabledExtensionCount );
+                for (i = 0; i < (int)create_info->enabledExtensionCount && len < (int)sizeof(buf) - 64; i++)
+                    len += snprintf( buf + len, sizeof(buf) - len, " %s", create_info->ppEnabledExtensionNames[i] );
+                wine_nx_runtime_trace( buf );
+
+                if (create_info->pEnabledFeatures)
+                {
+                    const VkBool32 *flags = (const VkBool32 *)create_info->pEnabledFeatures;
+                    for (i = 0; i < (int)(sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32)); i++)
+                        if (flags[i]) true_features++;
+                }
+                snprintf( buf, sizeof(buf), "[NXVK] pEnabledFeatures=%p true_count=%d pNext=%p",
+                         (void *)create_info->pEnabledFeatures, true_features, (void *)create_info->pNext );
+                wine_nx_runtime_trace( buf );
+
+                for (chain = (const VkBaseInStructure *)create_info->pNext; chain; chain = chain->pNext)
+                {
+                    snprintf( buf, sizeof(buf), "[NXVK] pNext chain: sType=%d", chain->sType );
+                    wine_nx_runtime_trace( buf );
+                }
+            }
+        }
+#endif
+        if ((res = instance->p_vkCreateDevice( physical_device->host.physical_device, create_info, NULL /* allocator */, &host_device )))
+        {
+#ifdef __SWITCH__
+            {
+                extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+                if (&wine_nx_runtime_trace)
+                {
+                    char buf[128];
+                    snprintf( buf, sizeof(buf), "[NXVK] host vkCreateDevice -> %d", res );
+                    wine_nx_runtime_trace( buf );
+                }
+            }
+#endif
+            goto failed;
+        }
+    }
 
     vulkan_object_init_ptr( &device->obj, (UINT_PTR)host_device, &client_device->obj );
     device->physical_device = physical_device;
@@ -1761,7 +1871,19 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
 
 static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
 {
+#ifdef __SWITCH__
+    /* NtUserGetPresentRect has no entry in this platform's syscall table
+     * at all (confirmed: zero matches in dlls/win32u/syscall.c) -- calling
+     * it is genuinely undefined, not a clean failure, and
+     * hardware-confirmed to come back looking like success (nonzero)
+     * without ever writing *rect, leaving it as stack garbage that the
+     * caller (adjust_surface_capabilities) then trusted. Go straight to
+     * the always-implemented, proven-working NtUserGetClientRect instead.
+     * See https://github.com/devrim-yildiz/wine-nx. */
+    if (!NtUserGetClientRect( hwnd, rect, dpi )) return FALSE;
+#else
     if (!NtUserGetPresentRect( hwnd, rect, dpi ) && !NtUserGetClientRect( hwnd, rect, dpi )) return FALSE;
+#endif
     OffsetRect( rect, -rect->left, -rect->top );
     return TRUE;
 }
@@ -1782,13 +1904,24 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
 
     /* Update the image extents to match what the Win32 WSI would provide. */
     /* FIXME: handle DPI scaling, somehow */
-    get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
-    capabilities->minImageExtent.width = client_rect.right - client_rect.left;
-    capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
-    capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
-    capabilities->maxImageExtent.height = client_rect.bottom - client_rect.top;
-    capabilities->currentExtent.width = client_rect.right - client_rect.left;
-    capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
+    /* get_surface_rect()'s return value was never checked here -- real,
+     * unmodified Wine bug, not Switch-specific in principle, but exposed
+     * hard by it: NtUserGetPresentRect has no real implementation on this
+     * platform (declared in include/ntuser.h, defined only in winex11.drv,
+     * which isn't part of this build) and hardware-confirmed to leave
+     * client_rect as uninitialized stack garbage on failure -- silently
+     * overwriting NVK's own already-correct currentExtent/minImageExtent/
+     * maxImageExtent with garbage instead of leaving them alone. See
+     * https://github.com/devrim-yildiz/wine-nx. */
+    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
+    {
+        capabilities->minImageExtent.width = client_rect.right - client_rect.left;
+        capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
+        capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
+        capabilities->maxImageExtent.height = client_rect.bottom - client_rect.top;
+        capabilities->currentExtent.width = client_rect.right - client_rect.left;
+        capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
+    }
 }
 
 static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
@@ -4055,6 +4188,41 @@ static void vulkan_init_once(void)
     const char *env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
     fshack_enabled = !env || !atoi( env );
 
+#if defined(__SWITCH__) && defined(WINE_NX_HAVE_VULKAN)
+    /* No dynamic Vulkan loader exists on Horizon -- there's nothing to
+     * dlopen. NVK (wine-nx-probe/third_party/nxvk) is statically linked
+     * directly into this binary and reached entirely through its single
+     * exported ICD entry point, vk_icdGetInstanceProcAddr(), the same way
+     * switch/smoke/nvk_harness.h's hardware-proven bring-up does it. NVK
+     * refuses device creation without these two env vars; see
+     * nvk_harness.h's nvk_bringup_ex(). WINE_NX_HAVE_VULKAN is only defined
+     * (see wine-nx-probe/CMakeLists.txt) when NVK's archives were actually
+     * found and linked in -- without it this whole branch would reference
+     * an undefined symbol. */
+    {
+        extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr( VkInstance instance, const char *name );
+
+        setenv( "NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1 );
+        setenv( "MESA_SHADER_CACHE_DISABLE", "1", 1 );
+
+        p_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void *)vk_icdGetInstanceProcAddr;
+        /* vkGetDeviceProcAddr genuinely needs a live VkInstance to resolve
+         * per the ICD contract (unlike vkCreateInstance/
+         * vkEnumerateInstanceExtensionProperties below, which are the only
+         * two spec-guaranteed to resolve with instance=NULL) -- nxvk's own
+         * harness never calls it any other way. Left NULL here and set for
+         * real the first time an instance actually exists, in
+         * win32u_vkCreateInstance() below. */
+        p_vkGetDeviceProcAddr = NULL;
+        vulkan_handle = (void *)(UINT_PTR)1; /* non-NULL sentinel: no real module to hold */
+    }
+#elif defined(__SWITCH__)
+    /* NVK wasn't built/linked for this build (see
+     * wine-nx-probe/CMakeLists.txt) -- no Vulkan support, same as any other
+     * build without a usable driver. */
+    ERR( "Wine was built without Vulkan support (NVK not linked).\n" );
+    return;
+#else
 #ifdef SONAME_LIBVULKAN
     vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
     if (!vulkan_handle) ERR( "Failed to load %s\n", SONAME_LIBVULKAN );
@@ -4075,6 +4243,7 @@ static void vulkan_init_once(void)
     LOAD_FUNCPTR( vkGetDeviceProcAddr );
     LOAD_FUNCPTR( vkGetInstanceProcAddr );
 #undef LOAD_FUNCPTR
+#endif /* __SWITCH__ */
 
     driver_funcs = &lazydrv_funcs;
     vulkan_funcs.p_vkGetInstanceProcAddr = p_vkGetInstanceProcAddr;

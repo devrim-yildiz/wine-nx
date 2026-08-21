@@ -1053,6 +1053,17 @@ static void load_display_driver(void)
             null_user_driver.pCreateWindowSurface  = wine_nx_drv_CreateWindowSurface;
             null_user_driver.pWindowPosChanged     = wine_nx_drv_WindowPosChanged;
             null_user_driver.pProcessEvents        = wine_nx_drv_ProcessEvents;
+#ifdef WINE_NX_HAVE_VULKAN
+            /* Only defined (dlls/win32u/winnx_vulkan.c) and linkable when
+             * NVK's static archives were found at CMake-configure time --
+             * see wine-nx-probe/CMakeLists.txt. A build without them keeps
+             * pVulkanInit at its nulldrv_VulkanInit default
+             * (STATUS_NOT_IMPLEMENTED), same as before this feature existed. */
+            {
+                extern UINT wine_nx_drv_VulkanInit( UINT, void *, const struct vulkan_driver_funcs ** );
+                null_user_driver.pVulkanInit = wine_nx_drv_VulkanInit;
+            }
+#endif
             /* NB: pUpdateDisplayDevices is intentionally NOT overridden — the
              * device-manager + registry enumeration path crashes on the
              * Switch's minimal registry. The virtual screen size is forced

@@ -386,6 +386,79 @@ target_compile_options(wine-win32u-real PRIVATE
 
 target_include_directories(wine-win32u-real PRIVATE ${WINE_SWITCH_WIN32U_INCLUDES})
 
+# Optional NVK Vulkan driver (wine-nx-probe/third_party/nxvk) -- linked in
+# only when its static archives have already been built (see
+# wine-nx-probe/tools/build-nxvk-smoke.sh) and the archive path was passed
+# in via -DNXVK_DIR=... (build-switch.sh does this automatically once it
+# detects a built nxvk). Without it, wine-nx-runtime builds exactly as
+# before this feature existed -- Vulkan support is purely additive, same
+# opt-in philosophy as WINE_NX_DEKO3D.
+set(NXVK_DIR "" CACHE PATH "Path to the vendored nxvk submodule, if its Switch archives have been built")
+set(WINE_NX_HAVE_VULKAN FALSE)
+if(NXVK_DIR)
+    set(NXVK_CROSS_DIR "${NXVK_DIR}/switch/build/cross")
+    set(NXVK_LIBNVK "${NXVK_CROSS_DIR}/src/nouveau/vulkan/libnvk.a")
+    if(EXISTS "${NXVK_LIBNVK}")
+        set(WINE_NX_HAVE_VULKAN TRUE)
+        # Support archives libnvk.a pulls in, in dependency order -- mirrors
+        # third_party/nxvk/switch/build/build-nro.sh's own ARCHIVES list
+        # exactly, so this stays in sync with nxvk's own proven-working link
+        # line rather than re-deriving it.
+        set(NXVK_ARCHIVES
+            "${NXVK_CROSS_DIR}/src/util/libmesa_util.a"
+            "${NXVK_CROSS_DIR}/src/util/libmesa_util_simd.a"
+            "${NXVK_CROSS_DIR}/src/util/blake3/libblake3.a"
+            "${NXVK_CROSS_DIR}/src/c11/impl/libmesa_util_c11.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/compiler/libnak.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/compiler/libnak_rs.a"
+            "${NXVK_CROSS_DIR}/src/compiler/rust/libcompiler_c_helpers.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/headers/libnvidia_headers_c.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/nil/libnil.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/nil/liblibnil_format_table.a"
+            "${NXVK_CROSS_DIR}/src/compiler/nir/libnir.a"
+            "${NXVK_CROSS_DIR}/src/compiler/libcompiler.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/mme/libnouveau_mme.a"
+            "${NXVK_CROSS_DIR}/src/nouveau/winsys/libnouveau_ws.a"
+            "${NXVK_CROSS_DIR}/src/vulkan/util/libvulkan_util.a"
+            "${NXVK_CROSS_DIR}/src/compiler/spirv/libvtn.a"
+            "${NXVK_CROSS_DIR}/src/util/libxmlconfig.a"
+        )
+        # Switch-target-cross-compiled SPIRV-Tools, built by nxvk's own
+        # Dockerfile into the toolchain image's portlibs dir -- libvtn.a's
+        # debug SPIR-V disassembly path needs its C API. Only present inside
+        # the nvk-switch-build image, not plain devkitpro/devkita64; see
+        # build-switch.sh's image selection.
+        find_library(NXVK_SPIRV_TOOLS SPIRV-Tools HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+        message(STATUS "NVK Vulkan driver found at ${NXVK_LIBNVK} -- wine-nx-runtime will link it in")
+    else()
+        message(STATUS "NXVK_DIR set but ${NXVK_LIBNVK} not found -- building wine-nx-runtime without Vulkan support")
+    endif()
+endif()
+if(WINE_NX_HAVE_VULKAN)
+    target_sources(wine-win32u-real PRIVATE ../dlls/win32u/winnx_vulkan.c)
+    target_compile_definitions(wine-win32u-real PRIVATE WINE_NX_HAVE_VULKAN)
+
+    # winevulkan's own native ("unix side") implementation -- separate from
+    # dlls/win32u/vulkan.c (the driver-loading glue patched above).
+    # winevulkan.dll (PE, both aarch64-windows and i386-windows builds) is
+    # its own unixlib module and needs its own __wine_init_unix_call()
+    # target compiled in, exactly like win32u.dll's; see the
+    # wine_nx_static_unix_libs table in dlls/ntdll/unix/virtual.c. vulkan.c
+    # is hand-written; vulkan_thunks.c is real, unmodified Wine codegen
+    # output (per-Vulkan-function marshaling, both 64-bit and WOW64/32-bit
+    # variants from one source file, selected by _WIN64 at compile time).
+    target_sources(wine-win32u-real PRIVATE
+        ../dlls/winevulkan/vulkan.c
+        ../dlls/winevulkan/vulkan_thunks.c)
+    target_include_directories(wine-win32u-real PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../dlls/winevulkan")
+
+    # virtual.c's wine_nx_static_unix_libs table (dlls/ntdll/unix/virtual.c,
+    # a DIFFERENT object library) also needs to know Vulkan is linked in, to
+    # reference wine_nx_winevulkan_unix_funcs/_wow64_funcs.
+    target_compile_definitions(wine-virtual-real PRIVATE WINE_NX_HAVE_VULKAN)
+endif()
+
 add_executable(wine-nx-probe
     source/main.cpp
     $<TARGET_OBJECTS:wine-horizon>
@@ -647,8 +720,56 @@ find_library(SWITCH_HARFBUZZ harfbuzz HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib
 find_library(SWITCH_PNG png HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_BZ2 bz2 HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 find_library(SWITCH_Z z HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
+find_library(SWITCH_EXPAT expat HINTS "$ENV{DEVKITPRO}/portlibs/switch/lib")
 target_link_libraries(wine-nx-runtime PRIVATE
     ${SWITCH_FREETYPE} ${SWITCH_PNG} ${SWITCH_BZ2} ${SWITCH_Z} ${SWITCH_HARFBUZZ} deko3d nx m)
+
+# Links NVK's archives into a wine-nx-runtime* target. A function (not
+# inlined at each call site) because wine-win32u-real is an OBJECT library
+# -- $<TARGET_OBJECTS:wine-win32u-real> pulls its .o files into whichever
+# executable references it, but plain object-library usage does NOT
+# propagate that library's own target_link_libraries/target_sources
+# requirements the way a real STATIC/SHARED library target would, so every
+# executable consuming wine-win32u-real's objects (winnx_vulkan.c among
+# them, once WINE_NX_HAVE_VULKAN is on) needs this applied to it directly.
+function(wine_nx_link_vulkan target)
+    if(NOT WINE_NX_HAVE_VULKAN)
+        return()
+    endif()
+    # Mesa/NVK expects a handful of ordinary POSIX functions
+    # (posix_memalign, getuid/geteuid/getgid/getegid, regcomp/regexec/
+    # regfree, a CSRNG-backed getrandom) that devkitA64's newlib doesn't
+    # provide and nothing in wine-nx-runtime needed before now. Reuse
+    # nxvk's own gap-fill file instead of duplicating it -- see
+    # third_party/nxvk/switch/smoke/nvk_compat.c's header comment. Safe to
+    # add unconditionally: none of these symbols exist anywhere else in
+    # wine-nx-runtime today (confirmed by grep), so there's nothing to
+    # collide with.
+    target_sources(${target} PRIVATE third_party/nxvk/switch/smoke/nvk_compat.c)
+    target_include_directories(${target} PRIVATE "${NXVK_DIR}/include")
+
+    # libnvk.a must be whole-archived (matches
+    # third_party/nxvk/switch/build/build-nro.sh's own link line exactly);
+    # the rest go in a start-group since several of these Mesa/NAK/NIR
+    # archives reference each other circularly. m/z/expat are repeated
+    # here, not just relied on from this target's own earlier
+    # target_link_libraries call -- that call is earlier in final link
+    # order, so by the time the linker reaches these NVK archives it has
+    # already passed those libraries and won't revisit them for
+    # powf/log2f/exp2f/XML_ParserCreate/etc without this.
+    target_link_options(${target} PRIVATE -Wl,-u,vk_icdGetInstanceProcAddr)
+    target_link_libraries(${target} PRIVATE
+        -Wl,--whole-archive "${NXVK_LIBNVK}" -Wl,--no-whole-archive
+        -Wl,--start-group ${NXVK_ARCHIVES} ${NXVK_SPIRV_TOOLS} ${SWITCH_Z} ${SWITCH_EXPAT} m -Wl,--end-group
+        # This target's own sources are all C, so CMake picks the C linker
+        # driver (gcc) for the final link, which -- unlike g++ -- doesn't
+        # auto-link the C++ runtime. libSPIRV-Tools.a (C++, pulled in
+        # transitively by libvtn.a's debug SPIR-V path) needs it
+        # explicitly: operator new/delete, std::string, std::__throw_*.
+        stdc++)
+endfunction()
+
+wine_nx_link_vulkan(wine-nx-runtime)
 
 # Deko3d-only runtime: a genuinely separate binary, not a runtime flag inside
 # wine-nx-runtime, specifically so it never references nwindowGetDefault() or

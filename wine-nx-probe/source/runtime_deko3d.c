@@ -336,6 +336,39 @@ int wine_nx_deko3d_fb_init(void)
     return 0;
 }
 
+/* Lets another vi consumer in this same process (dlls/win32u/winnx_vulkan.c)
+ * share this already-open ViDisplay instead of independently calling
+ * viOpenDefaultDisplay() itself -- that call is NOT safe to repeat, unlike
+ * viCreateLayer() (a plain per-call IPC request, genuinely fine to use
+ * multiple times against one already-open display -- see the comment on
+ * wine_nx_deko3d_fb_init() above). Hardware-confirmed: a second independent
+ * viOpenDefaultDisplay() from the same process returns 0x1272, even after
+ * this backend's own first call already succeeded. Returns 0 and copies the
+ * handle out on success, -1 if this backend never got a display open. */
+int wine_nx_deko3d_get_vi_display( ViDisplay *out )
+{
+    if (!g_dk_ready) return -1;
+    *out = g_dk_viDisplay;
+    return 0;
+}
+
+/* Hardware-confirmed: a SECOND independent viCreateLayer() from the same
+ * process also fails (0x272), contradicting this backend's own original
+ * assumption (see the comment on wine_nx_deko3d_fb_init() above) that
+ * layers are a cheap, repeatable per-call resource -- true for privileged
+ * system modules (overlays/capture), evidently not for a regular
+ * application's "vi:u" access. So: no second layer either. Returns a
+ * pointer to this backend's own already-created NWindow (NOT a copy --
+ * NWindow has internal buffer-queue state a shallow copy would corrupt)
+ * so a Vulkan surface can present through the exact same window deko3d's
+ * own compositor already owns, instead of creating its own. Returns NULL
+ * if this backend never got that far. */
+NWindow *wine_nx_deko3d_get_vi_window(void)
+{
+    if (!g_dk_ready) return NULL;
+    return &g_dk_win;
+}
+
 void *wine_nx_deko3d_fb_lock( int *width, int *height, int *stride_px )
 {
     if (!g_dk_ready && wine_nx_deko3d_fb_init()) return NULL;

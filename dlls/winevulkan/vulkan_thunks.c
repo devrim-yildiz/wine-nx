@@ -64041,7 +64041,16 @@ BOOL wine_vk_is_type_wrapped(VkObjectType type)
 
 #ifdef _WIN64
 
+/* wine-nx: statically linked into one binary alongside every other
+ * unixlib's own table (win32u.dll, ws2_32.dll, ...), so each needs a
+ * unique symbol name -- see the wine_nx_static_unix_libs lookup table in
+ * dlls/ntdll/unix/virtual.c. Real Wine builds this as its own separate
+ * winevulkan.so, where the plain name never collides with anything. */
+#ifdef __SWITCH__
+const unixlib_entry_t wine_nx_winevulkan_unix_funcs[] =
+#else
 const unixlib_entry_t __wine_unix_call_funcs[] =
+#endif
 {
     init_vulkan,
     vk_is_available_instance_function,
@@ -64734,12 +64743,20 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     thunk64_vkWriteResourceDescriptorsEXT,
     thunk64_vkWriteSamplerDescriptorsEXT,
 };
+#ifdef __SWITCH__
+C_ASSERT(ARRAYSIZE(wine_nx_winevulkan_unix_funcs) == unix_count);
+#else
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);
+#endif
 
 #endif /* _WIN64 */
 
 #ifdef _WIN64
+#ifdef __SWITCH__
+const unixlib_entry_t wine_nx_winevulkan_unix_wow64_funcs[] =
+#else
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+#endif
 #else
 const unixlib_entry_t __wine_unix_call_funcs[] =
 #endif
@@ -65435,4 +65452,8 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     thunk32_vkWriteResourceDescriptorsEXT,
     thunk32_vkWriteSamplerDescriptorsEXT,
 };
+#ifdef __SWITCH__
+C_ASSERT(ARRAYSIZE(wine_nx_winevulkan_unix_funcs) == unix_count);
+#else
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);
+#endif

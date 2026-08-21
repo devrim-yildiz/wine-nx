@@ -137,11 +137,57 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
-echo "Building Switch runtime NRO with devkitA64 Docker image..."
+# NVK Vulkan support (wine-nx-probe/third_party/nxvk) is purely additive
+# and opt-in: it only links in when its static archives have already been
+# built (see wine-nx-probe/tools/build-nxvk-smoke.sh) AND the toolchain
+# image that has its Switch-cross SPIRV-Tools baked in ("nvk-switch-build",
+# built from nxvk's own switch/docker/Dockerfile -- a strict superset of
+# plain devkitpro/devkita64, so it's safe to use unconditionally once it
+# exists) is available locally. Neither is required for a normal build; a
+# fresh checkout that hasn't touched nxvk at all builds exactly as before
+# this feature existed.
+NXVK_DIR="$SCRIPT_DIR/third_party/nxvk"
+NXVK_LIBNVK="$NXVK_DIR/switch/build/cross/src/nouveau/vulkan/libnvk.a"
+DOCKER_IMAGE="devkitpro/devkita64"
+# A plain string, not a bash array: macOS ships bash 3.2 by default, which
+# has a long-standing bug where "${arr[*]}" on a zero-element array trips
+# "unbound variable" under set -u even though the array itself is defined.
+CMAKE_VULKAN_ARGS=""
+# `docker image inspect nvk-switch-build` has been observed to
+# intermittently report a real, present image as missing, even after a
+# `docker version` warm-up and 8 retries -- but `docker images -q
+# nvk-switch-build` reliably found the same image in the exact same shell
+# state where `inspect` was failing (confirmed side by side). Not fully
+# understood why (Docker Desktop image-store lookup path difference
+# between the two subcommands, seemingly), but `images -q` is what's
+# actually reliable here, so that's the real check now; a miss is still
+# retried a few times as cheap insurance. A false negative here silently
+# drops Vulkan support while a stale CMakeCache.txt from a PRIOR
+# successful configure still expects it -- WINE_NX_HAVE_VULKAN can end up
+# true against the wrong (plain devkitpro/devkita64) image, and the
+# resulting build failure is confusing.
+docker version >/dev/null 2>&1
+NVK_IMAGE_FOUND=0
+for attempt in 1 2 3 4 5; do
+    if [ -n "$(docker images -q nvk-switch-build 2>/dev/null)" ]; then
+        NVK_IMAGE_FOUND=1
+        break
+    fi
+    sleep 3
+done
+if [ -f "$NXVK_LIBNVK" ] && [ "$NVK_IMAGE_FOUND" = "1" ]; then
+    echo "NVK Vulkan driver archives found -- building wine-nx-runtime with Vulkan support"
+    DOCKER_IMAGE="nvk-switch-build"
+    CMAKE_VULKAN_ARGS="-DNXVK_DIR=/project/wine-nx-probe/third_party/nxvk"
+else
+    echo "NVK not built (see wine-nx-probe/tools/build-nxvk-smoke.sh) -- building without Vulkan support"
+fi
+
+echo "Building Switch runtime NRO with devkitA64 Docker image ($DOCKER_IMAGE)..."
 docker run --rm \
     -v "$REPO_ROOT:/project" \
     --workdir /project/wine-nx-probe \
-    devkitpro/devkita64 \
+    "$DOCKER_IMAGE" \
     sh -lc '
         # win32u font rendering (font.c/freetype.c) needs the freetype portlib
         if [ ! -f "$DEVKITPRO/portlibs/switch/include/freetype2/ft2build.h" ]; then
@@ -149,7 +195,8 @@ docker run --rm \
         fi
         cmake -S . -B build-switch \
             -DCMAKE_TOOLCHAIN_FILE=cmake/switch-devkitA64.cmake \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            '"$CMAKE_VULKAN_ARGS"'
         cmake --build build-switch -j"$(nproc)"
     '
 
@@ -189,6 +236,29 @@ if [ -d "$WINE_PE_BUILD_DIR" ]; then
             echo "Building required Wine PE DLL $module.dll"
             PATH="$WINE_BUILD_PATH" \
                 make -C "$WINE_PE_BUILD_DIR" "dlls/$module/aarch64-windows/$module.dll"
+        fi
+    done
+fi
+
+# vulkan_test.exe (32-bit guest, see the vulkan_test app-kind block below)
+# needs winevulkan.dll/vulkan-1.dll built for i386-windows specifically --
+# those are ordinary Wine PE DLLs, never built here before now since nothing
+# needed them. Every other i386-windows DLL this app needs (kernel32,
+# ntdll, user32, gdi32, ...) is assumed already built, same as OpenTTD/
+# Luanti's own i386-windows dependencies -- see the generic bulk-copy loop
+# further down that stages whatever i386-windows DLLs already exist.
+VULKAN_TEST_WINE_DLL_MODULES=(vulkan-1 winevulkan)
+if [ "$APP_KIND" = "vulkan_test" ] || [ "$APP_KIND" = "vulkan_triangle_test" ]; then
+    if [ ! -d "$WINE_PE_BUILD_DIR" ]; then
+        echo "Missing PE build dir for vulkan_test: $WINE_PE_BUILD_DIR" >&2
+        exit 1
+    fi
+    for module in "${VULKAN_TEST_WINE_DLL_MODULES[@]}"; do
+        dll="$WINE_PE_BUILD_DIR/dlls/$module/i386-windows/$module.dll"
+        if [ ! -f "$dll" ]; then
+            echo "Building vulkan_test dependency $module.dll (i386-windows)"
+            PATH="$WINE_BUILD_PATH" \
+                make -C "$WINE_PE_BUILD_DIR" "dlls/$module/i386-windows/$module.dll"
         fi
     done
 fi
@@ -413,6 +483,68 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
             fi
         fi
     fi
+    # First real end-to-end Vulkan test: a 32-bit (WOW64) guest .exe that
+    # creates a window, loads vulkan-1.dll, and drives instance -> surface
+    # -> device -> swapchain -> present through dlls/win32u/winnx_vulkan.c's
+    # NVK-backed driver. Built i686-w64-mingw32 like cube32, for the same
+    # reason: it's the real 32-bit guest path (WOW64/box64), not a native
+    # ARM64 PE. winevulkan.dll/vulkan-1.dll themselves are ordinary Wine PE
+    # DLLs, built for i386-windows below like any other guest dependency.
+    if [ "$APP_KIND" = "vulkan_test" ]; then
+        VULKAN_TEST_SRC="$SCRIPT_DIR/samples/vulkan_test/vulkan_test.c"
+        VULKAN_TEST_EXE="$SCRIPT_DIR/samples/vulkan_test/vulkan_test.exe"
+        VULKAN_TEST_CC="$LLVM_MINGW_BIN_DIR/i686-w64-mingw32-clang"
+        if [ -f "$VULKAN_TEST_SRC" ]; then
+            if [ ! -x "$VULKAN_TEST_CC" ]; then
+                VULKAN_TEST_CC="$(command -v i686-w64-mingw32-clang || true)"
+            fi
+            if [ -z "$VULKAN_TEST_CC" ] || [ ! -x "$VULKAN_TEST_CC" ]; then
+                echo "Missing i686-w64-mingw32-clang; cannot build vulkan_test app" >&2
+                exit 1
+            fi
+            if [ ! -f "$VULKAN_TEST_EXE" ] || [ "$VULKAN_TEST_SRC" -nt "$VULKAN_TEST_EXE" ]; then
+                # Headers only (vk_icdGetInstanceProcAddr's own vendored copy of
+                # the standard Khronos headers) -- vulkan-1.dll is loaded
+                # dynamically via LoadLibrary/GetProcAddress, not linked, so no
+                # import lib is needed here.
+                "$VULKAN_TEST_CC" -municode -mwindows -O2 -Wall -Wextra \
+                    -I "$SCRIPT_DIR/third_party/nxvk/include" \
+                    -o "$VULKAN_TEST_EXE" "$VULKAN_TEST_SRC" -luser32 -lgdi32
+            fi
+        fi
+    fi
+    # Triangle test: real render pass/pipeline/vkCmdDraw, one step up from
+    # vulkan_test's bare clear. Shaders are pre-compiled SPIR-V C headers
+    # (third_party/nxvk/switch/smoke/shaders/{tri_vert,solid_frag}.h) --
+    # regenerate them with switch/smoke/shaders/gen-shaders.sh (needs
+    # glslangValidator, inside the nvk-switch-build image) if they're ever
+    # missing or the .vert/.frag sources change.
+    if [ "$APP_KIND" = "vulkan_triangle_test" ]; then
+        VULKAN_TRI_SRC="$SCRIPT_DIR/samples/vulkan_test/vulkan_triangle_test.c"
+        VULKAN_TRI_EXE="$SCRIPT_DIR/samples/vulkan_test/vulkan_triangle_test.exe"
+        VULKAN_TRI_CC="$LLVM_MINGW_BIN_DIR/i686-w64-mingw32-clang"
+        VULKAN_TRI_SHADERS_DIR="$SCRIPT_DIR/third_party/nxvk/switch/smoke/shaders"
+        if [ -f "$VULKAN_TRI_SRC" ]; then
+            if [ ! -x "$VULKAN_TRI_CC" ]; then
+                VULKAN_TRI_CC="$(command -v i686-w64-mingw32-clang || true)"
+            fi
+            if [ -z "$VULKAN_TRI_CC" ] || [ ! -x "$VULKAN_TRI_CC" ]; then
+                echo "Missing i686-w64-mingw32-clang; cannot build vulkan_triangle_test app" >&2
+                exit 1
+            fi
+            if [ ! -f "$VULKAN_TRI_SHADERS_DIR/tri_vert.h" ] || [ ! -f "$VULKAN_TRI_SHADERS_DIR/solid_frag.h" ]; then
+                echo "Missing pre-compiled shader headers in $VULKAN_TRI_SHADERS_DIR" >&2
+                echo "  Regenerate with: docker run --rm -v \"$SCRIPT_DIR/third_party/nxvk:/work:z\" -w /work nvk-switch-build bash switch/smoke/shaders/gen-shaders.sh" >&2
+                exit 1
+            fi
+            if [ ! -f "$VULKAN_TRI_EXE" ] || [ "$VULKAN_TRI_SRC" -nt "$VULKAN_TRI_EXE" ]; then
+                "$VULKAN_TRI_CC" -municode -mwindows -O2 -Wall -Wextra \
+                    -I "$SCRIPT_DIR/third_party/nxvk/include" \
+                    -I "$VULKAN_TRI_SHADERS_DIR" \
+                    -o "$VULKAN_TRI_EXE" "$VULKAN_TRI_SRC" -luser32 -lgdi32
+            fi
+        fi
+    fi
     # Direct-blit test app: WINE_NX_APP=blit stages the no-InvalidateRect/
     # no-BeginPaint GetDC+StretchDIBits comparison test (see
     # samples/direct-blit/direct_blit.c's file header for what this isolates).
@@ -462,6 +594,24 @@ if [ -f "$BUILD_DIR/wine-nx-runtime.nro" ] && { [ "$APP_KIND" != "curl" ] || [ -
         printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
         rm -f "$PACKAGE_DIR/args.txt"
         echo "Staged cube32 (32-bit WOW64 smoke test) as runtime target (WINE_NX_APP=cube32)"
+    elif [ "$APP_KIND" = "vulkan_test" ] && [ -f "$SCRIPT_DIR/samples/vulkan_test/vulkan_test.exe" ]; then
+        VULKAN_TEST_DIR="$PACKAGE_DIR/drive_c/vulkan_test"
+        mkdir -p "$VULKAN_TEST_DIR"
+        cp "$SCRIPT_DIR/samples/vulkan_test/vulkan_test.exe" "$VULKAN_TEST_DIR/vulkan_test.exe"
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/vulkan_test/vulkan_test.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged vulkan_test (32-bit Vulkan smoke test) as runtime target (WINE_NX_APP=vulkan_test)"
+    elif [ "$APP_KIND" = "vulkan_triangle_test" ] && [ -f "$SCRIPT_DIR/samples/vulkan_test/vulkan_triangle_test.exe" ]; then
+        VULKAN_TRI_DIR="$PACKAGE_DIR/drive_c/vulkan_triangle_test"
+        mkdir -p "$VULKAN_TRI_DIR"
+        cp "$SCRIPT_DIR/samples/vulkan_test/vulkan_triangle_test.exe" "$VULKAN_TRI_DIR/vulkan_triangle_test.exe"
+        printf '%s\n' 'sdmc:/switch/wine/drive_c/vulkan_triangle_test/vulkan_triangle_test.exe' > "$PACKAGE_DIR/target.txt"
+        printf '%s\n' '1' > "$PACKAGE_DIR/run-entry.txt"
+        printf '%s\n' '0' > "$PACKAGE_DIR/systrace.txt"
+        rm -f "$PACKAGE_DIR/args.txt"
+        echo "Staged vulkan_triangle_test (32-bit Vulkan shader/pipeline test) as runtime target (WINE_NX_APP=vulkan_triangle_test)"
     elif [ "$APP_KIND" = "cube64" ] && [ -f "$SCRIPT_DIR/samples/cube32/cube64.exe" ]; then
         CUBE64_DIR="$PACKAGE_DIR/drive_c/cube64"
         mkdir -p "$CUBE64_DIR"
