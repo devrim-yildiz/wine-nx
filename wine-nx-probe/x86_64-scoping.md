@@ -75,35 +75,119 @@ not harder:
   seam, the RX->RW translation fixes -- is arch-independent and carries
   over unchanged.
 
+## Revised plan: no separate PE DLL, no BTCpu* interface
+
+The original plan (below, superseded) assumed a 64-bit CPU backend needed
+to be its own PE DLL implementing the generic `BTCpu*` plugin surface,
+mirroring `wowbox64.dll`. That's wrong for this case, and the mistake is
+worth recording so it doesn't get re-proposed:
+
+`wowbox64.dll` has to be a genuinely separate, dynamically-loaded PE
+module *only* because `wow64.dll`'s own loader (`process_init()` in
+`dlls/wow64/syscall.c`, via `load_64bit_module(get_cpu_dll_name())`)
+insists on loading a guest-visible CPU-backend DLL and resolving its
+`BTCpu*` exports by name across a real PE import/export boundary. Since
+`wow64.dll` cannot host a 64-bit guest at all (confirmed above), the
+64-bit path was already going to bypass it entirely via a new
+`wine_nx_x64_handoff()` -- the same way `wine_nx_wow64_handoff()` bypasses
+the *standard* `LdrInitializeThunk` path today. There is no `wow64.dll`
+loader in the picture to demand a separate PE module, so there's no
+reason to build one.
+
+Confirmed by reading the actual call chain: `wine_nx_wow64_handoff()`
+(`dlls/ntdll/loader.c`) is compiled as part of the PE-labeled ntdll.dll
+sources (per `dlls/ntdll/Makefile.in`), yet is called via a plain `extern`
+from `wine-nx-probe/source/runtime.c` (native devkitA64 bootstrap) with no
+loader/module-resolution step in between -- because wine-nx's "native, no
+WOW64" build links the whole aarch64-windows PE-labeled source set
+directly into the single statically-linked `wine-nx-runtime` executable,
+not as standalone loaded PE modules. `wine_nx_do_syscall()`
+(`dlls/ntdll/unix/signal_arm64.c`, unix-side) is plain native AAPCS64 C --
+proven by its own asm trampoline (`__wine_syscall_dispatcher`) existing
+specifically to bridge *from* PE-ABI calling context *into* this native
+one, i.e. the native side never needed such a bridge for itself.
+
+So: box64's x86-64 emulation core can be linked directly into
+`wine-nx-runtime`'s own native ELF binary (same link unit as
+`wine_nx_do_syscall`), and any glue code in that world can call
+`wine_nx_do_syscall()` as an ordinary C function -- no PE export tables,
+no `dlltool` import libs, no `BTCpu*` interface contract, none of the
+`aarch64-w64-mingw32` toolchain machinery `wowbox64.dll` needs. This also
+means box64's *upstream* `wowbox64.dll` build (opt-in,
+`WINE_NX_BUILD_WOWBOX64`) is completely unaffected by any of this -- it
+keeps building exactly as before.
+
 ## What remains (the real work, in dependency order)
 
-1. **A 64-bit CPU-backend DLL** (aarch64-windows PE, linking box64's emu/
-   dynarec like `wowbox64.dll` does) exposing the `BTCpu*` surface with
-   `CONTEXT`/`AMD64_CONTEXT` layouts: BTCpuProcessInit/ThreadInit/
-   Simulate/GetContext/SetContext/ResetToConsistentState, a bop/unix-call
-   opcode pair, and the syscall entry that reads the guest's x64-ABI args
-   and dispatches into the native syscall table (the piece that replaces
-   `Wow64SystemServiceEx` -- for 64-bit it is a register shuffle into the
-   same `__wine_syscall_dispatcher`-backed table the native path uses).
-   `dlls/wow64cpu/cpu.c` documents the interface contract; `wowbox64.c`
-   documents which entry points matter in practice and why.
-2. **A `wine_nx_x64_handoff()`** replacing today's routing stub, playing
+1. **DONE, syntax-verified this round: `EmuX64Syscall()` in
+   `wine-nx-probe/third_party/box64/src/os/os_horizon.c`.** This is
+   box64's own hook for the real x86-64 `SYSCALL` instruction
+   (`src/emu/x64run0f.c:193`, opcode `0F 05`) -- previously a stub
+   printing "NYI" (dead code in the existing wowbox64.dll build, since
+   32-bit guest code can never execute a 64-bit-only `syscall`
+   instruction). Implemented for real, gated behind a new
+   `WINE_NX_X64NATIVE` `#ifdef` so the existing wowbox64.dll build path is
+   untouched (falls through to the same old stub). Reads args per the real
+   Windows x64 Nt* syscall-stub convention -- arg1 in R10 (not RCX;
+   `syscall` clobbers RCX with the return address, so the guest's own
+   ntdll stub copies RCX to R10 first), arg2 in RDX, arg3 in R8, arg4 in
+   R9, arg5+ on the guest stack at `[rsp+0x28]` onward (`syscall` doesn't
+   push anything, unlike `call`) -- builds a 16-slot arg array the same
+   shape `wine_nx_do_syscall()` already expects (8 register args + a
+   `stack_args` pointer for the rest, exactly mirroring how
+   `__wine_syscall_dispatcher`'s ARM64 asm trampoline does it for the
+   native path), and calls `wine_nx_do_syscall()` directly. Return value
+   written back to `R_RAX`. Syntax-checked clean (zero errors/warnings)
+   against the real `aarch64-w64-mingw32-clang` toolchain with the actual
+   box64/wine header set this file compiles against -- not just
+   eyeballed. **Not yet linked into anything or run** -- there is no
+   `WINE_NX_X64NATIVE` build target yet (next item).
+2. **A native build target for box64's core**, linked directly into
+   `wine-nx-runtime` (or a small standalone smoke-test executable first,
+   matching this project's established "prove it builds" milestone
+   pattern from the nxvk/wowbox64 bring-ups) via the *existing* devkitA64
+   toolchain wine-nx-probe already uses -- not a nested
+   `ExternalProject_Add` with a separate toolchain the way
+   `WINE_NX_BUILD_WOWBOX64` needs one. Source list to reuse verbatim from
+   `wine/wow64/CMakeLists.txt`'s `WOW64_BOX64CPU_SRC` + `MUSL_SRC` (proven
+   to compile for ARM64 already, just via a different toolchain) plus the
+   top-level `CMakeLists.txt`'s `ARM_DYNAREC` `DYNAREC_ASM`/`DYNAREC_PASS`
+   file lists (read in full this round, `CMakeLists.txt:1033-1091`) --
+   NOT `wowbox64.c` itself (32-bit-specific `BTCpu*` glue); a new, minimal
+   native entry point replaces it. Real risk here, not yet assessed: box64
+   assumes a much fuller POSIX surface (`mmap`, `pthread_*`, signal/
+   `ucontext_t` handling in `custommem.c` and the dynarec) than
+   libnx/newlib provides -- expect a real compile-error-fixing campaign,
+   not a clean first build. This is the next concrete step.
+3. **A `wine_nx_x64_handoff()`** replacing today's routing stub, playing
    the role `wine_nx_wow64_handoff()` plays for i386 but without
    wow64.dll: allocate the guest stack, build the initial AMD64 context
    (Rip at the x86_64 ntdll's `LdrInitializeThunk`, Rsp with headroom --
    every bug class from the 32-bit boot chain in `perf-lab-log.md` Part 2
    has a 64-bit analog waiting), load the x86_64 guest ntdll, and enter
-   BTCpuSimulate.
-3. **Guest DLL staging.** A third staged directory for the x86_64 DLL set
+   box64's run loop directly (no `BTCpuSimulate`/`BTCpu*` indirection
+   needed per the revised plan above).
+4. **Guest DLL staging.** A third staged directory for the x86_64 DLL set
    plus loader search-path awareness for it. Real Windows-on-ARM never
    ships an x86_64 system directory (ARM64EC makes system32 dual-use), so
    there is no convention to copy; proposal: `drive_c/windows/sysx64`,
    mirroring how `syswow64` is staged today, wired the same way
    `SYSWOW64_DIR` is in `build-switch.sh`.
-4. **Hardware bring-up.** Expect the boot-sequence bug chain again
+5. **Hardware bring-up.** Expect the boot-sequence bug chain again
    (initial context, stack headroom, TLS state, NtContinue routing,
    unwind-vs-JIT-frames); the categories are documented from the 32-bit
    campaign even though the specifics will differ.
+
+### Original plan (superseded by the section above, kept for context)
+
+~~1. A 64-bit CPU-backend DLL (aarch64-windows PE, linking box64's emu/
+   dynarec like `wowbox64.dll` does) exposing the `BTCpu*` surface with
+   `CONTEXT`/`AMD64_CONTEXT` layouts: BTCpuProcessInit/ThreadInit/
+   Simulate/GetContext/SetContext/ResetToConsistentState, a bop/unix-call
+   opcode pair, and the syscall entry that reads the guest's x64-ABI args
+   and dispatches into the native syscall table.~~ Superseded: no
+   `wow64.dll` loader means no reason for a separate PE module at all --
+   see above.
 
 ## Constraint noted for later
 
