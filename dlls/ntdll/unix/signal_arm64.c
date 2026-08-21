@@ -741,6 +741,61 @@ NTSTATUS wine_nx_do_syscall( ULONG_PTR *stack_args,
                     wine_nx_runtime_trace( buf2 );
                 }
             }
+
+            /* caller_native_ret above only ever resolves into wow64.dll's own
+             * wow64_NtTerminateProcess thunk (confirmed by symbol lookup
+             * against this build's wow64.dll) -- that's Wine's generic
+             * dispatch, not the guest x86 code that actually decided to
+             * terminate (abort()/ExitProcess() etc). That decision lives on
+             * the GUEST's own x86 stack, one call frame up from
+             * NtTerminateProcess's tiny stub -- read it via the same
+             * WOW64_CPURESERVED/I386_CONTEXT struct the pre/post-
+             * NtQueryInformationProcess trace above already uses (a
+             * different, Wine-maintained context from x64emu_t, which regs[]
+             * already proved unreliable for this). This is a single address
+             * space, so guest_esp is directly dereferenceable as a native
+             * pointer, same as guest_eip already is above. */
+            {
+                WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+                I386_CONTEXT *ictx = cpu ? (I386_CONTEXT *)(cpu + 1) : NULL;
+                ULONG_PTR guest_esp = ictx ? (ULONG_PTR)ictx->Esp : 0;
+                snprintf( buf2, sizeof(buf2), "[SYSCALL] ictx cpu=%p Eip=0x%lx Esp=0x%lx (vs emu_ptr guest_eip=0x%lx)",
+                          (void *)cpu, ictx ? (unsigned long)ictx->Eip : 0, (unsigned long)guest_esp,
+                          (unsigned long)guest_eip );
+                wine_nx_runtime_trace( buf2 );
+                if (guest_esp)
+                {
+                    uint32_t *stack = (uint32_t *)(uintptr_t)guest_esp;
+                    char hex[210]; int pos = 0;
+                    for (int i = 0; i < 24 && pos < 200; i++)
+                        pos += snprintf( hex + pos, sizeof(hex) - pos, "%08x ", stack[i] );
+                    snprintf( buf2, sizeof(buf2), "[SYSCALL] guest stack from Esp: %s", hex );
+                    wine_nx_runtime_trace( buf2 );
+
+                    /* Two prior fixes aimed at OpenAL's device/driver backend
+                     * selection (ALSOFT_DRIVERS=winmm, then =null) both left
+                     * this exact crash byte-for-byte unchanged -- so it's not
+                     * that. Dump the actual x86 bytes at OpenAL32.dll's own
+                     * return address (the repeated 0xfe278d70-ish stack value)
+                     * instead of continuing to guess at what OpenAL Soft's
+                     * source does; a real disassembly of what's actually
+                     * there settles it. */
+                    for (int i = 0; i < 24; i++)
+                    {
+                        ULONG_PTR v = stack[i];
+                        if (v >= 0xfe000000 && v < 0xff000000)
+                        {
+                            uint8_t *code = (uint8_t *)(v - 16);
+                            char hex2[160]; int pos2 = 0;
+                            for (int j = 0; j < 32 && pos2 < 150; j++)
+                                pos2 += snprintf( hex2 + pos2, sizeof(hex2) - pos2, "%02x ", code[j] );
+                            snprintf( buf2, sizeof(buf2), "[SYSCALL] bytes at stack[%d]=0x%lx-16..+16: %s",
+                                      i, (unsigned long)v, hex2 );
+                            wine_nx_runtime_trace( buf2 );
+                        }
+                    }
+                }
+            }
         }
     }
 

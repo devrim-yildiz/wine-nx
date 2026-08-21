@@ -357,6 +357,13 @@ void MSACM_RegisterAllDrivers(void)
      * Does Windows handle that?  */
     if (MSACM_pFirstACMDriverID) return;
 
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace) wine_nx_runtime_trace( "[MSACM] MSACM_RegisterAllDrivers enter" );
+    }
+#endif
+
     lRet = RegOpenKeyExW(HKEY_LOCAL_MACHINE, drvkey, 0, KEY_QUERY_VALUE, &hKey);
     if (lRet == ERROR_SUCCESS) {
 	RegQueryInfoKeyW( hKey, 0, 0, 0, &cnt, 0, 0, 0, 0, 0, 0, 0);
@@ -394,6 +401,12 @@ void MSACM_RegisterAllDrivers(void)
     }
     MSACM_ReorderDriversByPriority();
     MSACM_RegisterDriver(L"msacm32.dll", L"msacm32.dll", 0);
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace) wine_nx_runtime_trace( "[MSACM] MSACM_RegisterAllDrivers exit ok" );
+    }
+#endif
 }
 
 /***********************************************************************

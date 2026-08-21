@@ -1859,6 +1859,28 @@ void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
 #endif
     NTSTATUS status;
     WCHAR *dst;
+#ifdef __SWITCH__
+    /* Luanti's bundled OpenAL32.dll aborts (hardware-confirmed: guest stack
+     * at the NtTerminateProcess call site resolves to an OpenAL32.dll return
+     * address feeding into ucrtbase's abort path) during device backend
+     * probing. Forcing ALSOFT_DRIVERS=winmm (an earlier attempt) still
+     * crashed identically -- confirmed via hardware trace that WinMM's own
+     * device/driver enumeration on this platform (which routes through
+     * either an absent mmdevapi.dll/COM path, or a system.ini/Drivers32
+     * legacy lookup with nothing registered there either) is itself what
+     * OpenAL doesn't handle cleanly, not which backend name gets picked.
+     * "null" is OpenAL Soft's built-in no-op backend: it never touches any
+     * device/driver enumeration API at all, so there is nothing left in
+     * that whole code area for it to trip over. Silent, but running.
+     * Environment is set here in the guest's own environment block (not a
+     * native setenv(), which this process's own GetEnvironmentVariableA
+     * never reads). No-op for any guest that isn't OpenAL Soft-linked. */
+    static const WCHAR extra_env_var[] =
+        {'A','L','S','O','F','T','_','D','R','I','V','E','R','S','=','n','u','l','l',0};
+#define EXTRA_ENV_SIZE sizeof(extra_env_var)
+#else
+#define EXTRA_ENV_SIZE 0
+#endif
     SIZE_T size = (sizeof(*wow64_params)
                    + params->CurrentDirectory.DosPath.MaximumLength
                    + params->DllPath.MaximumLength
@@ -1868,7 +1890,8 @@ void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
                    + params->Desktop.MaximumLength
                    + params->ShellInfo.MaximumLength
                    + ((params->RuntimeInfo.MaximumLength + 1) & ~1)
-                   + params->EnvironmentSize);
+                   + params->EnvironmentSize
+                   + EXTRA_ENV_SIZE);
 
     status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&wow64_params, limit_2g - 1, &size,
                                       MEM_COMMIT, PAGE_READWRITE );
@@ -1934,10 +1957,44 @@ void *build_wow64_parameters( const RTL_USER_PROCESS_PARAMETERS *params )
     dup_unicode_string( &params->RuntimeInfo, &dst, &wow64_params->RuntimeInfo );
 
     wow64_params->Environment = PtrToUlong( dst );
+#ifdef __SWITCH__
+    /* Environment is a NUL-terminated-string list ending in one extra NUL
+     * (i.e. the block itself ends "...lastvar\0\0"). Drop that trailing
+     * block-terminator NUL, splice in the extra var (which already carries
+     * its own NUL, from the L"..." literal), then write a fresh
+     * block-terminator NUL after it. */
+    wow64_params->EnvironmentSize = params->EnvironmentSize + EXTRA_ENV_SIZE;
+    memcpy( dst, params->Environment, params->EnvironmentSize - sizeof(WCHAR) );
+    memcpy( (char *)dst + params->EnvironmentSize - sizeof(WCHAR), extra_env_var, sizeof(extra_env_var) );
+    *(WCHAR *)((char *)dst + params->EnvironmentSize - sizeof(WCHAR) + sizeof(extra_env_var)) = 0;
+    /* Prior test showed zero effect on the OpenAL32.dll abort -- verify the
+     * injected var actually landed where GetEnvironmentVariableA would read
+     * it (wow_peb->ProcessParameters->Environment) before assuming this
+     * mechanism itself is wrong. */
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            WCHAR *check = (WCHAR *)((char *)dst + params->EnvironmentSize - sizeof(WCHAR));
+            char ascii[48]; unsigned int i;
+            for (i = 0; i < sizeof(extra_env_var)/sizeof(WCHAR) - 1 && i < sizeof(ascii) - 1; i++)
+                ascii[i] = (check[i] >= 0x20 && check[i] < 0x7f) ? (char)check[i] : '?';
+            ascii[i] = 0;
+            char buf[128];
+            snprintf( buf, sizeof(buf),
+                      "[WOW64] injected env at dst+0x%lx = '%s' (wow64_params=%p EnvironmentSize=%lu)",
+                      (unsigned long)(params->EnvironmentSize - sizeof(WCHAR)), ascii,
+                      (void *)wow64_params, (unsigned long)wow64_params->EnvironmentSize );
+            wine_nx_runtime_trace( buf );
+        }
+    }
+#else
     wow64_params->EnvironmentSize = params->EnvironmentSize;
     memcpy( dst, params->Environment, params->EnvironmentSize );
+#endif
     return wow64_params;
 }
+#undef EXTRA_ENV_SIZE
 
 
 /*************************************************************************

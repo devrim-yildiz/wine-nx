@@ -776,6 +776,21 @@ static	BOOL	MCI_OpenMciDriver(LPWINE_MCIDRIVER wmd, LPCWSTR drvTyp, DWORD_PTR lp
 {
     WCHAR	libName[128];
 
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            char ascii[80]; unsigned int i;
+            for (i = 0; i < 79 && drvTyp && drvTyp[i]; i++)
+                ascii[i] = (drvTyp[i] >= 0x20 && drvTyp[i] < 0x7f) ? (char)drvTyp[i] : '?';
+            ascii[i] = 0;
+            char buf[128];
+            snprintf( buf, sizeof(buf), "[MCI] MCI_OpenMciDriver drvTyp='%s'", ascii );
+            wine_nx_runtime_trace( buf );
+        }
+    }
+#endif
     if (!DRIVER_GetLibName(drvTyp, L"MCI", libName, sizeof(libName)))
 	return FALSE;
 
@@ -1334,6 +1349,12 @@ DWORD WINAPI mciSendStringW(LPCWSTR lpstrCommand, LPWSTR lpstrRet,
     if (!wcscmp(verb, L"open")) {
 	LPWSTR	tmp;
         WCHAR	buf[128];
+#ifdef __SWITCH__
+        {
+            extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+            if (&wine_nx_runtime_trace) wine_nx_runtime_trace( "[MCI] mciSendString open-verb reached" );
+        }
+#endif
 
 	/* case dev == 'new' has to be handled */
 	if (!wcscmp(dev, L"new")) {

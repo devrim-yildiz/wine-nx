@@ -385,6 +385,33 @@ HDRVR WINAPI OpenDriver(LPCWSTR lpDriverName, LPCWSTR lpSectionName, LPARAM lPar
     TRACE("(%s, %s, 0x%08Ix);\n",
           debugstr_w(lpDriverName), debugstr_w(lpSectionName), lParam);
 
+#ifdef __SWITCH__
+    /* Luanti's bundled OpenAL32.dll aborts shortly after a system.ini/
+     * Drivers32 lookup that resolves to this exact call chain
+     * (DRIVER_GetLibName -> OpenDriver, hardware-confirmed via guest stack
+     * trace at the NtTerminateProcess call site). Neither of the two
+     * strings this function receives are visible from any existing trace
+     * -- log them directly to identify exactly which legacy driver name is
+     * being requested before deciding what (if anything) can satisfy it. */
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            char ascii1[80], ascii2[80]; unsigned int i;
+            for (i = 0; i < 79 && lpDriverName && lpDriverName[i]; i++)
+                ascii1[i] = (lpDriverName[i] >= 0x20 && lpDriverName[i] < 0x7f) ? (char)lpDriverName[i] : '?';
+            ascii1[i] = 0;
+            for (i = 0; i < 79 && lpSectionName && lpSectionName[i]; i++)
+                ascii2[i] = (lpSectionName[i] >= 0x20 && lpSectionName[i] < 0x7f) ? (char)lpSectionName[i] : '?';
+            ascii2[i] = 0;
+            char buf[192];
+            snprintf( buf, sizeof(buf), "[WINMM] OpenDriver name='%s' section='%s' lParam=0x%lx",
+                      ascii1, lpSectionName ? ascii2 : "(null)", (unsigned long)lParam );
+            wine_nx_runtime_trace( buf );
+        }
+    }
+#endif
+
     DRIVER_Dump("BEFORE:");
 
     if (lsn == NULL) {
@@ -402,6 +429,17 @@ HDRVR WINAPI OpenDriver(LPCWSTR lpDriverName, LPCWSTR lpSectionName, LPARAM lPar
           debugstr_w(lpDriverName), debugstr_w(lpSectionName));
 
 the_end:
+#ifdef __SWITCH__
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            char buf[64];
+            snprintf( buf, sizeof(buf), "[WINMM] OpenDriver returns lpDrv=%p", (void *)lpDrv );
+            wine_nx_runtime_trace( buf );
+        }
+    }
+#endif
     TRACE("=> %p\n", lpDrv);
 
     DRIVER_Dump("AFTER:");

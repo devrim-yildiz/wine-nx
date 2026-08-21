@@ -6318,6 +6318,28 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
+#ifdef __SWITCH__
+    /* Chasing a hardware-confirmed abort() in Luanti's guest process whose
+     * stack carries a VirtualProtect-related error string (ucrtbase's
+     * signal/raise/_XcptFilter strings sit right next to it) -- narrowed to
+     * PAGE_EXECUTE_READWRITE/WRITECOPY specifically (the combined-permission
+     * case get_horizon_page_vprot()/is_vprot_exec_write() above already
+     * special-cases for Horizon's W^X model) rather than tracing every
+     * VirtualProtect call, which would be most of DLL loading. */
+    if (new_prot == PAGE_EXECUTE_READWRITE || new_prot == PAGE_EXECUTE_WRITECOPY)
+    {
+        extern void wine_nx_runtime_trace( const char *msg ) __attribute__((weak));
+        if (&wine_nx_runtime_trace)
+        {
+            char buf[160];
+            snprintf( buf, sizeof(buf),
+                      "[VPROT] NtProtectVirtualMemory addr=%p size=0x%lx new_prot=0x%lx -> status=0x%x old=0x%lx",
+                      base, (unsigned long)size, (unsigned long)new_prot, status,
+                      status == STATUS_SUCCESS ? (unsigned long)old : 0 );
+            wine_nx_runtime_trace( buf );
+        }
+    }
+#endif
     if (status == STATUS_SUCCESS)
     {
         *addr_ptr = base;
