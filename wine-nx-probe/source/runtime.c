@@ -1,5 +1,6 @@
 #include <switch.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -2307,6 +2308,51 @@ wine_nx_boot_result_t wine_nx_boot_and_run_target( const char *target, int autor
     return WINE_NX_BOOT_NOT_RUN;
 }
 
+/* nxlinkStdio() (libnx, wine/runtime/nxlink.h) is a CLIENT: it connects OUT
+ * to __nxlink_host:NXLINK_CLIENT_PORT (28771) and redirects stdout/stderr
+ * onto that socket -- it does not open a listening socket on this process
+ * at all. __nxlink_host only gets populated automatically when the real
+ * nxlink PC tool's own netloader push sets it as part of that handshake;
+ * a plain hbmenu launch (this project's normal case -- see build-switch.sh)
+ * leaves it zeroed, so nxlinkConnectToHost() has nowhere to connect and
+ * silently does nothing. Confirmed directly against libnx's own
+ * nxlink.h -- not assumed.
+ *
+ * Since __nxlink_host is a plain exported global (struct in_addr), this
+ * sets it by hand from a small SD-card config file instead of relying on
+ * netloader auto-discovery, so nxlink logging works for a normal manual
+ * launch too: sdmc:/switch/wine/nxlink-host.txt, one line, the dev
+ * machine's own LAN IP (the deploy-side counterpart, tools/deploy.py,
+ * listens on NXLINK_CLIENT_PORT instead of trying to connect to the
+ * Switch, matching this actual connection direction). Missing file or
+ * unparseable IP -> no-op, same as today's behavior without this file.
+ *
+ * Deliberately kept OUTSIDE the #ifndef WINE_NX_MERGED_LAUNCHER guard
+ * below (unlike main() itself) -- launcher_main.c calls this directly, and
+ * a first version of this change put it inside that guard by mistake,
+ * which compiled fine but silently dropped the symbol from wine-nx-launcher
+ * (a link error at wine-nx-launcher.elf time, not a wine-nx-runtime one --
+ * caught before it ever reached hardware). */
+void wine_nx_nxlink_connect(void)
+{
+    FILE *f = fopen( RUNTIME_DIR "/nxlink-host.txt", "r" );
+    char line[64] = {0};
+    in_addr_t addr;
+
+    if (!f) return;
+    if (!fgets( line, sizeof(line), f )) { fclose( f ); return; }
+    fclose( f );
+
+    line[strcspn( line, "\r\n" )] = 0;
+    if (!line[0]) return;
+
+    addr = inet_addr( line );
+    if (addr == INADDR_NONE) return;
+
+    __nxlink_host.s_addr = addr;
+    nxlinkStdio();
+}
+
 #ifndef WINE_NX_MERGED_LAUNCHER
 int main( int argc, char **argv )
 {
@@ -2315,6 +2361,19 @@ int main( int argc, char **argv )
 
     log_main_thread = pthread_self();
     log_main_thread_set = 1;
+
+    /* nxlink live logging: bring up libnx's BSD socket service (idempotent
+     * -- wine_nx_lazy_init() below calls the same function again once
+     * boot actually starts, guarded by runtime_platform.c's own static
+     * flags, so this never double-inits) before connecting out to nxlink,
+     * so a listening dev-machine client can stream this process' log from
+     * the very first line instead of only once the guest is running.
+     * Independent of this project's own SD-card log_line()/
+     * wine_nx_runtime_trace() writer -- nxlinkStdio() only touches the C
+     * library's stdout/stderr file descriptors. */
+    wine_nx_runtime_platform_init();
+    wine_nx_nxlink_connect();
+
 #ifndef WINE_NX_DEKO3D_ONLY
     consoleInit( NULL );
 #endif
@@ -2339,6 +2398,15 @@ int main( int argc, char **argv )
 
     wine_nx_boot_and_run_target( target, autorun );
 
+    /* Only reached when wine_nx_boot_and_run_target() actually returns --
+     * i.e. a failure before any guest code ran, or autorun disabled (see
+     * runtime_boot.h). A successful guest run never gets here at all:
+     * wine_nx_x64_handoff()/wine_nx_wow64_handoff() block until the guest
+     * exits, and the whole Horizon process exits with it -- this
+     * socketExit() is unreachable on that path by construction, same as
+     * this project's existing Minus-button exit handler already has its
+     * own, separate socketExit() call for the "guest is running" case. */
+    socketExit();
     park_forever();
     return 0;
 }

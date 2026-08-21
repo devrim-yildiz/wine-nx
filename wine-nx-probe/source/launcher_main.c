@@ -33,6 +33,24 @@
 #include <stdio.h>
 #include <string.h>
 
+/* No dedicated header for either of these -- source/runtime.c declares
+ * wine_nx_runtime_platform_init() the same way (a plain extern next to its
+ * own call site), since runtime_platform.c exports it with no header of
+ * its own. Idempotent (paths_initialized/sockets_initialized statics in
+ * runtime_platform.c), so calling it here AND again later inside
+ * wine_nx_lazy_init() (once a game is actually picked, via
+ * nx_arch_launch_exe() -> wine_nx_boot_and_run_target()) is safe -- the
+ * underlying socketInitializeDefault() only ever runs once per process
+ * either way.
+ *
+ * wine_nx_nxlink_connect() (source/runtime.c) reads sdmc:/switch/wine/
+ * nxlink-host.txt and, if present, sets libnx's __nxlink_host before
+ * calling nxlinkStdio() -- see that function's own comment for why this
+ * is needed at all (nxlinkStdio() connects OUT to a host IP that a plain
+ * hbmenu launch, unlike a real nxlink push, never populates on its own). */
+extern void wine_nx_runtime_platform_init(void);
+extern void wine_nx_nxlink_connect(void);
+
 #define WINE_NX_LAUNCHER_FB_W 1280
 #define WINE_NX_LAUNCHER_FB_H 720
 
@@ -96,6 +114,19 @@ int main( int argc, char **argv )
 
     (void)argc;
     (void)argv;
+
+    /* nxlink live logging, active for this binary's own GUI phase too --
+     * not just once a game is running. See source/runtime.c's own main()
+     * for why wine_nx_runtime_platform_init() (idempotent bsd socket
+     * bring-up) is called explicitly here rather than assuming
+     * wine_nx_lazy_init() already did it -- this process's GUI phase never
+     * reaches that function until the user actually picks a game.
+     * wine_nx_nxlink_connect() itself is called exactly once for this
+     * process' lifetime, here -- not repeated inside wine_nx_lazy_init(),
+     * since calling nxlinkStdio() twice in one process is not a safe
+     * pattern to rely on. */
+    wine_nx_runtime_platform_init();
+    wine_nx_nxlink_connect();
 
     /* Auto-test-mode resume check runs before any graphics init at all
      * -- if a test chain is continuing, hand off immediately without
@@ -230,6 +261,7 @@ int main( int argc, char **argv )
                 write_launch_target( menu.launch_path );
                 nxquickmenu_shutdown( &quickmenu );
                 framebufferClose( &fb );
+                socketExit();
                 envSetNextLoad( nro, "" );
                 return 0;
             }
@@ -254,6 +286,13 @@ int main( int argc, char **argv )
                 framebufferClose( &fb );
                 nwindowReleaseBuffers( nwindowGetDefault() );
                 boot_result = nx_arch_launch_exe( menu.launch_path );
+                /* Only reached on a failure before any guest code ran --
+                 * see runtime_boot.h. A successful launch never returns
+                 * here at all, the same way source/runtime.c's own main()
+                 * never gets back from wine_nx_boot_and_run_target()
+                 * either -- this socketExit() is unreachable on the
+                 * common, successful-launch path by construction. */
+                socketExit();
                 return (int)boot_result;
             }
         }
@@ -268,5 +307,6 @@ int main( int argc, char **argv )
      * comment on its Minus-button handler) doesn't apply here -- a
      * plain return after framebufferClose() is the whole exit sequence. */
     framebufferClose( &fb );
+    socketExit();
     return 0;
 }
