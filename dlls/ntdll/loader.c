@@ -6820,6 +6820,230 @@ NTSTATUS wine_nx_wow64_handoff(void)
 
     return STATUS_SUCCESS;
 }
+
+#ifdef WINE_NX_X64NATIVE
+/***********************************************************************
+ *           wine_nx_x64_handoff
+ *
+ * SKELETON, NOT HARDWARE-VALIDATED. Gated behind WINE_NX_X64NATIVE
+ * (undefined by every build today, including this one) specifically so
+ * this compiles to nothing and changes no existing behavior until the
+ * native box64-core CMake target (wine-nx-probe/third_party/box64/wine/
+ * x64native/x64native.c) actually exists and is linked in -- the four
+ * wine_nx_x64_* externs below are defined there and are NOT part of any
+ * build today. runtime.c's current x86_64 routing stop does not call
+ * this function yet either; wiring that up is the last step once this
+ * compiles and the functions it calls have been hardware-exercised at
+ * all, even minimally.
+ *
+ * Modeled directly on wine_nx_wow64_handoff() immediately above --
+ * reuses the same load_dll()/RtlFindExportedRoutineByName()/
+ * wine_nx_patch_ntdll_dispatchers()/wine_nx_decode_adrp_ldr_target()
+ * primitives, all proven working for the 32-bit case. Deliberately
+ * SKIPS that function's LdrSystemDllInitBlock/SET_PE_INIT_BLOCK section
+ * entirely: that struct is WOW64-only plumbing for handing dispatcher
+ * addresses across a *separate address-space-mapped* 32-bit ntdll --
+ * per x86_64-scoping.md's own "no dual PEB/TEB" finding, a 64-bit guest
+ * has no such split, so its own ntdll should resolve everything through
+ * its normal PE imports the same way it would on real x86-64 hardware.
+ * This is a reasoned inference from the architecture, NOT something
+ * confirmed by tracing the x86_64-windows ntdll's own LdrInitializeThunk
+ * -- first thing to check if the guest boots far enough to reach that
+ * function and something looks wrong.
+ */
+/* wine-ntdll-loader-real (this file's own object library) is a SHARED
+ * compile reused by executables that never link box64 at all -- the smoke
+ * tests, in particular (see wine-nx-probe/CMakeLists.txt's add_executable
+ * list: wine-nx-pe-smoke, wine-nx-ntdll-smoke, etc, all pull in
+ * $<TARGET_OBJECTS:wine-ntdll-loader-real>). If WINE_NX_X64NATIVE ever
+ * needs to be defined for this whole object library's compile (rather
+ * than only for wine-nx-runtime's own final link), those four externs
+ * would be unresolved for every executable that doesn't also link the
+ * box64-core target. Declaring them __attribute__((weak)) + guarding each
+ * call with "is this symbol actually present" is this codebase's own,
+ * already-established fix for exactly this shared-object-library problem
+ * -- see dlls/ntdll/unix/horizon.c:8923-8968's weak fallbacks, and
+ * wine_nx_wow64_handoff() immediately above this function using the same
+ * "(&init_thread_stack) ? init_thread_stack(...) : STATUS_NOT_IMPLEMENTED"
+ * idiom for init_thread_stack/wine_nx_init_wow64_initial_context. Reused
+ * verbatim here, not reinvented. */
+#include "wine/x64native.h"
+
+NTSTATUS wine_nx_x64_handoff(void)
+{
+    /* Proposed path per x86_64-scoping.md item 4 (Guest DLL staging) --
+     * NOT staged by build-switch.sh yet (tracked separately). Mirrors
+     * syswow64's own staging exactly, just for the third, x86_64 arch. */
+    static const WCHAR ntdll64_guest_path[] = L"C:\\windows\\sysx64\\ntdll.dll";
+    WINE_MODREF *wm;
+    NTSTATUS status;
+    void *guest_ntdll_base;
+    void *pLdrInitializeThunk;
+    extern NTSTATUS wine_nx_x64_process_init(void) __attribute__((weak));
+    extern NTSTATUS wine_nx_x64_thread_init(void) __attribute__((weak));
+    extern void wine_nx_x64_enter( struct wine_nx_amd64_context *ctx ) __attribute__((weak));
+    extern void WINAPI wine_nx_x64_prepare_for_exception( EXCEPTION_RECORD *rec, CONTEXT *context ) __attribute__((weak));
+    struct wine_nx_amd64_context *ctx;
+    void *guest_stack;
+    SIZE_T guest_stack_size = 0x100000;  /* 1MB -- arbitrary starting point, same as a typical default reserve; no hardware signal yet on whether this is enough */
+
+    if (!(&wine_nx_x64_process_init) || !(&wine_nx_x64_thread_init) ||
+        !(&wine_nx_x64_enter) || !(&wine_nx_x64_prepare_for_exception))
+    {
+        /* Built with WINE_NX_X64NATIVE but without the box64-core target
+         * linked in (WINE_NX_BUILD_X64NATIVE off) -- e.g. a smoke test.
+         * Not an error in that context, just "this executable can't run
+         * an x86_64 guest"; the caller (runtime.c) already treats a
+         * non-STATUS_SUCCESS return as "handoff didn't take". */
+        ERR( "wine_nx: x64 handoff requested but box64 core not linked into this executable\n" );
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    if ((status = wine_nx_x64_process_init()))
+    {
+        ERR( "wine_nx: x64 process init failed, status %lx\n", status );
+        return status;
+    }
+    if ((status = wine_nx_x64_thread_init()))
+    {
+        ERR( "wine_nx: x64 thread init failed, status %lx\n", status );
+        return status;
+    }
+
+    /* load_dll() maps an x86_64 PE image the exact same way it maps the
+     * i386 one in wine_nx_wow64_handoff() above -- machine-type dispatch
+     * already lives inside load_dll()/the PE loader, not here (see
+     * x86_64-scoping.md item 3: "Detection and routing" was already done
+     * and hardware-verified via the cube64/WINE_NX_APP mechanism, just
+     * for the *main image*; this is the same underlying mapping path
+     * applied to a dependency DLL instead). */
+    if ((status = load_dll( NULL, ntdll64_guest_path, 0, &wm, FALSE )))
+    {
+        ERR( "wine_nx: could not load x86_64 guest %s, status %lx\n",
+             debugstr_w(ntdll64_guest_path), status );
+        return status;
+    }
+    guest_ntdll_base = wm->ldr.DllBase;
+
+    if (!(pLdrInitializeThunk = RtlFindExportedRoutineByName( guest_ntdll_base, "LdrInitializeThunk" )))
+    {
+        ERR( "wine_nx: failed to resolve x86_64 guest LdrInitializeThunk\n" );
+        return STATUS_ENTRYPOINT_NOT_FOUND;
+    }
+
+    /* Same load-bearing fixup wine_nx_wow64_handoff() needs (see its own
+     * comment above): without this, __wine_syscall_dispatcher/
+     * __wine_unix_call_dispatcher stay NULL in the guest ntdll and its
+     * first syscall attempt faults at pc=0. UNVERIFIED for the x86_64
+     * case specifically: this function's real body (loader.c:4442 or
+     * 4775, whichever branch this native compile takes) was written and
+     * hardware-debugged against the i386 guest case. Whether it patches
+     * the correct slot layout for an x86_64 guest ntdll's own dispatcher
+     * stub encoding (real x86-64 Nt* stubs contain a literal `syscall`
+     * instruction, not a call through this slot -- see EmuX64Syscall's
+     * own comment, os_horizon.c) has not been checked. It may turn out
+     * this call is a no-op for the x86_64 case, or it may need a second,
+     * x86_64-specific variant -- find out by tracing whether anything in
+     * the guest ntdll actually reads __wine_syscall_dispatcher as a
+     * function pointer rather than executing `syscall` directly (e.g.
+     * RtlRaiseException's internal SEH plumbing might). */
+    wine_nx_patch_ntdll_dispatchers();
+
+    /* Same slot-patching mechanism wine_nx_wow64_handoff() uses to wire
+     * pWow64PrepareForException (dlls/ntdll/loader.c:6784-6801 above) --
+     * reused verbatim, just pointed at wine_nx_x64_prepare_for_exception
+     * (wine/x64native/x64native.c) instead of Wow64PrepareForException.
+     * KiUserExceptionDispatcher itself must stay resolved against THIS
+     * process's own native ntdll (not the guest's) -- it's wine-nx's
+     * hand-written ARM64 implementation (signal_arm64.c), same reasoning
+     * as the 32-bit case's base64 comment above; there is exactly one
+     * such dispatcher regardless of which guest is running. */
+    {
+        void *ki_user_exception_dispatcher =
+            RtlFindExportedRoutineByName( wine_nx_pe_ntdll_module->ldr.DllBase, "KiUserExceptionDispatcher" );
+
+        if (ki_user_exception_dispatcher)
+        {
+            void **slot = wine_nx_decode_adrp_ldr_target( ki_user_exception_dispatcher );
+
+            if (slot)
+            {
+                *slot = wine_nx_x64_prepare_for_exception;
+                wine_nx_trace( "[LDR] x64 pWow64PrepareForException-slot at %p <- %p",
+                               slot, wine_nx_x64_prepare_for_exception );
+            }
+            else wine_nx_trace( "[LDR] x64: failed to decode exception-hook slot" );
+        }
+        else wine_nx_trace( "[LDR] x64: failed to resolve KiUserExceptionDispatcher" );
+    }
+
+    /* Guest stack. wine_nx_wow64_handoff() reuses init_thread_stack()
+     * (dlls/ntdll/unix/thread.c) for this, but that function's actual
+     * job (per its own call site's comment above) is populating a
+     * *32-bit WOW TEB's* Tib.StackBase/StackLimit -- there is no WOW TEB
+     * here (single shared TEB, per the "no dual PEB/TEB" scoping note),
+     * so reusing it as-is is questionable. Using a plain
+     * NtAllocateVirtualMemory reservation instead, sized generously and
+     * unvalidated -- first concrete thing to get hardware signal on
+     * once this boots far enough to touch the stack at all (expect a
+     * headroom bug of the exact same shape as the 32-bit RtlUserThreadStart
+     * off-by-a-few-bytes fault documented in
+     * wine_nx_init_wow64_initial_context()'s own comment above -- that
+     * class of bug is not 32-bit-specific, it's "nothing populated real
+     * Wine's usual pre-thread-start guarantees", which is equally true
+     * here). */
+    guest_stack = NULL;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), &guest_stack, 0, &guest_stack_size,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+    if (status)
+    {
+        ERR( "wine_nx: x64 guest stack allocation failed, status %lx\n", status );
+        return status;
+    }
+
+    /* Initial AMD64 CONTEXT. Rip at the guest ntdll's own
+     * LdrInitializeThunk, same role Eip plays in the 32-bit case's
+     * SET_PE_INIT_BLOCK dance -- but reached directly here since there
+     * is no LdrSystemDllInitBlock indirection to go through (see the
+     * function-level comment above). Rcx conventionally holds the
+     * context pointer LdrInitializeThunk expects on real Windows x64
+     * (RtlUserThreadStart's own calling convention) -- passing NULL here
+     * exactly mirrors wine_nx_wow64_handoff()'s own "context is NULL,
+     * confirmed unused" reasoning, but that was confirmed by reading
+     * Wow64LdrpInitialize's specific body; LdrInitializeThunk's real
+     * x86_64 implementation has NOT been read as part of this pass to
+     * confirm the same holds for it. Check this first if the guest
+     * faults immediately on entry reading through Rcx. */
+    {
+        struct wine_nx_amd64_context init_ctx = { 0 };
+        init_ctx.Rip = (DWORD64)(uintptr_t)pLdrInitializeThunk;
+        init_ctx.Rsp = (DWORD64)(uintptr_t)guest_stack + guest_stack_size - 0x100; /* headroom, unvalidated -- see stack comment above */
+        init_ctx.Rcx = 0;
+        init_ctx.EFlags = 0x202; /* IF set, matching the i386 initial-context precedent (horizon.c:9079) */
+        init_ctx.MxCsr = 0x1f80; /* matching the i386 fpu->MxCsr precedent (horizon.c:9081) */
+        ctx = &init_ctx;
+
+        wine_nx_trace( "[LDR] x64 handoff: guest ntdll base=%p LdrInitializeThunk=%p stack=%p+0x%zx",
+                       guest_ntdll_base, pLdrInitializeThunk, guest_stack, (size_t)guest_stack_size );
+
+        /* Does not return -- DynaRun()/Run() (via wine_nx_x64_enter())
+         * blocks running the guest until the thread exits or faults,
+         * same role cpu_simulate() plays at the end of
+         * wine_nx_wow64_handoff() above. No x18/TEB asm trampoline
+         * needed here the way that path needs one for
+         * Wow64LdrpInitialize: wine_nx_x64_enter() is this file's own
+         * native ELF code (x64native.c, same toolchain, same link unit),
+         * not resolved PE machine code -- a plain C call already has the
+         * right calling convention, x18 already holds the current TEB
+         * throughout by construction, same reasoning load_dll()/
+         * RtlFindExportedRoutineByName() get for being called directly,
+         * two paragraphs up in the comment on wine_nx_wow64_handoff(). */
+        wine_nx_x64_enter( ctx );
+    }
+
+    return STATUS_SUCCESS;
+}
+#endif
 #endif
 
 

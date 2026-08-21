@@ -20,6 +20,7 @@
 #include "wine/server.h"
 #include "unix_private.h"
 #include "horizon_private.h"
+#include "runtime_boot.h"
 
 u32 __nx_applet_type = AppletType_Application;
 size_t __nx_heap_size = 256 * 1024 * 1024;
@@ -63,6 +64,18 @@ extern NTSTATUS wine_nx_loader_bootstrap( const UNICODE_STRING *main_nt_name );
 extern NTSTATUS wine_nx_loader_fixup_main_imports(void);
 extern NTSTATUS wine_nx_loader_attach_main(void);
 extern NTSTATUS wine_nx_wow64_handoff(void);
+/* Weak, unlike wine_nx_wow64_handoff() above: wine_nx_x64_handoff() only
+ * exists as a symbol at all when dlls/ntdll/loader.c was compiled with
+ * WINE_NX_X64NATIVE defined (see that file's own #ifdef around the whole
+ * function) -- which only happens when WINE_NX_BUILD_X64NATIVE is turned
+ * on in wine-nx-probe/CMakeLists.txt. A plain, non-weak extern here would
+ * break the DEFAULT build (option off) with an undefined-reference link
+ * error the moment this file calls it unconditionally below -- checked
+ * via "(&wine_nx_x64_handoff) ? ... : ..." at the call site instead,
+ * matching this project's own established idiom for exactly this
+ * situation (see wine_nx_wow64_handoff()'s own body, dlls/ntdll/loader.c,
+ * for "(&init_thread_stack) ? init_thread_stack(...) : STATUS_NOT_IMPLEMENTED"). */
+extern NTSTATUS wine_nx_x64_handoff(void) __attribute__((weak));
 extern const char *wine_nx_loader_last_import_dll(void);
 extern NTSTATUS wine_nx_loader_last_import_status(void);
 extern const char *wine_nx_loader_last_open_path(void);
@@ -2025,35 +2038,35 @@ static unsigned short peek_pe_machine( const char *path )
     return machine;
 }
 
-int main( int argc, char **argv )
-{
-    char target[512] = DEFAULT_TARGET;
-    TEB *teb;
-    void *module = NULL;
-    void *entry = NULL;
-    SIZE_T view_size = 0;
-    struct runtime_module *main_module;
-    RTL_USER_PROCESS_PARAMETERS *params;
-    UNICODE_STRING main_nt_name;
-    char dos_path[512];
-    unsigned int status;
-    unsigned int ldr_status = STATUS_INVALID_IMAGE_FORMAT;
-    unsigned int attach_status = STATUS_INVALID_IMAGE_FORMAT;
-    int autorun;
+/* Target-independent environment bring-up: directories, the log file,
+ * the various trace-select config reads, then Wine's own paths/unix
+ * bridge, virtual memory, NLS/environment, and the first TEB. This is
+ * exactly what main() below always did before it knew which target it
+ * was about to run -- extracted, byte-for-byte, so wine-nx-launcher
+ * (the merged single-NRO GUI+engine build, see nx_arch.c) can call the
+ * SAME sequence lazily, the first time the user actually launches a
+ * game, instead of paying for it at the launcher's own cold boot. The
+ * idempotency guard exists because a merged launcher's own call site
+ * doesn't have main()'s "runs exactly once" guarantee for free.
+ *
+ * Deliberately does NOT call consoleInit() -- that stays specific to
+ * this file's own standalone-binary boot-trace UX (see the comment
+ * that used to sit above main()'s now-removed consoleInit() call);
+ * wine-nx-launcher already owns the screen through its own nxgui
+ * framebuffer before this ever runs, and calling consoleInit() here
+ * would just be a second, redundant, conflicting claim on the same
+ * NWindow. Returns the first TEB on success, NULL on failure (caller
+ * decides what "failure" means for it -- see wine_nx_boot_and_run_target's
+ * own comment on why this can't just call park_forever() itself). */
+static int wine_nx_lazy_init_done;
 
-    log_main_thread = pthread_self();
-    log_main_thread_set = 1;
-#ifndef WINE_NX_DEKO3D_ONLY
-    consoleInit( NULL );
-#endif
-    /* deko3d-only build never calls consoleInit() at all -- confirmed via
-     * libnx's console_sw.c (the default renderer) that it calls
-     * nwindowGetDefault() internally, so even calling consoleInit() just to
-     * show boot-trace text would pull in the same __nx_win_init() conflict
-     * this whole binary exists to avoid. No on-screen boot trace in this
-     * build by design (matches deko_basic/Borealis, neither of which show
-     * one either) -- the log file is the only source of truth, same as it's
-     * been for every hardware diagnosis this session. */
+static TEB *wine_nx_lazy_init( void )
+{
+    TEB *teb;
+
+    if (wine_nx_lazy_init_done) return NtCurrentTeb();
+    wine_nx_lazy_init_done = 1;
+
     mkdir( "sdmc:/switch", 0777 );
     mkdir( RUNTIME_DIR, 0777 );
     mkdir( WINE_DRIVE_C, 0777 );
@@ -2070,20 +2083,6 @@ int main( int argc, char **argv )
     wine_nx_fast_flush_period_select();
     wine_nx_batch_redraw_updatenow_select();
     wine_nx_neon_blit_select();
-
-    if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
-    else
-    {
-        const char *config_target = wine_nx_config_get( "target" );
-        if (config_target && config_target[0]) snprintf( target, sizeof(target), "%s", config_target );
-        else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
-    }
-    autorun = wine_nx_config_get( "run-entry" ) ? wine_nx_config_get_bool( "run-entry" )
-                                                : read_bool_file( RUNTIME_DIR "/run-entry.txt" );
-
-    log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
-    log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
-    log_line( "[TARGET] %s", target );
 
     wine_nx_runtime_platform_init();
     log_line( "[INIT] Wine paths/unix bridge ready" );
@@ -2107,8 +2106,64 @@ int main( int argc, char **argv )
     if (!teb || NtCurrentTeb() != teb || !teb->Peb)
     {
         log_line( "[FAIL] virtual_alloc_first_teb" );
-        park_forever();
+        return NULL;
     }
+    return teb;
+}
+
+/* See runtime_boot.h's own comment -- a public, non-static door into
+ * the exact same guarded bootstrap above, for callers outside this file
+ * (nx_diagnostics.c's real-allocator test) that need virtual_init() to
+ * have already run before they can safely call NtAllocateVirtualMemory
+ * themselves. */
+struct _TEB *wine_nx_ensure_lazy_init( void )
+{
+    return wine_nx_lazy_init();
+}
+
+/* Maps and, if `autorun`, runs `target` end to end -- the exact
+ * sequence main() below always ran once it knew what to boot,
+ * extracted so wine-nx-launcher's nx_arch.c can call the identical,
+ * unmodified path (not a reimplementation of it) after a user picks a
+ * game from its own GUI.
+ *
+ * IMPORTANT, same as it always was: wine_nx_x64_handoff() and
+ * wine_nx_wow64_handoff() are one-way, blocking calls once a guest
+ * starts running successfully -- they simply never return in that
+ * case (see their own call sites below, unchanged from before this
+ * refactor). This function's return value is therefore only ever
+ * observed on a FAILURE that happened before any guest code ran. A
+ * caller expecting "returns after the game closes" is wrong about what
+ * this loader has ever supported, merged into one binary or not --
+ * when a guest process really exits, the whole Horizon process exits
+ * with it, exactly like running wine-nx-runtime.nro standalone today.
+ *
+ * Unlike the original inline code, failures here return a status
+ * instead of calling park_forever() directly -- that's runtime.c's own
+ * standalone-binary "nothing else to do, wait for HOME" fallback, not
+ * something a merged GUI should do to itself. main() below still calls
+ * park_forever() itself after this returns, preserving its own exact
+ * original behavior. */
+wine_nx_boot_result_t wine_nx_boot_and_run_target( const char *target, int autorun )
+{
+    TEB *teb;
+    void *module = NULL;
+    void *entry = NULL;
+    SIZE_T view_size = 0;
+    struct runtime_module *main_module;
+    RTL_USER_PROCESS_PARAMETERS *params;
+    UNICODE_STRING main_nt_name;
+    char dos_path[512];
+    unsigned int status;
+    unsigned int ldr_status = STATUS_INVALID_IMAGE_FORMAT;
+    unsigned int attach_status = STATUS_INVALID_IMAGE_FORMAT;
+
+    log_line( "wine-nx-runtime: generic Wine ntdll PE loader path" );
+    log_line( "[BUILD] %s", WINE_NX_RUNTIME_BUILD );
+    log_line( "[TARGET] %s", target );
+
+    teb = wine_nx_lazy_init();
+    if (!teb) return WINE_NX_BOOT_FAIL_TEB;
 
     wine_nx_set_target_machine( peek_pe_machine( target ) );
     server_init_process();
@@ -2116,102 +2171,175 @@ int main( int argc, char **argv )
     if (status)
     {
         log_line( "[FAIL] init_process_done status=%08x", status );
-        park_forever();
+        return WINE_NX_BOOT_FAIL_PROCESS_INIT;
     }
 
     status = map_pe_image( target, &module, &view_size );
     if (status)
     {
         log_line( "[FAIL] map target status=%08x", status );
-        park_forever();
+        return WINE_NX_BOOT_FAIL_MAP;
     }
 
-    if (runtime_describe_image( module, view_size, &entry ))
-    {
-        params = runtime_create_process_params( target, &main_nt_name, dos_path, sizeof(dos_path) );
-        if (!params)
-        {
-            log_line( "[FAIL] process parameter allocation" );
-            park_forever();
-        }
-        runtime_init_peb_process( teb, module, params );
-        log_line( "[PEB] image=%s nt=\\??\\%s", dos_path, dos_path );
+    if (!runtime_describe_image( module, view_size, &entry ))
+        return WINE_NX_BOOT_FAIL_DESCRIBE;
 
-        main_module = register_module( target, module, view_size, 1 );
-        if (main_module)
+    params = runtime_create_process_params( target, &main_nt_name, dos_path, sizeof(dos_path) );
+    if (!params)
+    {
+        log_line( "[FAIL] process parameter allocation" );
+        return WINE_NX_BOOT_FAIL_PARAMS;
+    }
+    runtime_init_peb_process( teb, module, params );
+    log_line( "[PEB] image=%s nt=\\??\\%s", dos_path, dos_path );
+
+    main_module = register_module( target, module, view_size, 1 );
+    if (main_module)
+    {
+        status = wine_nx_loader_bootstrap( &main_nt_name );
+        log_line( "[LDR] bootstrap status=%08x", status );
+        /* A 32-bit guest's own dependency chain (kernel32/kernelbase/ntdll)
+         * has genuine IMAGE_THUNK_DATA32 (4-byte) import tables, but this
+         * native loader's fixup_imports()/import_dll() hardcode
+         * IMAGE_THUNK_DATA (== IMAGE_THUNK_DATA64, 8-byte stride) for IAT
+         * walking -- correct for a 64-bit target, but it walks a 32-bit
+         * IAT off into unmapped memory. Real Wine's new-WoW64 model never
+         * asks the 64-bit host loader to do this: the guest's own,
+         * separately i386-compiled ntdll.dll resolves its own imports as
+         * real x86 code once Wow64LdrpInitialize/cpu_simulate() takes
+         * over. So for a WoW64 target, skip native import resolution and
+         * attach entirely and hand off immediately. */
+        /* An x86_64 guest must skip native import resolution/attach for
+         * the same reason a 32-bit one does (the host loader would
+         * resolve its imports against aarch64 DLLs and run x86-64
+         * DllMains natively) -- it just doesn't announce itself via
+         * is_wow64(), since a 64-bit guest shares the native PEB and
+         * never gets a wow_peb. */
+        if (!status && !is_wow64() && main_image_info.Machine != IMAGE_FILE_MACHINE_AMD64)
         {
-            status = wine_nx_loader_bootstrap( &main_nt_name );
-            log_line( "[LDR] bootstrap status=%08x", status );
-            /* A 32-bit guest's own dependency chain (kernel32/kernelbase/ntdll)
-             * has genuine IMAGE_THUNK_DATA32 (4-byte) import tables, but this
-             * native loader's fixup_imports()/import_dll() hardcode
-             * IMAGE_THUNK_DATA (== IMAGE_THUNK_DATA64, 8-byte stride) for IAT
-             * walking -- correct for a 64-bit target, but it walks a 32-bit
-             * IAT off into unmapped memory. Real Wine's new-WoW64 model never
-             * asks the 64-bit host loader to do this: the guest's own,
-             * separately i386-compiled ntdll.dll resolves its own imports as
-             * real x86 code once Wow64LdrpInitialize/cpu_simulate() takes
-             * over. So for a WoW64 target, skip native import resolution and
-             * attach entirely and hand off immediately. */
-            /* An x86_64 guest must skip native import resolution/attach for
-             * the same reason a 32-bit one does (the host loader would
-             * resolve its imports against aarch64 DLLs and run x86-64
-             * DllMains natively) -- it just doesn't announce itself via
-             * is_wow64(), since a 64-bit guest shares the native PEB and
-             * never gets a wow_peb. */
-            if (!status && !is_wow64() && main_image_info.Machine != IMAGE_FILE_MACHINE_AMD64)
+            ldr_status = wine_nx_loader_fixup_main_imports();
+            log_line( "[LDR] fixup_imports status=%08x", ldr_status );
+            if (ldr_status && wine_nx_loader_last_import_dll()[0])
+                log_line( "[LDR] last failed import=%s status=%08x",
+                          wine_nx_loader_last_import_dll(),
+                          wine_nx_loader_last_import_status() );
+            if (ldr_status && wine_nx_loader_last_open_path()[0])
+                log_line( "[LDR] last dll open=%s status=%08x",
+                          wine_nx_loader_last_open_path(),
+                          wine_nx_loader_last_open_status() );
+            if (ldr_status && wine_nx_loader_last_export_diag()[0])
+                log_line( "[LDR] export diag=%s", wine_nx_loader_last_export_diag() );
+            if (!ldr_status)
             {
-                ldr_status = wine_nx_loader_fixup_main_imports();
-                log_line( "[LDR] fixup_imports status=%08x", ldr_status );
-                if (ldr_status && wine_nx_loader_last_import_dll()[0])
-                    log_line( "[LDR] last failed import=%s status=%08x",
-                              wine_nx_loader_last_import_dll(),
-                              wine_nx_loader_last_import_status() );
-                if (ldr_status && wine_nx_loader_last_open_path()[0])
-                    log_line( "[LDR] last dll open=%s status=%08x",
-                              wine_nx_loader_last_open_path(),
-                              wine_nx_loader_last_open_status() );
-                if (ldr_status && wine_nx_loader_last_export_diag()[0])
-                    log_line( "[LDR] export diag=%s", wine_nx_loader_last_export_diag() );
-                if (!ldr_status)
-                {
-                    attach_status = wine_nx_loader_attach_main();
-                    log_line( "[LDR] process_attach status=%08x", attach_status );
-                }
+                attach_status = wine_nx_loader_attach_main();
+                log_line( "[LDR] process_attach status=%08x", attach_status );
             }
         }
-        log_line( "[READY] PE image is mapped by Wine ntdll; entry=%p", entry );
-        if (autorun && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)
-        {
-            /* Detection and routing exist ahead of the executor so an
-             * x86_64 target fails here, identifiably, instead of jumping
-             * to x86-64 machine code on an aarch64 CPU below. */
-            log_line( "[RUN] 64-bit x86 guest detected (machine=0x8664); "
-                      "x86_64 execution path not implemented yet" );
-        }
-        else if (autorun && is_wow64())
-        {
-            NTSTATUS wow64_status;
-
-            log_line( "[RUN] run-entry.txt enabled; 32-bit guest, handing off to WoW64 (wow64.dll + WowBox64)" );
-            wow64_status = wine_nx_wow64_handoff();
-            /* Only reached if the handoff itself failed before ever
-             * reaching cpu_simulate() (e.g. wow64.dll or
-             * Wow64LdrpInitialize couldn't be resolved) -- a
-             * successfully running guest blocks inside
-             * wine_nx_wow64_handoff() and this line never executes. */
-            log_line( "[RUN] wow64 handoff returned status=%08x", wow64_status );
-        }
-        else if (autorun && !ldr_status && !attach_status)
-        {
-            log_line( "[RUN] run-entry.txt enabled; jumping to PE entry after Wine loader attach" );
-            log_line( "[RUN] entry returned %d", call_pe_entry_point( entry ) );
-        }
-        else if (autorun)
-            log_line( "[BLOCK] run-entry.txt enabled, but loader status import=%08x attach=%08x",
-                      ldr_status, attach_status );
     }
+    log_line( "[READY] PE image is mapped by Wine ntdll; entry=%p", entry );
+    if (autorun && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)
+    {
+        /* Same dynamic, no-manual-toggle selection the 32-bit branch
+         * below already has -- main_image_info.Machine was already
+         * populated from the guest PE's own header long before this
+         * point (peek_pe_machine(), per x86_64-scoping.md item 3),
+         * so which of the two guest CPU backends runs is decided
+         * entirely by what target.txt points at, same mechanism as
+         * everything else in this loader. Neither branch touches the
+         * other: this one calls wine_nx_x64_handoff(), the is_wow64()
+         * branch immediately below calls wine_nx_wow64_handoff() --
+         * completely unmodified by anything in this change. The
+         * "if (&wine_nx_x64_handoff)" guard right below is what makes
+         * this branch safe when WINE_NX_BUILD_X64NATIVE is off (the
+         * weak symbol resolves to NULL in that case, per the extern
+         * declaration above). */
+        if (&wine_nx_x64_handoff)
+        {
+            NTSTATUS x64_status;
+
+            log_line( "[RUN] run-entry.txt enabled; 64-bit x86 guest, handing off natively (box64 core, no wow64.dll)" );
+            x64_status = wine_nx_x64_handoff();
+            /* Only reached if the handoff itself failed before ever
+             * reaching wine_nx_x64_enter()'s DynaRun()/Run() call --
+             * a successfully running guest blocks inside
+             * wine_nx_x64_handoff() and this line never executes,
+             * exactly the same shape as the wow64 branch below. */
+            log_line( "[RUN] x64 handoff returned status=%08x", x64_status );
+        }
+        else
+        {
+            /* WINE_NX_BUILD_X64NATIVE was off for this build -- the
+             * box64 core isn't linked in at all. Detection/routing
+             * still fails here identifiably, same as before this
+             * change, instead of falling through to jump at x86-64
+             * machine code on an aarch64 CPU below. */
+            log_line( "[RUN] 64-bit x86 guest detected (machine=0x8664); "
+                      "this build was compiled without WINE_NX_BUILD_X64NATIVE" );
+        }
+        return WINE_NX_BOOT_FAIL_HANDOFF;
+    }
+    else if (autorun && is_wow64())
+    {
+        NTSTATUS wow64_status;
+
+        log_line( "[RUN] run-entry.txt enabled; 32-bit guest, handing off to WoW64 (wow64.dll + WowBox64)" );
+        wow64_status = wine_nx_wow64_handoff();
+        /* Only reached if the handoff itself failed before ever
+         * reaching cpu_simulate() (e.g. wow64.dll or
+         * Wow64LdrpInitialize couldn't be resolved) -- a
+         * successfully running guest blocks inside
+         * wine_nx_wow64_handoff() and this line never executes. */
+        log_line( "[RUN] wow64 handoff returned status=%08x", wow64_status );
+        return WINE_NX_BOOT_FAIL_HANDOFF;
+    }
+    else if (autorun && !ldr_status && !attach_status)
+    {
+        log_line( "[RUN] run-entry.txt enabled; jumping to PE entry after Wine loader attach" );
+        log_line( "[RUN] entry returned %d", call_pe_entry_point( entry ) );
+        return WINE_NX_BOOT_NOT_RUN;
+    }
+    else if (autorun)
+    {
+        log_line( "[BLOCK] run-entry.txt enabled, but loader status import=%08x attach=%08x",
+                  ldr_status, attach_status );
+        return WINE_NX_BOOT_FAIL_HANDOFF;
+    }
+    return WINE_NX_BOOT_NOT_RUN;
+}
+
+#ifndef WINE_NX_MERGED_LAUNCHER
+int main( int argc, char **argv )
+{
+    char target[512] = DEFAULT_TARGET;
+    int autorun;
+
+    log_main_thread = pthread_self();
+    log_main_thread_set = 1;
+#ifndef WINE_NX_DEKO3D_ONLY
+    consoleInit( NULL );
+#endif
+    /* deko3d-only build never calls consoleInit() at all -- confirmed via
+     * libnx's console_sw.c (the default renderer) that it calls
+     * nwindowGetDefault() internally, so even calling consoleInit() just to
+     * show boot-trace text would pull in the same __nx_win_init() conflict
+     * this whole binary exists to avoid. No on-screen boot trace in this
+     * build by design (matches deko_basic/Borealis, neither of which show
+     * one either) -- the log file is the only source of truth, same as it's
+     * been for every hardware diagnosis this session. */
+
+    if (argc > 1 && argv[1] && argv[1][0]) snprintf( target, sizeof(target), "%s", argv[1] );
+    else
+    {
+        const char *config_target = wine_nx_config_get( "target" );
+        if (config_target && config_target[0]) snprintf( target, sizeof(target), "%s", config_target );
+        else read_first_line( RUNTIME_DIR "/target.txt", target, sizeof(target) );
+    }
+    autorun = wine_nx_config_get( "run-entry" ) ? wine_nx_config_get_bool( "run-entry" )
+                                                : read_bool_file( RUNTIME_DIR "/run-entry.txt" );
+
+    wine_nx_boot_and_run_target( target, autorun );
 
     park_forever();
     return 0;
 }
+#endif /* !WINE_NX_MERGED_LAUNCHER */

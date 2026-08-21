@@ -1006,6 +1006,7 @@ SOURCES = \
 	wine/wingdi16.h \
 	wine/winnet16.h \
 	wine/winuser16.h \
+	wine/x64native.h \
 	winerror.h \
 	winevt.h \
 	wingdi.h \
